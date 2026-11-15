@@ -105,6 +105,32 @@ export function truncateUtf8Safe(text: string, maxBytes: number): Utf8TruncateRe
   };
 }
 
+/**
+ * The untrusted-text half of {@link fenceToolOutput}: credential scrub, control/bidi/zero-width
+ * stripping and fence-tag smuggling removal. Deterministic, so offsets into the result are stable.
+ */
+export function sanitizeUntrustedText(text: string): string {
+  return stripControlAndInvisibleChars(scrubCredentials(text)).replace(
+    FENCE_TAG_SMUGGLE_RE,
+    "[stripped_fence_tag]",
+  );
+}
+
+/**
+ * Wraps already-sanitized text in a fresh `<untrusted_tool_result_${nonce}>` fence without
+ * truncating it. A nonce that occurs in the text is never used (a new one is drawn instead).
+ */
+export function wrapSanitizedInFence(sanitized: string): { nonce128: string; wrappedText: string } {
+  let nonce128 = generateFenceNonce128();
+  while (sanitized.toLowerCase().includes(nonce128)) {
+    nonce128 = generateFenceNonce128();
+  }
+  return {
+    nonce128,
+    wrappedText: `<untrusted_tool_result_${nonce128}>\n${sanitized}\n</untrusted_tool_result_${nonce128}>`,
+  };
+}
+
 export interface FenceToolOutputOptions {
   readonly nonce128?: string;
   readonly maxPayloadBytes?: number;

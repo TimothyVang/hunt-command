@@ -739,6 +739,15 @@ export interface CitationVerificationResult {
   malformed: string[];
 }
 
+/** A record behind a cited `evt-*`, `frame-*` or `ioc-*` id (raw case data, unscrubbed). */
+export interface CitedRecord {
+  id: string;
+  kind: "evt" | "frame" | "ioc";
+  timestamp_iso: string | null;
+  title: string;
+  record: Record<string, unknown>;
+}
+
 export interface HuntDataPlane {
   readonly caseId: string;
   readonly dataOrigin: DataOrigin;
@@ -762,6 +771,8 @@ export interface HuntDataPlane {
     authorizeTool?: AuthorizeWatchTool,
   ): Promise<LabBrowserResult> | LabBrowserResult;
   verifyCitations(citations: readonly string[]): Promise<CitationVerificationResult> | CitationVerificationResult;
+  /** Optional: reads the case-scoped records behind cited ids (absent ids are omitted). */
+  readCitedRecords?(ids: readonly string[]): Promise<CitedRecord[]> | CitedRecord[];
   close(): Promise<void> | void;
 }
 
