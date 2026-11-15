@@ -12,6 +12,20 @@ import {
 } from "@hunt-command/telemetry";
 import { EmbeddedHuntDataPlane } from "../src/index.ts";
 
+/** Nearest ancestor directory that has a sibling `hermes-hunt-bots/` checkout (override: HUNT_WORKSPACE_ROOT). */
+function findWorkspaceRoot(start: string): string {
+  if (process.env.HUNT_WORKSPACE_ROOT) return process.env.HUNT_WORKSPACE_ROOT;
+  let dir = start;
+  for (;;) {
+    if (fs.existsSync(path.join(dir, "hermes-hunt-bots"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return start;
+    dir = parent;
+  }
+}
+
+const WORKSPACE = findWorkspaceRoot(import.meta.dir).replaceAll("\\", "/");
+
 const tempDirs: string[] = [];
 
 function makeTempDir(prefix: string): string {
@@ -59,14 +73,14 @@ function prepareSyntheticBenchmarkCase(sourceDir: string, caseId: string): strin
 }
 
 const DNS_LAB_DIR = resolveExistingCaseDir([
-  "C:/Users/newbi/Desktop/bot-framework/hermes-hunt-bots/repo/runtime/cases/dns-lab-001/evidence",
-  "C:/Users/newbi/Desktop/bot-framework/hermes-hunt-bots/repo/runtime/cases/dns-lab-001",
-  "C:/Users/newbi/Desktop/bot-framework/hermes-hunt-bots/repo/framework/hunt_lab/fixtures/dns-lab-001",
+  `${WORKSPACE}/hermes-hunt-bots/repo/runtime/cases/dns-lab-001/evidence`,
+  `${WORKSPACE}/hermes-hunt-bots/repo/runtime/cases/dns-lab-001`,
+  `${WORKSPACE}/hermes-hunt-bots/repo/framework/hunt_lab/fixtures/dns-lab-001`,
 ]);
 
 const LAB_MED_DIR = resolveExistingCaseDir([
-  "C:/Users/newbi/Desktop/bot-framework/hermes-hunt-bots/repo/runtime/cases/lab-med-001/evidence",
-  "C:/Users/newbi/Desktop/bot-framework/hermes-hunt-bots/runtime/cases/lab-med-001/evidence",
+  `${WORKSPACE}/hermes-hunt-bots/repo/runtime/cases/lab-med-001/evidence`,
+  `${WORKSPACE}/hermes-hunt-bots/runtime/cases/lab-med-001/evidence`,
 ]);
 
 describe("Real Case Integration & Latency Benchmarks (dns-lab-001 & lab-med-001)", () => {
