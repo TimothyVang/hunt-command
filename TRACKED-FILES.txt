@@ -76,6 +76,7 @@ apps/desktop/test/live-gate-context.test.ts
 apps/desktop/test/live-run-controls.test.tsx
 apps/desktop/test/network-quiet.test.ts
 apps/desktop/test/preload-sandbox.test.ts
+apps/desktop/test/reconcile-union-real-daemon.test.ts
 apps/desktop/test/renderer-bridge.test.ts
 apps/desktop/test/report-exporter.test.ts
 apps/desktop/test/security-and-defang.test.ts

@@ -153,6 +153,24 @@ describe("F4: gate approval requires the gate's decision context", () => {
     expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(true);
   });
 
+  test("citation_source_unavailable with the source still down lists cited ids as unresolved and stays approvable", () => {
+    const inc = incidentContext().incident;
+    const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, {
+      run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
+      reconcile: {
+        reason_code: "citation_source_unavailable",
+        citation_receipt: { ...inc.citation_receipt, verified: false, source_status: "unavailable", diagnostic: "events backend down" },
+        unavailable_sources: ["events"], evidence: [], evidence_truncated: false,
+      },
+    });
+    expect(p.activeGate.contextError).toBeUndefined();
+    const rc = p.activeGate.reconcileContext!;
+    if (rc.reasonCode !== "citation_source_unavailable") throw new Error("narrowing");
+    expect(rc.unavailableSources).toEqual(["events"]);
+    expect(rc.citationReceipt.entries.map((e) => [e.citationId, e.status])).toEqual([[EVT, "unresolved"]]);
+    expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(true);
+  });
+
   test("an unparseable reconcile context (no receipts) fails closed", () => {
     const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, {
       run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
