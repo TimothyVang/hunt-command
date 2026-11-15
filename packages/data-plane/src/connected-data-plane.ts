@@ -23,6 +23,7 @@ import {
   type ArkimeUniqueParams,
   type ArkimeUniqueResult,
   type CitationVerificationResult,
+  budgetElasticSearchResult,
   coerceBoundedInt,
   type DetectionTestParams,
   type DetectionTestResult,
@@ -505,11 +506,10 @@ export function validateConnectedCase(
           h.length > 0 &&
           h.length <= 100 &&
           isPrintableAscii(h),
-      ) ||
-      new Set(obj.hosts).size !== obj.hosts.length
+      )
     ) {
       throw new ConnectConfigError(
-        `hosts must list 1 to ${MAX_HOSTS} distinct exact host.name values`,
+        `hosts must list 1 to ${MAX_HOSTS} exact host.name values`,
       );
     }
   }
@@ -863,6 +863,7 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
   private readonly startMs: number;
   private readonly endMs: number;
   private readonly citationsPath: string | null;
+  private readonly citationScopeFingerprint: string;
   private readonly activePitPath: string | null;
 
   private pit: string | null = null;
@@ -897,6 +898,15 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
     const endNs = parseTimestampNs(params.caseDef.time_range_utc.end_exclusive);
     this.startMs = epochMillisFromNs(startNs);
     this.endMs = epochMillisFromNs(endNs);
+    // Bind durable citations to evidence scope, never to the replaceable API credential.
+    const hosts = [...new Set(params.caseDef.hosts ?? [])].sort();
+    this.citationScopeFingerprint = crypto.createHash("sha256").update(JSON.stringify({
+      base: this.base,
+      index: this.indexPattern,
+      start_ns: startNs.toString(),
+      end_ns: endNs.toString(),
+      hosts,
+    })).digest("hex");
 
     this.scopeFilters = [
       {
@@ -908,9 +918,9 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
         },
       },
     ];
-    if (params.caseDef.hosts && params.caseDef.hosts.length > 0) {
+    if (hosts.length > 0) {
       this.scopeFilters.push({
-        terms: { "host.name": [...params.caseDef.hosts] },
+        terms: { "host.name": hosts },
       });
     }
 
@@ -921,8 +931,14 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
       const content = fs.readFileSync(this.citationsPath, "utf8");
       for (const line of content.split(/\r?\n/)) {
         if (!line.trim()) continue;
-        const rec = JSON.parse(line) as { evt: string; _index?: string; _id: string };
-        if (typeof rec.evt === "string" && typeof rec._id === "string") {
+        const rec = JSON.parse(line) as {
+          evt: string; _index?: string; _id: string; scope_fingerprint?: string;
+        };
+        if (
+          rec.scope_fingerprint === this.citationScopeFingerprint &&
+          typeof rec.evt === "string" &&
+          typeof rec._id === "string"
+        ) {
           let list = this.citations.get(rec.evt);
           if (!list) {
             list = [];
@@ -1549,7 +1565,10 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
       if (this.citationsPath) {
         fs.appendFileSync(
           this.citationsPath,
-          `${JSON.stringify({ evt: cited, _index: indexName, _id: docId })}\n`,
+          `${JSON.stringify({
+            evt: cited, _index: indexName, _id: docId,
+            scope_fingerprint: this.citationScopeFingerprint,
+          })}\n`,
           "utf8",
         );
       }
@@ -1871,14 +1890,14 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
     const nextAfter =
       lastHit && Array.isArray(lastHit.sort) ? this.encodeAfterToken(lastHit.sort) : null;
 
-    return {
+    return budgetElasticSearchResult({
       case_id: this.caseId,
       total: totalObj.value,
       total_relation: totalObj.relation ?? "eq",
       returned: hits.length,
       hits,
       next_after: nextAfter,
-    };
+    }, (count) => this.encodeAfterToken(rawHits[count - 1]!.sort));
   }
 
   public async elasticAggregate(params: ElasticAggregateParams): Promise<ElasticAggregateResult> {

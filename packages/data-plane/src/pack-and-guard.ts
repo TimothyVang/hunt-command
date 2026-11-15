@@ -11,7 +11,7 @@ import {
   type HistogramInterval,
   type ProfileId,
 } from "@hunt-command/shared";
-import { scrubSecretsValue, truncateUtf8Safe } from "@hunt-command/telemetry";
+import { scrubSecretsValue } from "@hunt-command/telemetry";
 import { throwDataPlaneError } from "./errors.ts";
 import { parseTimestampNs } from "./timestamps-and-ip.ts";
 
@@ -20,7 +20,11 @@ const WIN32_RESERVED_DEVICE_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)
 const SAFE_REL_ARTIFACT_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 const TOOL_RESULT_MAX_BYTES = 24 * 1024;
-const TOOL_RESULT_TRUNCATION_MARKER = "\n[TRUNCATED]";
+const TOOL_RESULT_FENCE_BYTES = Buffer.byteLength(
+  `<untrusted_tool_result_${"0".repeat(32)}>\n\n</untrusted_tool_result_${"0".repeat(32)}>`,
+  "utf8",
+);
+const TOOL_RESULT_CONTENT_BYTES = TOOL_RESULT_MAX_BYTES - TOOL_RESULT_FENCE_BYTES;
 const TOOL_RESULT_INVISIBLE_RE = /[\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g;
 
 function stripToolResultControls(value: unknown): unknown {
@@ -41,25 +45,175 @@ function stripToolResultControls(value: unknown): unknown {
   return value;
 }
 
-function fenceToolResult(rawResult: unknown): string {
-  // Normalize controls before scrubbing so invisible characters cannot disguise credentials.
-  const serialized = JSON.stringify(scrubSecretsValue(stripToolResultControls(rawResult)));
+/** Normalize controls before scrubbing so invisible characters cannot disguise credentials. */
+export function sanitizeToolResult(rawResult: unknown): unknown {
+  return scrubSecretsValue(stripToolResultControls(rawResult));
+}
+
+function serializeToolResult(result: unknown): string {
+  const serialized = JSON.stringify(result);
   if (serialized === undefined) {
     throw new TypeError("Tool result is not JSON serializable");
   }
-  // JSON escapes preserve the data while preventing case text from introducing any fence tag.
-  const content = serialized.replace(/</g, "\\u003c");
+  // Escapes preserve data while preventing case text from introducing any fence tag.
+  return serialized.replace(/</g, "\\u003c");
+}
+
+function fitsToolResult(result: unknown): boolean {
+  return Buffer.byteLength(serializeToolResult(result), "utf8") <= TOOL_RESULT_CONTENT_BYTES;
+}
+
+const RESULT_METADATA_KEYS: Record<string, true> = {
+  case_id: true,
+  total: true,
+  total_relation: true,
+  other: true,
+  name: true,
+  returned: true,
+  next_after: true,
+  start: true,
+  offset: true,
+  limit: true,
+  more: true,
+  read_only: true,
+  recordsFiltered: true,
+  dataset: true,
+  field: true,
+  fields: true,
+  page: true,
+  url: true,
+  title: true,
+  blocked_requests: true,
+  first: true,
+  last: true,
+  truncated: true,
+};
+const RESULT_ROWS_KEYS = ["hits", "records", "sessions", "rows", "values"] as const;
+const RESULT_ARRAY_KEYS = [...RESULT_ROWS_KEYS, "buckets", "hosts", "sample", "matches", "unmatched"];
+
+function stringPrefix(value: string, limit: number): string {
+  let end = Math.min(value.length, limit);
+  // Do not turn an intact surrogate pair into a lone surrogate at the budget boundary.
+  if (end > 0 && end < value.length
+    && /[\ud800-\udbff]/.test(value[end - 1]!) && /[\udc00-\udfff]/.test(value[end]!)) {
+    end--;
+  }
+  return value.slice(0, end);
+}
+
+/**
+ * One deterministic limit for payload string lengths, list lengths and object field counts.
+ * Keep citation identities and top-level pagination intact; never cut serialized JSON bytes.
+ */
+function limitToolPayload(value: unknown, limit: number, root = false): unknown {
+  if (typeof value === "string") return stringPrefix(value, limit);
+  if (Array.isArray(value)) return value.slice(0, limit).map((item) => limitToolPayload(item, limit));
+  if (value === null || typeof value !== "object" || value instanceof Date) return value;
+
+  const result: Record<string, unknown> = {};
+  let payloadFields = 0;
+  for (const [key, item] of Object.entries(value)) {
+    const citation = key === "@timestamp" || key === "event" || key === "id"
+      || key.endsWith(".id") || key.endsWith("_id");
+    const rootArray = root && RESULT_ARRAY_KEYS.includes(key) && Array.isArray(item);
+    if (root && RESULT_METADATA_KEYS[key] === true) {
+      result[key] = item;
+    } else if (!citation && !rootArray && payloadFields++ >= limit) {
+      continue;
+    } else if (citation && key !== "event") {
+      result[key] = item;
+    } else if (root && key === "hits" && Array.isArray(item)) {
+      // A generic fence cannot regenerate Elastic cursors. Only the search-specific
+      // helper may drop hits; here retain their identities and trim their payloads.
+      result[key] = item.map((hit) => limitToolPayload(hit, limit));
+    } else {
+      result[key] = limitToolPayload(item, limit);
+    }
+  }
+  const rowsKey = RESULT_ROWS_KEYS.find((key) => Array.isArray(result[key]));
+  if (rowsKey && typeof result.returned === "number") {
+    const rows = result[rowsKey] as unknown[];
+    const originalRows = (value as Record<string, unknown>)[rowsKey] as unknown[];
+    result.returned = rows.length;
+    if (rows.length < originalRows.length && "more" in result) result.more = true;
+  }
+  return result;
+}
+
+function budgetStructuredResult(resultForLimit: (limit: number) => unknown): unknown {
+  let low = 0;
+  let high = TOOL_RESULT_CONTENT_BYTES;
+  let best = resultForLimit(0);
+  if (!fitsToolResult(best)) {
+    // Identifiers/cursors cannot be shortened without corrupting citations or pagination.
+    throw new RangeError("Tool result metadata exceeds the wire budget");
+  }
+  while (low <= high) {
+    const limit = Math.floor((low + high) / 2);
+    const candidate = resultForLimit(limit);
+    if (fitsToolResult(candidate)) {
+      best = candidate;
+      low = limit + 1;
+    } else {
+      high = limit - 1;
+    }
+  }
+  return best;
+}
+
+/**
+ * Budget a search before returning it, while its backend still owns cursor generation.
+ * Prefer a complete nonempty hit prefix to trimming any hit's payload.
+ */
+export function budgetElasticSearchResult(
+  result: ElasticSearchResult,
+  cursorForCount: (count: number) => string,
+): ElasticSearchResult {
+  const clean = sanitizeToolResult(result) as ElasticSearchResult;
+  if (fitsToolResult(clean)) return clean;
+  const pageMetadata = (count: number): ElasticSearchResult => ({
+    ...clean,
+    hits: [],
+    returned: count,
+    next_after: count < clean.hits.length ? cursorForCount(count) : clean.next_after,
+    truncated: true,
+  });
+  let hitBytes = 0;
+  let best: ElasticSearchResult | undefined;
+  // Cursor lengths can vary, so total page size is not necessarily monotone.
+  // Measure every feasible prefix, serializing each hit just once.
+  for (let count = 1; count <= clean.hits.length; count++) {
+    hitBytes += Buffer.byteLength(serializeToolResult(clean.hits[count - 1]), "utf8")
+      + (count === 1 ? 0 : 1);
+    if (hitBytes > TOOL_RESULT_CONTENT_BYTES) break;
+    const candidate = pageMetadata(count);
+    if (Buffer.byteLength(serializeToolResult(candidate), "utf8") + hitBytes <= TOOL_RESULT_CONTENT_BYTES) {
+      best = candidate;
+    }
+  }
+  if (best) return { ...best, hits: clean.hits.slice(0, best.returned) };
+  const count = Math.min(1, clean.hits.length);
+  const single = { ...pageMetadata(count), hits: clean.hits.slice(0, count) };
+  return budgetStructuredResult((limit) => ({
+    ...single,
+    hits: single.hits.map((hit) => limitToolPayload(hit, limit)),
+  })) as ElasticSearchResult;
+}
+
+/** Return sanitized, parseable JSON inside a complete independent 128-bit nonce fence. */
+export function fenceToolResult(rawResult: unknown): string {
+  let result = sanitizeToolResult(rawResult);
+  if (!fitsToolResult(result)) {
+    const object = result !== null && typeof result === "object" && !Array.isArray(result)
+      ? result as Record<string, unknown>
+      : { value: result };
+    result = budgetStructuredResult((limit) => ({
+      ...limitToolPayload(object, limit, true) as Record<string, unknown>,
+      truncated: true,
+    }));
+  }
   const nonce = crypto.randomBytes(16).toString("hex");
-  const open = `<untrusted_tool_result_${nonce}>\n`;
-  const close = `\n</untrusted_tool_result_${nonce}>`;
-  const contentBudget = TOOL_RESULT_MAX_BYTES - Buffer.byteLength(open + close, "utf8");
-  const inner = Buffer.byteLength(content, "utf8") <= contentBudget
-    ? content
-    : truncateUtf8Safe(
-      content,
-      contentBudget - Buffer.byteLength(TOOL_RESULT_TRUNCATION_MARKER, "utf8"),
-    ) + TOOL_RESULT_TRUNCATION_MARKER;
-  return open + inner + close;
+  return `<untrusted_tool_result_${nonce}>\n${serializeToolResult(result)}\n</untrusted_tool_result_${nonce}>`;
 }
 
 export interface ValidatedCaseSource {
@@ -421,6 +575,7 @@ export interface ElasticSearchResult {
   returned: number;
   hits: Array<Record<string, unknown>>;
   next_after: string | null;
+  truncated?: boolean;
 }
 
 export interface ElasticAggregateParams {
@@ -570,6 +725,8 @@ export interface LabBrowserResult {
   html_preview?: string;
 }
 
+export type AuthorizeWatchTool = (tool: DataPlaneToolName) => void;
+
 export interface CitationVerificationResult {
   allValid: boolean;
   checkedCount: number;
@@ -600,7 +757,10 @@ export interface HuntDataPlane {
   arkimeUnique(params: ArkimeUniqueParams): Promise<ArkimeUniqueResult> | ArkimeUniqueResult;
   packetFields(params: PacketFieldsParams): Promise<PacketFieldsResult> | PacketFieldsResult;
   huntLabQuery(params: HuntLabQueryParams): Promise<HuntLabQueryResult> | HuntLabQueryResult;
-  labBrowser(params: LabBrowserParams): Promise<LabBrowserResult> | LabBrowserResult;
+  labBrowser(
+    params: LabBrowserParams,
+    authorizeTool?: AuthorizeWatchTool,
+  ): Promise<LabBrowserResult> | LabBrowserResult;
   verifyCitations(citations: readonly string[]): Promise<CitationVerificationResult> | CitationVerificationResult;
   close(): Promise<void> | void;
 }
@@ -767,7 +927,13 @@ export function createRoleCapabilityMint(explicitSecret?: Uint8Array): RoleCapab
           rawResult = await dataPlane.huntLabQuery(args as unknown as HuntLabQueryParams);
           break;
         case "lab_browser":
-          rawResult = await dataPlane.labBrowser(args as unknown as LabBrowserParams);
+          rawResult = await dataPlane.labBrowser(
+            args as unknown as LabBrowserParams,
+            (pageTool) => {
+              verifyCapability(token, dataPlane.caseId);
+              assertRoleOwnsTool(token.profile, pageTool, token.stepId);
+            },
+          );
           break;
         default:
           throwDataPlaneError(403, "tool_not_owned", `Unknown data-plane tool '${String(tool)}'`);

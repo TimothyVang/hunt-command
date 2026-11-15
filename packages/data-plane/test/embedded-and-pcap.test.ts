@@ -1284,7 +1284,9 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
       }));
       await expect(network.executeTool("elastic_search", {})).rejects.toThrow(/does not own tool/);
       await expect(network.executeTool("intel_lookup", { values: "example.test" })).rejects.toThrow(/does not own tool/);
-      const wire = await network.executeTool("lab_browser", { page: "lab_console" });
+      await expect(network.executeTool("lab_browser", { page: "lab_console" })).rejects.toThrow(/does not own tool/);
+      await expect(network.executeTool("lab_browser", { page: "kibana_discover" })).rejects.toThrow(/does not own tool/);
+      const wire = await network.executeTool("lab_browser", { page: "arkime_sessions" });
       expect(wire.includes(srv.secret)).toBe(false);
       const fence = /^<untrusted_tool_result_([0-9a-f]{32})>\n([\s\S]*)\n<\/untrusted_tool_result_\1>$/.exec(wire);
       expect(fence).not.toBeNull();
@@ -1308,6 +1310,47 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
         "X-Hunt-Lab-Secret": key,
       });
       expect(watchAsHeader.status).toBe(401);
+
+      const networkUrl = new URL(result.url);
+      const allowedNetwork = await rawGet(`${networkUrl.pathname}${networkUrl.search}`, {
+        Host: `127.0.0.1:${srv.port}`,
+      });
+      expect(allowedNetwork.status).toBe(200);
+      for (const route of ["/", "/view", "/watch/kibana_discover", "/watch/arkime_spiview"]) {
+        const refused = await rawGet(`${route}?key=${key}`, { Host: `127.0.0.1:${srv.port}` });
+        expect(refused.status).toBe(401);
+      }
+
+      const researcherToken = { ...networkPlane.issueCapability({
+        huntId: "hunt-watch-researcher",
+        caseId: dp.caseId,
+        profile: "framework-researcher",
+      }) };
+      const researcher = networkPlane.bindDataPlane(dp, researcherToken);
+      await expect(researcher.executeTool("lab_browser", { page: "arkime_sessions" })).rejects.toThrow(/does not own tool/);
+      await expect(researcher.executeTool("lab_browser", { page: "arkime_spiview" })).rejects.toThrow(/does not own tool/);
+      const eventWire = await researcher.executeTool("lab_browser", { page: "kibana_discover" });
+      const eventFence = /^<untrusted_tool_result_([0-9a-f]{32})>\n([\s\S]*)\n<\/untrusted_tool_result_\1>$/.exec(eventWire);
+      const eventResult = JSON.parse(eventFence![2]!) as { url: string };
+      const eventUrl = new URL(eventResult.url);
+      const eventPage = await rawGet(`${eventUrl.pathname}${eventUrl.search}`, {
+        Host: `127.0.0.1:${srv.port}`,
+      });
+      expect(eventPage.status).toBe(200);
+      expect(eventPage.body).toContain("evt-00001");
+      expect(eventPage.body).not.toContain("secret_event_jwt_token");
+      expect(eventPage.body).not.toContain("SyntheticEventPat1234");
+      expect(eventPage.body).toMatch(/&lt;untrusted_tool_result_[0-9a-f]{32}&gt;/);
+      expect(eventPage.body).toMatch(/&lt;\/untrusted_tool_result_[0-9a-f]{32}&gt;/);
+      const swapped = await rawGet(`/watch/arkime_sessions?key=${eventUrl.searchParams.get("key")}`, {
+        Host: `127.0.0.1:${srv.port}`,
+      });
+      expect(swapped.status).toBe(401);
+      researcherToken.profile = "framework-network-analyst";
+      const revoked = await rawGet(`${eventUrl.pathname}${eventUrl.search}`, {
+        Host: `127.0.0.1:${srv.port}`,
+      });
+      expect(revoked.status).toBe(403);
 
       // 5. decideWatchRequest policy checks
       const scope = {

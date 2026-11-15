@@ -12,6 +12,7 @@ import {
   type ConnectedElasticConfig,
   type ConnectedHttpsTransport,
   createVerifiedHttpsTransport,
+  createRoleCapabilityMint,
   extractDataPlaneError,
   formatConnectedCitation,
   NEWER_CLUSTER_PRIVILEGES,
@@ -574,6 +575,117 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
     }
   });
 
+  test("binds persisted citations to canonical connection and nanosecond case scope, refusing legacy records", async () => {
+    const stateDir = makeTempDir("hunt-conn-citation-scope-");
+    const config = makeValidConfig();
+    const caseDefinition = makeValidCase();
+    const open = (nextConfig = config, nextCase = caseDefinition, apiKey = TEST_API_KEY) => {
+      const mock = createMockEsTransport().transport;
+      const prefix = new URL(nextConfig.url).pathname.replace(/\/+$/, "");
+      return ConnectedHuntDataPlane.open({
+        config: nextConfig,
+        caseDefinition: nextCase,
+        environ: { HUNT_ELASTIC_API_KEY: apiKey },
+        stateDir,
+        transport: (method, url, headers, body) => {
+          const target = new URL(url);
+          if (prefix) target.pathname = target.pathname.slice(prefix.length) || "/";
+          return mock(method, target.toString(), headers, body);
+        },
+        nowEpochMs: FIXED_NOW_MS,
+      });
+    };
+    const initial = await open();
+    let citations: string[];
+    try {
+      citations = (await initial.elasticSearch({})).hits.map((hit) => String(hit["event.id"]));
+    } finally {
+      await initial.close();
+    }
+    const citationsPath = path.join(stateDir, caseDefinition.case_id, "citations.jsonl");
+    const persisted = fs.readFileSync(citationsPath, "utf8");
+    const records = persisted.trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    expect(records).toHaveLength(2);
+    expect(records[0].scope_fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(records[1].scope_fingerprint).toBe(records[0].scope_fingerprint);
+    expect(persisted).not.toContain(TEST_API_KEY);
+    const legacyCitation = formatConnectedCitation("logs-win-2026.11.01", "legacy-unbound");
+    fs.appendFileSync(citationsPath, `${JSON.stringify({
+      evt: legacyCitation, _index: "logs-win-2026.11.01", _id: "legacy-unbound",
+    })}\n`);
+
+    const equivalentCases = [
+      caseDefinition,
+      makeValidCase({
+        hosts: ["wkstn-02", "wkstn-01", "wkstn-02"],
+        time_range_utc: {
+          start_inclusive: "2026-11-14T12:00:00.000000000Z",
+          end_exclusive: "2026-11-15T01:30:00.000000000Z",
+        },
+      }),
+    ];
+    for (const equivalentCase of equivalentCases) {
+      const reopened = await open(
+        makeValidConfig({ url: "https://SIEM-ES.CORP.INTERNAL:9200/" }),
+        equivalentCase,
+        `${TEST_API_KEY}-rotated`,
+      );
+      try {
+        expect(reopened.verifyCitations(citations!).allValid).toBe(true);
+        for (const citation of citations!) {
+          expect(reopened.resolveCitationsInLucene(`event.id:${citation}`)).toContain("_index:");
+        }
+        expect(reopened.verifyCitations([legacyCitation]).unresolved).toEqual([legacyCitation]);
+        expect(() => reopened.resolveCitationsInLucene(`event.id:${legacyCitation}`))
+          .toThrow(/Unknown citation/);
+      } finally {
+        await reopened.close();
+      }
+    }
+
+    const changedScopes = [
+      { config, caseDefinition: makeValidCase({
+        time_range_utc: {
+          ...caseDefinition.time_range_utc,
+          start_inclusive: "2026-11-14T12:00:00.000000001Z",
+        },
+      }) },
+      { config, caseDefinition: makeValidCase({
+        time_range_utc: {
+          ...caseDefinition.time_range_utc,
+          end_exclusive: "2026-11-15T01:29:59.999999999Z",
+        },
+      }) },
+      { config, caseDefinition: makeValidCase({ hosts: ["wkstn-01"] }) },
+      { config: makeValidConfig({ url: "https://other-es.corp.internal:9200" }), caseDefinition },
+      { config: makeValidConfig({ url: `${config.url}/other-cluster` }), caseDefinition },
+      { config: makeValidConfig({ index: "logs-win-*" }), caseDefinition },
+    ];
+    for (const scope of changedScopes) {
+      const reopened = await open(scope.config, scope.caseDefinition);
+      try {
+        expect(reopened.verifyCitations(citations!).unresolved).toEqual(citations!);
+        for (const citation of citations!) {
+          try {
+            reopened.resolveCitationsInLucene(`event.id:${citation}`);
+            throw new Error("Expected unknown_citation");
+          } catch (error) {
+            expect(extractDataPlaneError(error)?.errorCode).toBe("unknown_citation");
+          }
+        }
+        // A fresh query may mint the same stable ID, but must persist its new scope binding.
+        await reopened.elasticSearch({});
+        const latest = fs.readFileSync(citationsPath, "utf8").trim().split(/\r?\n/).slice(-2)
+          .map((line) => JSON.parse(line));
+        expect(latest.every((record) => /^[a-f0-9]{64}$/.test(record.scope_fingerprint))).toBe(true);
+        expect(latest[0].scope_fingerprint).not.toBe(records[0].scope_fingerprint);
+        expect(latest[1].scope_fingerprint).toBe(latest[0].scope_fingerprint);
+      } finally {
+        await reopened.close();
+      }
+    }
+  });
+
   test("preserves the fractional exclusive end for terms and histogram aggregations", async () => {
     const timeRange = {
       start_inclusive: "2026-11-14T12:00:00.122999999Z",
@@ -1038,6 +1150,114 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
         expect(searches.map((call) => call.body!.search_after)).toEqual([
           undefined,
           ...rows.map((row) => row.sort),
+        ]);
+      } finally {
+        await dp.close();
+      }
+    });
+  }
+
+  for (const order of ["asc", "desc"] as const) {
+    test(`budgets role-scoped multibyte search pages without losing adjacent nanosecond events in ${order} order`, async () => {
+      const rows = Array.from({ length: 5 }, (_, index) => {
+        const timestamp = `2026-11-14T14:00:00.12345678${index}Z`;
+        return {
+          _index: "logs-win-2026.11.01",
+          _id: `budget-nano-${index}`,
+          sort: [timestamp, index + 10],
+          _source: {
+            "@timestamp": timestamp,
+            host: { name: "wkstn-01" },
+            process: { command_line: index === 2 ? "🧪".repeat(20_000) : "界".repeat(3_000) },
+          },
+        };
+      });
+      if (order === "desc") rows.reverse();
+      const { transport, calls } = createMockEsTransport({
+        onSearch: (body) => {
+          const after = body.search_after;
+          const index = after === undefined
+            ? 0
+            : rows.findIndex((row) => JSON.stringify(row.sort) === JSON.stringify(after)) + 1;
+          if (after !== undefined) expect(index).toBeGreaterThan(0);
+          return {
+            status: 200,
+            response: {
+              hits: {
+                total: { value: rows.length, relation: "eq" },
+                hits: rows.slice(index, index + Number(body.size)),
+              },
+            },
+          };
+        },
+      });
+      const dp = await ConnectedHuntDataPlane.open({
+        config: makeValidConfig(),
+        caseDefinition: makeValidCase(),
+        environ: { HUNT_ELASTIC_API_KEY: TEST_API_KEY },
+        transport,
+        nowEpochMs: FIXED_NOW_MS,
+      });
+      try {
+        const mint = createRoleCapabilityMint();
+        const scoped = mint.bindDataPlane(dp, mint.issueCapability({
+          huntId: "hunt-connected-budget",
+          caseId: dp.caseId,
+          profile: "framework-researcher",
+          stepId: "evidence",
+        }));
+        let after: string | undefined;
+        let seenCount = 0;
+        const seen: string[] = [];
+        for (const [pageIndex, expectedCount] of [2, 1, 2].entries()) {
+          const wire = await scoped.executeTool("elastic_search", {
+            size: 5, sort: order, fields: "process.command_line", ...(after ? { after } : {}),
+          });
+          expect(Buffer.byteLength(wire, "utf8")).toBeLessThanOrEqual(24 * 1024);
+          const fenced = /^<untrusted_tool_result_([0-9a-f]{32})>\n([\s\S]*)\n<\/untrusted_tool_result_\1>$/.exec(wire);
+          expect(fenced).not.toBeNull();
+          const page = JSON.parse(fenced![2]!) as {
+            total: number; total_relation: string; returned: number;
+            hits: Array<Record<string, unknown>>; next_after: string | null; truncated?: boolean;
+          };
+          expect(page.total).toBe(rows.length);
+          expect(page.total_relation).toBe("eq");
+          expect(page.returned).toBe(expectedCount);
+          expect(page.hits).toHaveLength(expectedCount);
+          expect(page.truncated).toBe(pageIndex < 2 ? true : undefined);
+          for (const hit of page.hits) {
+            const row = rows[seenCount++]!;
+            const citation = formatConnectedCitation(row._index, row._id);
+            expect(hit["@timestamp"]).toBe(row._source["@timestamp"]);
+            expect(hit["event.id"]).toBe(citation);
+            expect(dp.verifyCitations([citation]).allValid).toBe(true);
+            expect(dp.resolveCitationsInLucene(`event.id:${citation}`)).toContain(row._id);
+            const commandLine = String(hit["process.command_line"]);
+            expect(commandLine).not.toContain("\ufffd");
+            if (row._id === "budget-nano-2") {
+              expect(Buffer.byteLength(commandLine, "utf8")).toBeLessThan(
+                Buffer.byteLength(row._source.process.command_line, "utf8"),
+              );
+            } else {
+              expect(commandLine).toBe(row._source.process.command_line);
+            }
+            seen.push(citation);
+          }
+          if (pageIndex < 2) {
+            expect(page.next_after).toBeTruthy();
+            const tuple = JSON.parse(Buffer.from(page.next_after!, "base64url").toString("utf8"));
+            expect(tuple.slice(0, 2)).toEqual(rows[seenCount - 1]!.sort);
+            expect(Number.isSafeInteger(tuple[2])).toBe(true);
+            after = page.next_after!;
+          } else {
+            expect(page.next_after).toBeNull();
+          }
+        }
+        expect(seen).toEqual(rows.map((row) => formatConnectedCitation(row._index, row._id)));
+        expect(new Set(seen).size).toBe(rows.length);
+        const searches = calls.filter((call) => call.url.includes("/_search?"));
+        expect(searches.map((call) => call.body!.search_after)).toEqual([
+          undefined, rows[1]!.sort, rows[2]!.sort,
         ]);
       } finally {
         await dp.close();

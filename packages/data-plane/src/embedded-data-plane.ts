@@ -9,6 +9,7 @@ import {
   ARKIME_SESSION_FIELDS,
   ARKIME_UNIQUE_FIELDS,
   type DataOrigin,
+  type DataPlaneToolName,
   DEFAULT_FIELDS,
   EVENT_FIELDS,
   type HistogramInterval,
@@ -35,6 +36,7 @@ import {
 } from "./network-compilers.ts";
 import {
   type ArkimeSessionsParams,
+  type AuthorizeWatchTool,
   type ArkimeSessionsResult,
   type ArkimeUniqueParams,
   type ArkimeUniqueResult,
@@ -47,6 +49,8 @@ import {
   type ElasticAggregateResult,
   type ElasticSearchParams,
   type ElasticSearchResult,
+  budgetElasticSearchResult,
+  fenceToolResult,
   type HuntDataPlane,
   type HuntLabQueryParams,
   type HuntLabQueryResult,
@@ -58,6 +62,7 @@ import {
   type PacketFieldsResult,
   type ValidatedCasePack,
   type ValidateCasePackOptions,
+  sanitizeToolResult,
   validateCasePack,
   type WatchPageId,
 } from "./pack-and-guard.ts";
@@ -828,6 +833,13 @@ interface ActivityEntry {
   error: string | null;
 }
 
+const WATCH_PAGES = {
+  lab_console: { path: "/view", tool: "elastic_search" },
+  kibana_discover: { path: "/watch/kibana_discover", tool: "elastic_search" },
+  arkime_sessions: { path: "/watch/arkime_sessions", tool: "arkime_sessions" },
+  arkime_spiview: { path: "/watch/arkime_spiview", tool: "arkime_unique" },
+} as const satisfies Record<WatchPageId, { path: string; tool: DataPlaneToolName }>;
+
 export class EmbeddedHuntDataPlane implements HuntDataPlane {
   public readonly caseId: string;
   public readonly dataOrigin: DataOrigin;
@@ -843,7 +855,10 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
   private readonly startMs: number;
   private readonly endMs: number;
   private localServer: LocalDataPlaneHttpHandle | null = null;
-  private readonly watchKey = crypto.randomBytes(32).toString("hex");
+  private readonly watchGrants = new Map<string, {
+    page: WatchPageId;
+    authorizeTool?: AuthorizeWatchTool;
+  }>();
   private closed = false;
 
   private constructor(params: {
@@ -1225,14 +1240,17 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
       ? encodeEmbeddedCursor(BigInt(lastRow.ts_ns_str), lastRow.event_id)
       : null;
 
-    return {
+    return budgetElasticSearchResult({
       case_id: this.caseId,
       total,
       total_relation: "eq",
       returned: hits.length,
       hits,
       next_after: nextAfter,
-    };
+    }, (count) => {
+      const last = rows[count - 1]!;
+      return encodeEmbeddedCursor(BigInt(last.ts_ns_str), last.event_id);
+    });
   }
 
   public elasticAggregate(params: ElasticAggregateParams): ElasticAggregateResult {
@@ -1714,136 +1732,90 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     page: WatchPageId,
     params: { q?: string; host?: string; expression?: string; field?: string },
     consoleKey?: string,
+    authorizeTool?: AuthorizeWatchTool,
   ): { status: 200 | 400; title: string; summary: string; returned: number; html: string } {
+    authorizeTool?.(WATCH_PAGES[page].tool);
     const originBanner =
       this.dataOrigin === "synthetic"
         ? "Synthetic data only."
         : `${REAL_DATA_ORIGIN_LABELS[this.dataOrigin][0]} (${REAL_DATA_ORIGIN_LABELS[this.dataOrigin][1]}).`;
-    const hiddenKey = consoleKey
-      ? `<input type="hidden" name="key" value="${escapeHtml(consoleKey)}">`
-      : "";
-
     try {
+      let result: unknown;
+      let title: string;
+      let summary: string;
+      let returned: number;
       if (page === "lab_console" || page === "kibana_discover") {
-        const res = this.huntLabQuery({
-          dataset: "events",
-          q: params.q ?? "",
-          host: params.host ?? "",
-          limit: 50,
-          offset: 0,
-        }) as Extract<HuntLabQueryResult, { records: unknown[] }>;
-        const title =
-          page === "kibana_discover"
-            ? `Discover — ${this.caseId} events`
-            : "Hermes hunting lab";
-        const summary = `${res.returned} of ${res.total} events`;
-        const rowsHtml = res.records
-          .map(
-            (row) =>
-              `<tr><td>${escapeHtml(String(row["@timestamp"] ?? ""))}</td><td><pre>${escapeHtml(JSON.stringify(row, null, 2))}</pre></td></tr>`,
-          )
-          .join("");
-        const actionPath =
-          page === "kibana_discover" ? "/watch/kibana_discover" : "/view";
-        const html =
-          `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
-          `<style>body{font:15px system-ui;margin:24px}td{vertical-align:top;border-bottom:1px solid #999}pre{white-space:pre-wrap}input{margin:6px}</style></head><body>` +
-          `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(originBanner)} Read-only. No live capture.</p>` +
-          `<p>Case: ${escapeHtml(this.caseId)}</p><p>${escapeHtml(this.pack.question)}</p>` +
-          `<form action="${actionPath}" method="get"><label for="q">Search</label>` +
-          `<input id="q" name="q" size="60" value="${escapeHtml(params.q ?? "")}">` +
-          hiddenKey +
-          `<label for="host">Host</label><input id="host" name="host" value="${escapeHtml(params.host ?? "")}">` +
-          `<button>Search logs</button></form>` +
-          `<p role="status"><strong>${escapeHtml(summary)}</strong></p>` +
-          `<table>${rowsHtml}</table></body></html>`;
-        return { status: 200, title, summary, returned: res.returned, html };
-      }
-
-      if (page === "arkime_sessions") {
-        const res = this.arkimeSessions({
-          expression: params.expression ?? "",
-          length: 50,
-          start: 0,
-        });
-        const title = `Arkime Sessions — ${this.caseId}`;
-        const summary = `${res.returned} of ${res.recordsFiltered} sessions`;
-        const rowsHtml = res.sessions
-          .map(
-            (row) =>
-              `<tr><td>${escapeHtml(String(row.firstPacket ?? ""))}</td><td><pre>${escapeHtml(JSON.stringify(row, null, 2))}</pre></td></tr>`,
-          )
-          .join("");
-        const html =
-          `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
-          `<style>body{font:15px system-ui;margin:24px}td{vertical-align:top;border-bottom:1px solid #999}pre{white-space:pre-wrap}</style></head><body>` +
-          `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(originBanner)} Read-only.</p>` +
-          `<p role="status"><strong>${escapeHtml(summary)}</strong></p>` +
-          `<table>${rowsHtml}</table></body></html>`;
-        return { status: 200, title, summary, returned: res.returned, html };
-      }
-
-      if (page === "arkime_spiview") {
+        const q = checkCleanText(params.q, 300, "invalid_query");
+        const host = checkCleanText(params.host, 100, "invalid_query");
+        const hostTerm = host ? `host.name:"${host.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : "";
+        const query = hostTerm && q ? `(${q}) AND ${hostTerm}` : hostTerm || q;
+        const res = this.elasticSearch({ q: query, size: 50 });
+        result = res;
+        title = page === "kibana_discover" ? `Discover — ${this.caseId} events` : "Hermes hunting lab";
+        returned = res.returned;
+        summary = `${returned} of ${res.total} events`;
+      } else if (page === "arkime_sessions") {
+        const res = this.arkimeSessions({ expression: params.expression ?? "", length: 50, start: 0 });
+        result = res;
+        title = `Arkime Sessions — ${this.caseId}`;
+        returned = res.returned;
+        summary = `${returned} of ${res.recordsFiltered} sessions`;
+      } else {
         const field = params.field ?? "host.http";
-        const res = this.arkimeUnique({
-          expression: params.expression ?? "",
-          field,
-          counts: 1,
-        });
-        const title = `Arkime SPI View (${field}) — ${this.caseId}`;
-        const summary = `${res.returned} distinct values for ${field}`;
-        const rowsHtml = res.values
-          .map(
-            (v) =>
-              `<tr><td>${escapeHtml(v.value)}</td><td>${escapeHtml(String(v.count ?? ""))}</td></tr>`,
-          )
-          .join("");
-        const html =
-          `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
-          `<style>body{font:15px system-ui;margin:24px}td{border-bottom:1px solid #999;padding:4px 8px}</style></head><body>` +
-          `<h1>${escapeHtml(title)}</h1><p role="status"><strong>${escapeHtml(summary)}</strong></p>` +
-          `<table>${rowsHtml}</table></body></html>`;
-        return { status: 200, title, summary, returned: res.returned, html };
+        const res = this.arkimeUnique({ expression: params.expression ?? "", field, counts: 1 });
+        result = res;
+        title = `Arkime SPI View (${field}) — ${this.caseId}`;
+        returned = res.returned;
+        summary = `${returned} distinct values for ${field}`;
       }
+      const form = page === "lab_console" || page === "kibana_discover"
+        ? `<form action="${WATCH_PAGES[page].path}" method="get"><label for="q">Search</label>` +
+          `<input id="q" name="q" size="60" value="${escapeHtml(String(sanitizeToolResult(params.q ?? "")))}">` +
+          (consoleKey ? `<input type="hidden" name="key" value="${escapeHtml(consoleKey)}">` : "") +
+          `<label for="host">Host</label><input id="host" name="host" value="${escapeHtml(String(sanitizeToolResult(params.host ?? "")))}">` +
+          `<button>Search logs</button></form>`
+        : "";
+      const html =
+        `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
+        `<style>body{font:15px system-ui;margin:24px}pre{white-space:pre-wrap;overflow-wrap:anywhere}form{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{max-width:100%;box-sizing:border-box}</style></head><body>` +
+        `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(originBanner)} Read-only.</p>` +
+        form +
+        `<p role="status"><strong>${escapeHtml(summary)}</strong></p>` +
+        `<pre>${escapeHtml(fenceToolResult(result))}</pre></body></html>`;
+      return { status: 200, title, summary, returned, html };
     } catch (err) {
-      const dpErr = extractDataPlaneError(err);
-      const code = dpErr?.errorCode ?? "invalid_query";
+      const code = extractDataPlaneError(err)?.errorCode ?? "invalid_query";
       const title = "Query refused";
       const summary = `Query refused: ${code}`;
       const html =
-        `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title></head><body>` +
+        `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>` +
         `<p role="alert">${escapeHtml(summary)}</p></body></html>`;
       return { status: 400, title, summary, returned: 0, html };
     }
-
-    throwDataPlaneError(400, "invalid_arguments", `Unknown Watch page '${String(page)}'`);
   }
 
-  public async labBrowser(params: LabBrowserParams): Promise<LabBrowserResult> {
+  public async labBrowser(
+    params: LabBrowserParams,
+    authorizeTool?: AuthorizeWatchTool,
+  ): Promise<LabBrowserResult> {
     this.assertOpen();
     this.assertCaseParam(params.case_id);
 
-    const validPages: readonly WatchPageId[] = [
-      "lab_console",
-      "kibana_discover",
-      "arkime_sessions",
-      "arkime_spiview",
-    ];
-    if (!validPages.includes(params.page)) {
+    if (!Object.prototype.hasOwnProperty.call(WATCH_PAGES, params.page)) {
       throwDataPlaneError(400, "invalid_arguments", `Invalid Watch page '${String(params.page)}'`);
     }
 
-    const rendered = this.renderWatchHtml(params.page, params);
+    const rendered = this.renderWatchHtml(params.page, params, undefined, authorizeTool);
     if (rendered.status !== 200) {
       const code = rendered.summary.replace(/^Query refused:\s*/, "");
       throwDataPlaneError(400, (code as "invalid_query") || "invalid_query", rendered.summary);
     }
 
     const srv = await this.ensureLocalHttpServer();
-    const routePath =
-      params.page === "lab_console" ? "/view" : `/watch/${params.page}`;
-    const url = new URL(routePath, srv.baseUrl);
-    url.searchParams.set("key", this.watchKey);
+    const key = crypto.randomBytes(32).toString("hex");
+    this.watchGrants.set(key, { page: params.page, authorizeTool });
+    const url = new URL(WATCH_PAGES[params.page].path, srv.baseUrl);
+    url.searchParams.set("key", key);
     for (const name of ["q", "host", "expression", "field"] as const) {
       if (params[name] !== undefined) {
         url.searchParams.set(name, params[name]);
@@ -1947,7 +1919,6 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     }
     const instanceId = options?.instanceId ?? crypto.randomBytes(16).toString("hex");
     const secretBuf = Buffer.from(secret, "ascii");
-    const watchKeyBuf = Buffer.from(this.watchKey, "ascii");
 
     const activityRing: ActivityEntry[] = [];
     let activitySeq = 0;
@@ -1987,13 +1958,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
       res.end(bodyBuf);
     };
 
-    const CONSOLE_PATHS = new Set([
-      "/",
-      "/view",
-      "/watch/kibana_discover",
-      "/watch/arkime_sessions",
-      "/watch/arkime_spiview",
-    ]);
+    const CONSOLE_PATHS = new Set<string>(["/", ...Object.values(WATCH_PAGES).map((page) => page.path)]);
 
     const server = http.createServer((req, res) => {
       const rawUrl = req.url ?? "/";
@@ -2008,21 +1973,16 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
         return;
       }
 
-      // Watch keys authorize HTML only; the operator's API credential never reaches tool results.
       const headerSecrets = req.headersDistinct["x-hunt-lab-secret"] ?? [];
-      const secrets = headerSecrets.length > 0
-        ? headerSecrets
-        : isConsoleRoute ? parsedUrl.searchParams.getAll("key") : [];
-      const expectedSecret = headerSecrets.length > 0 ? secretBuf : watchKeyBuf;
-      if (secrets.length !== 1) {
-        sendResponse(res, 401, { error: "caller_not_authorized" });
-        return;
-      }
-      const candidateBuf = Buffer.from(secrets[0]!, "latin1");
-      if (
-        candidateBuf.byteLength !== expectedSecret.byteLength ||
-        !crypto.timingSafeEqual(candidateBuf, expectedSecret)
-      ) {
+      const candidate = headerSecrets.length === 1 ? Buffer.from(headerSecrets[0]!, "latin1") : null;
+      const operatorAuthorized = candidate !== null &&
+        candidate.byteLength === secretBuf.byteLength && crypto.timingSafeEqual(candidate, secretBuf);
+      const keys = isConsoleRoute ? parsedUrl.searchParams.getAll("key") : [];
+      const grant = keys.length === 1 ? this.watchGrants.get(keys[0]!) : undefined;
+      if (!operatorAuthorized && (
+        headerSecrets.length > 0 || !grant ||
+        parsedUrl.pathname !== WATCH_PAGES[grant.page].path
+      )) {
         sendResponse(res, 401, { error: "caller_not_authorized" });
         return;
       }
@@ -2127,6 +2087,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
               field: parsedUrl.searchParams.get("field") ?? undefined,
             },
             consoleKey,
+            operatorAuthorized ? undefined : grant!.authorizeTool,
           );
           sendResponse(res, rendered.status, rendered.html, "text/html");
           return;
@@ -2323,6 +2284,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
 
   public async close(): Promise<void> {
     if (this.closed) return;
+    this.watchGrants.clear();
     this.closed = true;
     if (this.localServer) {
       const srv = this.localServer;
