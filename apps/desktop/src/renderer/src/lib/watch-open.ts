@@ -1,5 +1,28 @@
 import type { WatchOpenInput } from "../../../shared/ipc.ts";
-import type { WorkbenchSnapshot } from "../../../shared/workbench-types.ts";
+import type { WatchBrowserState, WorkbenchSnapshot } from "../../../shared/workbench-types.ts";
+
+/** Never expose another hunt's browser as the current hunt's Watch session. */
+export function watchForHunt(huntId: string, watch: WatchBrowserState): WatchBrowserState {
+  if (watch.runId === huntId) return watch;
+  return {
+    enabled: false,
+    runId: huntId,
+    role: watch.role,
+    partition: `hunt-watch:${huntId}:${watch.role}`,
+    currentUrl: "about:blank",
+    title: "Watch Browser (Standby)",
+    loading: false,
+    allowedOrigins: [],
+    blockedRequestCount: 0,
+    lastBlockedReason: null,
+    cdpEndpointUrl: null,
+  };
+}
+
+export function scopeWatchSnapshot(snapshot: WorkbenchSnapshot, latestWatch?: WatchBrowserState): WorkbenchSnapshot {
+  const watch = latestWatch?.runId === snapshot.huntId ? latestWatch : snapshot.watchState;
+  return { ...snapshot, watchState: watchForHunt(snapshot.huntId, watch) };
+}
 
 /**
  * Builds the `watch:open` request the Watch tab sends: the typed URL's origin becomes the pinned lab

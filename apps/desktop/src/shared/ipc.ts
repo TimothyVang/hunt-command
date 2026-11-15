@@ -19,6 +19,7 @@ import type { EventChannel, InvokeChannel } from "./ipc-channels.ts";
 export const StartRunInputSchema = z
   .object({
     caseId: z.string().min(1).max(128),
+    scope: z.string().max(100_000).refine((value) => value.trim().length > 0, "Scope is required"),
     dataOrigin: DataOriginSchema,
     maxTotalTokens: z.number().int().min(10_000).max(50_000_000).default(4_000_000),
     followUps: z.number().int().min(0).max(12).default(6),
@@ -85,6 +86,7 @@ export type QueryDissectorInput = z.infer<typeof QueryDissectorInputSchema>;
 
 export const WatchBoundsInputSchema = z
   .object({
+    runId: z.string().min(1).max(128),
     bounds: z
       .object({
         x: z.number().int(),

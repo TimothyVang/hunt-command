@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import {
   AuthenticatedGateDecisionSchema,
   type AuthenticatedGateDecision,
@@ -83,6 +84,7 @@ export interface WorkbenchServiceDeps {
   watchHandlers?: {
     getState: () => WatchBrowserState;
     setBounds: (bounds: { x: number; y: number; width: number; height: number } | null) => WatchBrowserState;
+    invalidate: () => void;
     navigate: (runId: string, role: ProfileId, url: string) => Promise<WatchBrowserState>;
     open: (input: WatchOpenInput) => Promise<WatchBrowserState>;
   };
@@ -131,10 +133,23 @@ function buildStepTranscriptText(snapshot: WorkbenchSnapshot, stepId: string): s
 
   return `${stripControlAndBidiChars(lines.join("\n"))}\n`;
 }
+const LiveStartResultSchema = z.object({
+  run_id: z.string().min(1),
+  status: z.enum(["running", "awaiting_gate", "completed", "failed", "cancelled"]),
+});
+
+export interface LiveStartResult {
+  provenanceMode: "live_daemon";
+  huntId: string;
+  runStatus: "running" | "awaiting_human_gate" | "completed" | "stopped" | "failed";
+}
+
 
 export class WorkbenchService {
   readonly #deps: WorkbenchServiceDeps;
   readonly #runs = new Map<string, WorkbenchSnapshot>();
+  readonly #liveRunIds = new Set<string>();
+  #selectionVersion = 0;
   #activeHuntId: string;
 
   constructor(deps: WorkbenchServiceDeps) {
@@ -193,6 +208,7 @@ export class WorkbenchService {
   }
 
   async getWorkbenchState(rawPayload?: unknown): Promise<WorkbenchSnapshot> {
+    const selection = ++this.#selectionVersion;
     const requestedHuntId =
       typeof rawPayload === "object" &&
       rawPayload !== null &&
@@ -201,6 +217,10 @@ export class WorkbenchService {
         ? (rawPayload as { huntId: string }).huntId
         : this.#activeHuntId;
 
+    if (this.#liveRunIds.has(requestedHuntId)) {
+      throw new Error(`Live workbench state is not available for hunt '${requestedHuntId}'.`);
+    }
+
     if (this.#deps.sidecar.isLiveReady) {
       try {
         const liveSnap = await this.#deps.sidecar.request<WorkbenchSnapshot>("hunt.getWorkbenchState", {
@@ -208,7 +228,7 @@ export class WorkbenchService {
         });
         if (liveSnap && typeof liveSnap.huntId === "string") {
           this.#runs.set(liveSnap.huntId, liveSnap);
-          this.#activeHuntId = liveSnap.huntId;
+          if (selection === this.#selectionVersion) this.#selectHunt(liveSnap.huntId);
           return this.#attachWatchState(liveSnap);
         }
       } catch {
@@ -221,24 +241,28 @@ export class WorkbenchService {
       this.#runs.get(this.#activeHuntId) ??
       buildFixtureWorkbenchSnapshot({ huntId: requestedHuntId });
     this.#runs.set(snap.huntId, snap);
-    this.#activeHuntId = snap.huntId;
+    if (selection === this.#selectionVersion) this.#selectHunt(snap.huntId);
     return this.#attachWatchState(snap);
   }
 
-  async startRun(rawInput: unknown): Promise<WorkbenchSnapshot> {
+  async startRun(rawInput: unknown): Promise<WorkbenchSnapshot | LiveStartResult> {
     const parsed = StartRunInputSchema.parse(rawInput);
 
     if (this.#deps.sidecar.isLiveReady) {
-      try {
-        const started = await this.#deps.sidecar.request<WorkbenchSnapshot>("hunt.startRun", parsed);
-        if (started && typeof started.huntId === "string") {
-          this.#runs.set(started.huntId, started);
-          this.#activeHuntId = started.huntId;
-          return this.#attachWatchState(started);
-        }
-      } catch {
-        // Fall through to local Gate 1 scope run creation when daemon is in standby.
-      }
+      const response = await this.#deps.sidecar.request<unknown>("hunt.start", {
+        case_id: parsed.caseId,
+        scope: parsed.scope,
+        follow_ups: parsed.followUps,
+        max_total_tokens: parsed.maxTotalTokens,
+      });
+      const started = LiveStartResultSchema.parse(response);
+      this.#liveRunIds.add(started.run_id);
+      return {
+        provenanceMode: "live_daemon",
+        huntId: started.run_id,
+        runStatus: started.status === "awaiting_gate" ? "awaiting_human_gate"
+          : started.status === "cancelled" ? "stopped" : started.status,
+      };
     }
 
     const newHuntId = `hunt-${Date.now().toString(36)}-${parsed.caseId.slice(0, 16)}`;
@@ -253,7 +277,7 @@ export class WorkbenchService {
       created.activeGate.scopeSummary.followUpCount = parsed.followUps;
     }
     this.#runs.set(newHuntId, created);
-    this.#activeHuntId = newHuntId;
+    this.#selectHunt(newHuntId);
     return this.#attachWatchState(created);
   }
 
@@ -494,23 +518,13 @@ export class WorkbenchService {
 
   getWatchState(): WatchBrowserState {
     if (this.#deps.watchHandlers) {
-      return this.#deps.watchHandlers.getState();
+      const state = this.#deps.watchHandlers.getState();
+      if (state.runId === this.#activeHuntId) return state;
+      return this.#standbyWatchState(this.#activeHuntId);
     }
     const snap = this.#runs.get(this.#activeHuntId);
     return (
-      snap?.watchState ?? {
-        enabled: false,
-        runId: this.#activeHuntId,
-        role: "framework-researcher",
-        partition: `hunt-watch:${this.#activeHuntId}:framework-researcher`,
-        currentUrl: "about:blank",
-        title: "Watch Browser (Standby)",
-        loading: false,
-        allowedOrigins: [],
-        blockedRequestCount: 0,
-        lastBlockedReason: null,
-        cdpEndpointUrl: null,
-      }
+      snap?.watchState ?? this.#standbyWatchState(this.#activeHuntId)
     );
   }
 
@@ -519,11 +533,23 @@ export class WorkbenchService {
     if (!this.#deps.watchHandlers) {
       return this.getWatchState();
     }
-    return this.#deps.watchHandlers.setBounds(parsed.bounds);
+    if (parsed.bounds && (parsed.runId !== this.#activeHuntId ||
+      this.#deps.watchHandlers.getState().runId !== parsed.runId)) {
+      throw new Error("Watch bounds do not belong to the active hunt.");
+    }
+    this.#deps.watchHandlers.setBounds(parsed.bounds);
+    return this.getWatchState();
   }
 
   async openWatch(rawInput: unknown): Promise<WatchBrowserState> {
     const parsed = WatchOpenInputSchema.parse(rawInput);
+    if (parsed.runId !== this.#activeHuntId) {
+      throw new Error("Watch session does not belong to the active hunt.");
+    }
+    const current = this.#runs.get(this.#activeHuntId);
+    if (!current || parsed.caseId !== current.caseMetadata.case_id) {
+      throw new Error("Watch case does not match the active hunt.");
+    }
     if (!this.#deps.watchHandlers) {
       throw new Error("Watch Browser controller is not attached in headless test mode.");
     }
@@ -532,6 +558,9 @@ export class WorkbenchService {
 
   async navigateWatch(rawInput: unknown): Promise<WatchBrowserState> {
     const parsed = WatchNavigateInputSchema.parse(rawInput);
+    if (parsed.runId !== this.#activeHuntId) {
+      throw new Error("Watch session does not belong to the active hunt.");
+    }
     if (!this.#deps.watchHandlers) {
       throw new Error("Watch Browser controller is not attached in headless test mode.");
     }
@@ -595,13 +624,36 @@ export class WorkbenchService {
     return { deleted: true, ref: parsed.ref };
   }
 
-  #attachWatchState(snapshot: WorkbenchSnapshot): WorkbenchSnapshot {
-    if (!this.#deps.watchHandlers) {
-      return snapshot;
+  #selectHunt(huntId: string): void {
+    if (this.#activeHuntId !== huntId) {
+      this.#deps.watchHandlers?.invalidate();
+      this.#activeHuntId = huntId;
     }
+  }
+
+  #standbyWatchState(runId: string): WatchBrowserState {
+    return {
+      enabled: false,
+      runId,
+      role: "framework-researcher",
+      partition: `hunt-watch:${runId}:framework-researcher`,
+      currentUrl: "about:blank",
+      title: "Watch Browser (Standby)",
+      loading: false,
+      allowedOrigins: [],
+      blockedRequestCount: 0,
+      lastBlockedReason: null,
+      cdpEndpointUrl: null,
+    };
+  }
+
+  #attachWatchState(snapshot: WorkbenchSnapshot): WorkbenchSnapshot {
+    if (!this.#deps.watchHandlers) return snapshot;
     return {
       ...snapshot,
-      watchState: this.#deps.watchHandlers.getState(),
+      watchState: snapshot.huntId === this.#activeHuntId
+        ? this.getWatchState()
+        : this.#standbyWatchState(snapshot.huntId),
     };
   }
 }

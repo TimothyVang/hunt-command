@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type {
   DaemonEventBatchPayload,
   FilmExportResult,
@@ -6,6 +6,7 @@ import type {
 } from "../../shared/ipc.ts";
 import type { WatchBrowserState, WorkbenchSnapshot } from "../../shared/workbench-types.ts";
 import { invokeDesktop, subscribeDesktopEvent } from "./lib/bridge.ts";
+import { scopeWatchSnapshot } from "./lib/watch-open.ts";
 import { AttackGraphLineagePane } from "./panes/AttackGraphLineagePane.tsx";
 import { ClaimsAndGatesPane } from "./panes/ClaimsAndGatesPane.tsx";
 import { FlightRecorderHeader } from "./panes/FlightRecorderHeader.tsx";
@@ -40,6 +41,19 @@ function WorkbenchUnavailable({
 
 export function App() {
   const ui = useSyncExternalStore(workbenchStore.subscribe, workbenchStore.getState);
+  const selectedHunt = useRef<string | null>(null);
+  const selectionVersion = useRef(0);
+  const [switchingHunt, setSwitchingHunt] = useState(false);
+  const watchEvents = useRef(new Map<string, { version: number; state: WatchBrowserState }>());
+  const watchVersion = useRef(0);
+
+  const applySnapshot = (snapshot: WorkbenchSnapshot, requestVersion: number) => {
+    const latest = watchEvents.current.get(snapshot.huntId);
+    workbenchStore.setWorkbenchSnapshot(scopeWatchSnapshot(
+      snapshot,
+      latest && latest.version > requestVersion ? latest.state : undefined,
+    ));
+  };
 
   const isFilmMode = useMemo(() => {
     if (typeof window === "undefined") return false;
@@ -52,13 +66,17 @@ export function App() {
         ? new URLSearchParams(window.location.search).get("huntId") ?? undefined
         : undefined;
 
+    selectedHunt.current = initialHuntId ?? null;
+    const initialSelection = selectionVersion.current;
+    const initialVersion = watchVersion.current;
     void invokeDesktop<WorkbenchSnapshot>(
       "hunt:getWorkbenchState",
       initialHuntId ? { huntId: initialHuntId } : undefined,
     ).then((res) => {
-      if (res.ok && res.data) {
-        workbenchStore.setWorkbenchSnapshot(res.data);
-      } else {
+      if (res.ok && res.data && initialSelection === selectionVersion.current && (!selectedHunt.current || selectedHunt.current === res.data.huntId)) {
+        selectedHunt.current = res.data.huntId;
+        applySnapshot(res.data, initialVersion);
+      } else if (!res.ok && initialSelection === selectionVersion.current) {
         workbenchStore.setConnectionUnavailable(
           res.error?.code ?? "WORKBENCH_UNAVAILABLE",
           res.error?.message ?? "The main process returned no workbench snapshot.",
@@ -69,18 +87,23 @@ export function App() {
     const unsubBatch = subscribeDesktopEvent<DaemonEventBatchPayload>(
       "daemon:eventBatch",
       (batch) => {
+        if (selectedHunt.current !== batch.huntId) return;
+        const requestVersion = watchVersion.current;
+        const selection = selectionVersion.current;
         void invokeDesktop<WorkbenchSnapshot>("hunt:getWorkbenchState", {
           huntId: batch.huntId,
         }).then((res) => {
-          if (res.ok && res.data) {
-            workbenchStore.setWorkbenchSnapshot(res.data);
+          if (res.ok && res.data && selection === selectionVersion.current && selectedHunt.current === batch.huntId) {
+            applySnapshot(res.data, requestVersion);
           }
         });
       },
     );
 
     const unsubWatch = subscribeDesktopEvent<WatchBrowserState>("watch:stateChanged", (watch) => {
+      watchEvents.current.set(watch.runId, { version: ++watchVersion.current, state: watch });
       const curr = workbenchStore.getState().workbench;
+      if (watch.runId !== curr.huntId || selectedHunt.current !== curr.huntId) return;
       workbenchStore.setWorkbenchSnapshot({
         ...curr,
         watchState: watch,
@@ -94,21 +117,36 @@ export function App() {
   }, []);
 
   const handleSwitchPresetRun = (huntId: string) => {
+    const selection = ++selectionVersion.current;
+    selectedHunt.current = huntId;
+    setSwitchingHunt(true);
+    void invokeDesktop("watch:setBounds", { runId: ui.workbench.huntId, bounds: null });
+    const requestVersion = watchVersion.current;
     void invokeDesktop<WorkbenchSnapshot>("hunt:getWorkbenchState", { huntId }).then((res) => {
-      if (res.ok && res.data) {
-        workbenchStore.setWorkbenchSnapshot(res.data);
+      if (selection !== selectionVersion.current) return;
+      setSwitchingHunt(false);
+      if (res.ok && res.data && selectedHunt.current === huntId) {
+        applySnapshot(res.data, requestVersion);
         workbenchStore.setStatusBanner(null);
+      } else {
+        selectedHunt.current = workbenchStore.getState().workbench.huntId;
+        workbenchStore.setStatusBanner({
+          kind: "error",
+          message: res.error?.message ?? "Could not switch hunts.",
+        });
       }
     });
   };
 
   const handleGlobalStop = () => {
+    const requestVersion = watchVersion.current;
+    const selection = selectionVersion.current;
     void invokeDesktop<WorkbenchSnapshot>("hunt:globalStop", {
       huntId: ui.workbench.huntId,
       reason: "operator_global_stop",
     }).then((res) => {
-      if (res.ok && res.data) {
-        workbenchStore.setWorkbenchSnapshot(res.data);
+      if (res.ok && res.data && selection === selectionVersion.current && selectedHunt.current === res.data.huntId) {
+        applySnapshot(res.data, requestVersion);
         workbenchStore.setStatusBanner({
           kind: "info",
           message: `Global Stop executed on ${res.data.huntId}: all in-flight bot steps halted.`,
@@ -121,6 +159,8 @@ export function App() {
     const gate = ui.workbench.activeGate;
     if (!gate) return;
     const draft = workbenchStore.getActiveGateDraft();
+    const requestVersion = watchVersion.current;
+    const selection = selectionVersion.current;
 
     void invokeDesktop<WorkbenchSnapshot>("hunt:submitGateDecision", {
       huntId: ui.workbench.huntId,
@@ -131,8 +171,8 @@ export function App() {
       checkNote: draft.checkNote,
       payloadSha256: gate.payloadSha256,
     }).then((res) => {
-      if (res.ok && res.data) {
-        workbenchStore.setWorkbenchSnapshot(res.data);
+      if (res.ok && res.data && selection === selectionVersion.current && selectedHunt.current === res.data.huntId) {
+        applySnapshot(res.data, requestVersion);
         workbenchStore.setStatusBanner({
           kind: "success",
           message: `Signed Gate '${gate.gate}' (${action.toUpperCase()}) recorded in decisions.jsonl.`,
@@ -258,6 +298,7 @@ export function App() {
           <div className="h-[56%] min-h-0">
             <ClaimsAndGatesPane
               workbench={ui.workbench}
+              switchingHunt={switchingHunt}
               centerTab={ui.centerTab}
               claimKindFilter={ui.claimKindFilter}
               selectedClaimId={ui.selectedClaimId}
