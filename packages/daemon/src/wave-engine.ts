@@ -15,7 +15,7 @@ import {
   type HuntWave,
   type ProfileId,
 } from "@hunt-command/shared";
-import { GateAuthority, type SubmitGateDecisionInput } from "./gates.ts";
+import { GateAuthority, GateDecisionError, type SubmitGateDecisionInput } from "./gates.ts";
 import { SHARED_CACHE_HEADER, validateNonSyntheticGuidanceText } from "./omp-pool.ts";
 import {
   FINAL_HANDOFF_BYTES,
@@ -468,7 +468,13 @@ export interface HuntWaveEngineOptions {
   readonly modelRunner: ModelRunnerPort;
   readonly telemetry?: TelemetrySinkPort;
   readonly maxConcurrentHunts?: number;
+  /** Factory used to (re)bind a case data plane when a gate decision resumes a run. */
+  readonly resolveDataPlane?: DataPlaneResolver;
 }
+
+export type DataPlaneResolver = (
+  caseId: string,
+) => Promise<HuntDataPlanePort> | HuntDataPlanePort;
 
 export class HuntWaveEngine {
   public readonly stateStore: DurableStateStore;
@@ -476,6 +482,7 @@ export class HuntWaveEngine {
   public readonly modelRunner: ModelRunnerPort;
   public readonly telemetry: TelemetrySinkPort;
   public readonly maxConcurrentHunts: number;
+  public readonly resolveDataPlane?: DataPlaneResolver;
 
   private readonly activeControllers = new Map<string, AbortController>();
   private readonly dataPlanesByRun = new Map<string, HuntDataPlanePort>();
@@ -486,6 +493,7 @@ export class HuntWaveEngine {
     this.modelRunner = options.modelRunner;
     this.telemetry = options.telemetry ?? new NoopTelemetrySink();
     this.maxConcurrentHunts = options.maxConcurrentHunts ?? MAX_CONCURRENT_HUNTS;
+    this.resolveDataPlane = options.resolveDataPlane;
   }
 
   public registerDataPlaneForRun(runId: string, dataPlane: HuntDataPlanePort): void {
@@ -505,6 +513,11 @@ export class HuntWaveEngine {
    *   human `reconcile` gate — NEVER auto-rerunning!
    */
   public recoverInFlightRunsOnStartup(): PersistedHuntRun[] {
+    if (this.activeControllers.size > 0) {
+      throw new Error(
+        `recover_refused_active_hunts: ${this.activeControllers.size} hunt(s) are actively executing; recovery only runs at daemon startup`,
+      );
+    }
     const runningRuns = this.stateStore.listRuns("running");
     const recovered: PersistedHuntRun[] = [];
 
@@ -708,61 +721,71 @@ export class HuntWaveEngine {
   /**
    * Submits an authenticated human (or non-human intermediate) gate decision and
    * automatically advances execution if approved!
+   *
+   * Ordering is fail-closed: validate (pure) -> resolve the data plane when the decision
+   * would resume execution -> ONE atomic SQLite commit (gate-open check + unique decision +
+   * run transition) -> audit log append -> resume. Nothing is mutated if validation or
+   * data-plane resolution fails.
    */
   public async submitGateDecision(
     input: SubmitGateDecisionInput,
     dataPlaneOverride?: HuntDataPlanePort,
   ): Promise<PersistedHuntRun> {
-    const run = this.stateStore.getRun(input.huntId);
-    if (!run) {
+    const snapshot = this.stateStore.getRun(input.huntId);
+    if (!snapshot) {
       throw new Error(`Unknown hunt run_id '${input.huntId}'`);
     }
-    if (run.status !== "awaiting_gate" || !run.open_gate) {
+    if (snapshot.status !== "awaiting_gate" || !snapshot.open_gate) {
       throw new Error(`Hunt '${input.huntId}' is not currently awaiting a gate decision`);
     }
+    if (this.activeControllers.has(snapshot.run_id)) {
+      throw new Error(`Hunt '${snapshot.run_id}' is already actively executing`);
+    }
 
-    const activeGate = run.open_gate;
-    const { decision } = this.gateAuthority.validateAndRecordDecision(activeGate, input);
+    const activeGate = snapshot.open_gate;
+    const { decision, auditRecord } = this.gateAuthority.validateDecision(activeGate, input);
+    const transition = this.planGateTransition(snapshot, activeGate, decision.action);
+
+    let dp: HuntDataPlanePort | undefined;
+    if (transition.resume) {
+      dp =
+        dataPlaneOverride ??
+        this.dataPlanesByRun.get(snapshot.run_id) ??
+        (this.resolveDataPlane ? await this.resolveDataPlane(snapshot.case_id) : undefined);
+      if (!dp) {
+        throw new Error(
+          `Hunt '${snapshot.run_id}' cannot resume after gate '${activeGate.gate}': no HuntDataPlanePort is bound or resolvable (decision NOT recorded)`,
+        );
+      }
+    }
+
+    const committed = this.stateStore.commitGateDecision({
+      decision,
+      expectedOpenGate: activeGate,
+      mutate: (run) => transition.apply(run),
+    });
+    if (committed.outcome === "decision_id_replayed") {
+      throw new GateDecisionError(
+        "decision_id_replayed",
+        `Replay blocked: decision_id '${decision.decision_id}' has already been consumed`,
+      );
+    }
+    if (committed.outcome !== "committed") {
+      throw new GateDecisionError(
+        "gate_not_open",
+        `Gate '${activeGate.gate}' on hunt '${snapshot.run_id}' is no longer open (already decided or changed)`,
+      );
+    }
+    const run = committed.run;
+
+    this.gateAuthority.finalizeCommittedDecision(activeGate, auditRecord);
     this.telemetry.onGateDecision?.(decision);
 
-    run.decisions.push(decision);
-    run.open_gate = null;
-
-    if (decision.action === "reject") {
-      run.status = "failed";
-      run.reason_code =
-        activeGate.gate === RECONCILE_GATE ? "reconcile_rejected" : `gate_${activeGate.gate}_rejected`;
-      for (const [sid, st] of Object.entries(run.step_states)) {
-        if (st === "awaiting_review" || st === "awaiting_approval") {
-          run.step_states[sid] = "stopped";
-        }
-      }
-      this.stateStore.saveRun(run);
+    if (transition.kind === "reject") {
       this.telemetry.emit(run.run_id, "hunt.failed", { reason_code: run.reason_code });
       return run;
     }
-
-    // Action === "approve"
-    if (activeGate.gate === "scope") {
-      const scopeRes = run.results["scope"];
-      if (scopeRes?.handoff) {
-        run.reviewed_handoffs["scope"] = scopeRes.handoff;
-      }
-      run.step_states["scope"] = "done";
-      run.wave_index = 1;
-      run.wave = HUNT_WAVES[1]!;
-      run.status = "running";
-      run.reason_code = null;
-      this.stateStore.saveRun(run);
-    } else if (activeGate.gate === "incident") {
-      const incRes = run.results["incident"];
-      if (incRes?.handoff) {
-        run.reviewed_handoffs["incident"] = incRes.handoff;
-      }
-      run.step_states["incident"] = "done";
-      run.status = "completed";
-      run.reason_code = null;
-      this.stateStore.saveRun(run);
+    if (transition.kind === "incident") {
       this.stateStore.checkpointWal();
       this.telemetry.checkpoint?.();
       this.telemetry.emit(run.run_id, "hunt.completed", {
@@ -771,7 +794,79 @@ export class HuntWaveEngine {
         shadow_api_usd: run.token_ledger.shadow_api_usd,
       });
       return run;
-    } else if (activeGate.gate === RECONCILE_GATE) {
+    }
+    if (!transition.resume || !dp) {
+      return run;
+    }
+
+    this.dataPlanesByRun.set(run.run_id, dp);
+    return this.driveUntilGateOrTerminal(run.run_id, dp);
+  }
+
+  /** Deterministically plans the run transition for a gate decision (no side effects). */
+  private planGateTransition(
+    run: PersistedHuntRun,
+    activeGate: NonNullable<PersistedHuntRun["open_gate"]>,
+    action: "approve" | "reject",
+  ): {
+    kind: "reject" | "scope" | "incident" | "reconcile_drop" | "reconcile_halt" | "advance";
+    resume: boolean;
+    apply: (run: PersistedHuntRun) => void;
+  } {
+    if (action === "reject") {
+      return {
+        kind: "reject",
+        resume: false,
+        apply: (r) => {
+          r.status = "failed";
+          r.reason_code =
+            activeGate.gate === RECONCILE_GATE
+              ? "reconcile_rejected"
+              : `gate_${activeGate.gate}_rejected`;
+          for (const [sid, st] of Object.entries(r.step_states)) {
+            if (st === "awaiting_review" || st === "awaiting_approval") {
+              r.step_states[sid] = "stopped";
+            }
+          }
+        },
+      };
+    }
+
+    if (activeGate.gate === "scope") {
+      return {
+        kind: "scope",
+        resume: true,
+        apply: (r) => {
+          const scopeRes = r.results["scope"];
+          if (scopeRes?.handoff) {
+            r.reviewed_handoffs["scope"] = scopeRes.handoff;
+          }
+          r.step_states["scope"] = "done";
+          r.wave_index = 1;
+          r.wave = HUNT_WAVES[1]!;
+          r.status = "running";
+          r.reason_code = null;
+        },
+      };
+    }
+
+    if (activeGate.gate === "incident") {
+      return {
+        kind: "incident",
+        resume: false,
+        apply: (r) => {
+          const incRes = r.results["incident"];
+          if (incRes?.handoff) {
+            r.reviewed_handoffs["incident"] = incRes.handoff;
+          }
+          r.step_states["incident"] = "done";
+          r.status = "completed";
+          r.reason_code = null;
+        },
+      };
+    }
+
+    if (activeGate.gate === RECONCILE_GATE) {
       // Human operator explicitly reconciled an unknown step
       const unknownStepId = activeGate.unknown_step_id;
       const waves = buildEightWaveGraph({
@@ -780,40 +875,56 @@ export class HuntWaveEngine {
       });
       const spec = waves.flat().find((s) => s.stepId === unknownStepId);
       if (unknownStepId && spec?.optional) {
-        run.step_states[unknownStepId] = "dropped";
-        run.results[unknownStepId] = {
-          step_id: unknownStepId,
-          wave: spec.wave,
-          profile: spec.profile,
-          status: "dropped",
-          reason_code: "reconciled_drop",
-          attempts: 0,
-          finished_at: new Date().toISOString(),
+        return {
+          kind: "reconcile_drop",
+          resume: true,
+          apply: (r) => {
+            r.step_states[unknownStepId] = "dropped";
+            r.results[unknownStepId] = {
+              step_id: unknownStepId,
+              wave: spec.wave,
+              profile: spec.profile,
+              status: "dropped",
+              reason_code: "reconciled_drop",
+              attempts: 0,
+              finished_at: new Date().toISOString(),
+            };
+            r.status = "running";
+            r.reason_code = null;
+          },
         };
-        run.status = "running";
-        run.reason_code = null;
-        this.stateStore.saveRun(run);
-      } else {
-        // Required step was unknown and cannot materialize a verified typed handoff without re-running
-        run.status = "failed";
-        run.reason_code = "reconciled_halt_required_step";
-        this.stateStore.saveRun(run);
-        return run;
       }
-    } else {
-      run.status = "running";
-      run.reason_code = null;
-      this.stateStore.saveRun(run);
+      // Required step was unknown and cannot materialize a verified typed handoff without re-running
+      return {
+        kind: "reconcile_halt",
+        resume: false,
+        apply: (r) => {
+          r.status = "failed";
+          r.reason_code = "reconciled_halt_required_step";
+        },
+      };
     }
 
-    const dp = dataPlaneOverride ?? this.dataPlanesByRun.get(run.run_id);
-    if (!dp) {
-      throw new Error(
-        `Hunt '${run.run_id}' gate approved, but no HuntDataPlanePort is bound for resumption`,
-      );
-    }
-    this.dataPlanesByRun.set(run.run_id, dp);
-    return this.driveUntilGateOrTerminal(run.run_id, dp);
+    return {
+      kind: "advance",
+      resume: true,
+      apply: (r) => {
+        r.status = "running";
+        r.reason_code = null;
+      },
+    };
+  }
+
+  /**
+   * Lists runs left `status === "running"` with no live controller in this process (e.g. a
+   * crash between waves, or a committed approval whose resumption failed). They are safe to
+   * continue with `resumeParkedRun`, because ambiguous in-flight dispatches were already parked
+   * behind a `reconcile` gate by `recoverInFlightRunsOnStartup()`.
+   */
+  public listResumableRuns(): PersistedHuntRun[] {
+    return this.stateStore
+      .listRuns("running")
+      .filter((r) => !this.activeControllers.has(r.run_id));
   }
 
   public async resumeParkedRun(

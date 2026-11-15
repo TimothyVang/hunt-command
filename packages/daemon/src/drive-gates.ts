@@ -1,5 +1,5 @@
 import { requiresHumanDecision } from "@hunt-command/shared";
-import { GateDecisionError, type RbacRole } from "./gates.ts";
+import { GateDecisionError } from "./gates.ts";
 import type { PersistedHuntRun } from "./state-store.ts";
 import type { HuntWaveEngine } from "./wave-engine.ts";
 
@@ -7,8 +7,10 @@ export interface DriveGatesCommandInput {
   readonly action: "status" | "approve" | "reject" | "deny";
   readonly huntId: string;
   readonly gate?: string;
-  readonly operator?: string;
-  readonly rbacRole?: RbacRole;
+  /**
+   * Required for approve/reject: the operator principal and RBAC role are taken ONLY from
+   * this verified HMAC session token (caller-supplied principal/role are never trusted).
+   */
   readonly operatorToken?: string;
   readonly checkNote?: string;
   readonly payloadSha256?: string;
@@ -113,8 +115,6 @@ export async function executeDriveGates(
     gate: targetGate,
     action: normalizedAction,
     via: input.automated ? "automated" : "cli",
-    authenticatedPrincipal: input.operator ?? input.delegatedBy,
-    rbacRole: input.rbacRole ?? "analyst",
     operatorToken: input.operatorToken,
     payloadSha256: input.payloadSha256 ?? run.open_gate.payload_sha256,
     checkNote: input.checkNote,

@@ -172,6 +172,33 @@ export class OperatorSessionAuthority {
   }
 }
 
+/**
+ * Loads (or creates once, exclusively, mode 0600) the operator-session HMAC secret stored in the
+ * runtime dir, so tokens minted by the local human-facing CLI verify in the serving daemon.
+ * Possession of the runtime dir is the trust boundary; the secret is never exposed over RPC.
+ */
+export function loadOrCreateOperatorSessionSecret(secretPath: string): Buffer {
+  fs.mkdirSync(path.dirname(secretPath), { recursive: true });
+  if (!fs.existsSync(secretPath)) {
+    // Write a complete temp file, then hard-link it into place (atomic create-if-absent),
+    // so a concurrent reader never observes a partially written secret.
+    const tmpPath = `${secretPath}.tmp.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
+    fs.writeFileSync(tmpPath, crypto.randomBytes(32).toString("hex"), { mode: 0o600, flag: "wx" });
+    try {
+      fs.linkSync(tmpPath, secretPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    } finally {
+      fs.unlinkSync(tmpPath);
+    }
+  }
+  const hex = fs.readFileSync(secretPath, "utf8").trim();
+  if (!/^[0-9a-f]{64}$/.test(hex)) {
+    throw new Error(`Operator session secret at '${secretPath}' is malformed`);
+  }
+  return Buffer.from(hex, "hex");
+}
+
 export interface PendingGateReviewEnvelope {
   readonly card: SanitizedGateCardPayload;
   readonly action_nonce: string;
@@ -355,7 +382,38 @@ export class GateAuthority {
     }
   }
 
+  /**
+   * Standalone validate + record (no run row). The wave engine instead uses `validateDecision`
+   * followed by the atomic `DurableStateStore.commitGateDecision` and `finalizeCommittedDecision`.
+   */
   public validateAndRecordDecision(
+    openGate: OpenGateState | null,
+    input: SubmitGateDecisionInput,
+  ): { decision: AuthenticatedGateDecision; auditRecord: AuditedDecisionLogRecord } {
+    const validated = this.validateDecision(openGate, input);
+    // Atomic replay protection in SQLite BEFORE appending to decisions.jsonl
+    const unique = this.stateStore.recordUniqueDecisionId(validated.decision);
+    if (!unique) {
+      throw new GateDecisionError(
+        "decision_id_replayed",
+        `Replay blocked: decision_id '${validated.decision.decision_id}' has already been consumed`,
+      );
+    }
+    this.finalizeCommittedDecision(openGate, validated.auditRecord);
+    return validated;
+  }
+
+  /** Appends the audit record and removes review artifacts AFTER the decision is committed. */
+  public finalizeCommittedDecision(
+    openGate: OpenGateState | null,
+    auditRecord: AuditedDecisionLogRecord,
+  ): void {
+    appendDecisionLogAtomic(this.decisionsLogPath, auditRecord);
+    this.removeReviewArtifacts(openGate);
+  }
+
+  /** Pure validation: authenticates, checks RBAC/digest/expiry/note, and builds the records. */
+  public validateDecision(
     openGate: OpenGateState | null,
     input: SubmitGateDecisionInput,
   ): { decision: AuthenticatedGateDecision; auditRecord: AuditedDecisionLogRecord } {
@@ -372,10 +430,20 @@ export class GateAuthority {
       openGate.requires_human ||
       input.gate === RECONCILE_GATE;
 
-    // Resolve principal + RBAC role from cryptographic operatorToken when provided
-    let principal = input.authenticatedPrincipal?.trim() ?? "";
-    let rbacRole = input.rbacRole?.trim() ?? "";
-    if (input.operatorToken) {
+    // Principal + RBAC role come ONLY from a verified operatorToken, except for the in-process
+    // Slack bridge (`via: "slack"`), which authenticates via its allowlisted user.id itself.
+    let principal: string;
+    let rbacRole: string;
+    if (input.via === "slack") {
+      principal = input.authenticatedPrincipal?.trim() ?? "";
+      rbacRole = input.rbacRole?.trim() ?? "";
+    } else {
+      if (!input.operatorToken) {
+        throw new GateDecisionError(
+          "invalid_operator_token",
+          `A verified operator_token is required for gate decisions via='${input.via}'`,
+        );
+      }
       const verified = this.sessionAuthority.verifyToken(input.operatorToken, nowMs);
       principal = verified.principal;
       rbacRole = verified.rbacRole;
@@ -480,15 +548,6 @@ export class GateAuthority {
       );
     }
 
-    // Atomic replay protection in SQLite BEFORE appending to decisions.jsonl
-    const unique = this.stateStore.recordUniqueDecisionId(parsed.data);
-    if (!unique) {
-      throw new GateDecisionError(
-        "decision_id_replayed",
-        `Replay blocked: decision_id '${parsed.data.decision_id}' has already been consumed`,
-      );
-    }
-
     const auditRecord: AuditedDecisionLogRecord = {
       decision_id: parsed.data.decision_id,
       hunt_id: parsed.data.hunt_id,
@@ -506,9 +565,6 @@ export class GateAuthority {
       ...(input.delegatedBy ? { delegated_by: input.delegatedBy } : {}),
       ...(input.delegationReason ? { delegation_reason: input.delegationReason } : {}),
     };
-
-    appendDecisionLogAtomic(this.decisionsLogPath, auditRecord);
-    this.removeReviewArtifacts(openGate);
 
     return { decision: parsed.data, auditRecord };
   }

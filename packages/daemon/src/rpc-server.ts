@@ -9,7 +9,7 @@ import {
   type RpcResponse,
 } from "@hunt-command/shared";
 import { executeDriveGates, type DriveGatesCommandInput } from "./drive-gates.ts";
-import { GateDecisionError, type RbacRole } from "./gates.ts";
+import { GateDecisionError } from "./gates.ts";
 import type { DaemonTelemetryEvent, HuntDataPlanePort } from "./ports.ts";
 import type { HuntWaveEngine } from "./wave-engine.ts";
 
@@ -92,7 +92,7 @@ export class HuntDaemonRpcServer {
 
   constructor(options: HuntDaemonRpcServerOptions, maxLineBytes = DEFAULT_MAX_NDJSON_LINE_BYTES) {
     this.engine = options.engine;
-    this.resolveDataPlane = options.resolveDataPlane;
+    this.resolveDataPlane = options.resolveDataPlane ?? options.engine.resolveDataPlane;
     this.writeLine = options.writeLine;
     this.splitter = new LineSplitter(maxLineBytes);
   }
@@ -199,17 +199,6 @@ export class HuntDaemonRpcServer {
           };
         }
 
-        case "daemon.issueOperatorToken": {
-          const principal = typeof params.principal === "string" ? params.principal : "";
-          const role = (typeof params.rbac_role === "string" ? params.rbac_role : "analyst") as RbacRole;
-          const token = this.engine.gateAuthority.sessionAuthority.issueToken(principal, role);
-          return {
-            jsonrpc: "2.0",
-            id: req.id,
-            result: { token, principal, rbac_role: role },
-          };
-        }
-
         case "hunt.start": {
           const caseId = typeof params.case_id === "string" ? params.case_id : "";
           const scopeText = typeof params.scope === "string" ? params.scope : "";
@@ -265,22 +254,20 @@ export class HuntDaemonRpcServer {
         }
 
         case "hunt.decideGate": {
+          if (params.via === "slack") {
+            throw new GateDecisionError(
+              "automated_channel_forbidden",
+              "via='slack' is reserved for the in-process Slack bridge and is not accepted over RPC",
+            );
+          }
           const updated = await this.engine.submitGateDecision({
             decisionId: typeof params.decision_id === "string" ? params.decision_id : undefined,
             huntId: String(params.hunt_id ?? ""),
             gate: String(params.gate ?? ""),
             action: params.action === "reject" ? "reject" : "approve",
-            via:
-              params.via === "desktop" ||
-              params.via === "slack" ||
-              params.via === "automated"
-                ? params.via
-                : "cli",
-            authenticatedPrincipal:
-              typeof params.authenticated_principal === "string"
-                ? params.authenticated_principal
-                : undefined,
-            rbacRole: typeof params.rbac_role === "string" ? params.rbac_role : undefined,
+            // `slack` is reserved for the in-process Slack bridge and is never accepted over RPC;
+            // principal/RBAC role come only from the verified `operator_token`.
+            via: params.via === "desktop" || params.via === "automated" ? params.via : "cli",
             operatorToken:
               typeof params.operator_token === "string" ? params.operator_token : undefined,
             payloadSha256: String(params.payload_sha256 ?? ""),
@@ -290,12 +277,31 @@ export class HuntDaemonRpcServer {
         }
 
         case "hunt.recover": {
+          if (this.engine.getActiveHuntCount() > 0) {
+            throw new Error(
+              "recover_refused_active_hunts: hunt.recover is rejected while hunts are actively executing",
+            );
+          }
           const recovered = this.engine.recoverInFlightRunsOnStartup();
           return {
             jsonrpc: "2.0",
             id: req.id,
             result: { recovered_count: recovered.length, runs: recovered },
           };
+        }
+
+        case "hunt.resume": {
+          const runId = typeof params.run_id === "string" ? params.run_id : "";
+          const run = this.engine.stateStore.getRun(runId);
+          if (!run) {
+            throw new Error(`Unknown hunt '${runId}'`);
+          }
+          if (!this.resolveDataPlane) {
+            throw new Error("No resolveDataPlane factory configured on HuntDaemonRpcServer");
+          }
+          const dataPlane = await this.resolveDataPlane(run.case_id);
+          const resumed = await this.engine.resumeParkedRun(runId, dataPlane);
+          return { jsonrpc: "2.0", id: req.id, result: resumed };
         }
 
         case "driveGates.run": {

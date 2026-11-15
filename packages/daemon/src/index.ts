@@ -11,4 +11,5 @@ export * from "./wave-engine.ts";
 export * from "./slack-bridge.ts";
 export * from "./drive-gates.ts";
 export * from "./rpc-server.ts";
+export * from "./runtime-lock.ts";
 export * from "./cli.ts";

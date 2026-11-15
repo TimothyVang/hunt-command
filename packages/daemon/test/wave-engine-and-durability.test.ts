@@ -285,8 +285,7 @@ describe("8-Wave Hunt Engine, Merge Fallback, Capabilities, Durability & Budget"
       gate: "scope",
       action: "approve",
       via: "cli",
-      authenticatedPrincipal: "analyst-alice",
-      rbacRole: "analyst",
+      operatorToken: gates.sessionAuthority.issueToken("analyst-alice", "analyst"),
       payloadSha256: afterWave1.open_gate!.payload_sha256,
       checkNote: "Reviewed scope boundaries and time window.",
     });
@@ -323,8 +322,7 @@ describe("8-Wave Hunt Engine, Merge Fallback, Capabilities, Durability & Budget"
       gate: "incident",
       action: "approve",
       via: "desktop",
-      authenticatedPrincipal: "lead-bob",
-      rbacRole: "reviewer",
+      operatorToken: gates.sessionAuthority.issueToken("lead-bob", "reviewer"),
       payloadSha256: afterWave8.open_gate!.payload_sha256,
       checkNote: "Confirmed all inline evt-101 and frame-7 citations match case store.",
     });
@@ -393,8 +391,7 @@ describe("8-Wave Hunt Engine, Merge Fallback, Capabilities, Durability & Budget"
       gate: "scope",
       action: "approve",
       via: "cli",
-      authenticatedPrincipal: "op-1",
-      rbacRole: "admin",
+      operatorToken: gates.sessionAuthority.issueToken("op-1", "admin"),
       payloadSha256: w1.open_gate!.payload_sha256,
       checkNote: "Scope approved.",
     });
@@ -472,8 +469,7 @@ describe("8-Wave Hunt Engine, Merge Fallback, Capabilities, Durability & Budget"
       gate: "scope",
       action: "approve",
       via: "cli",
-      authenticatedPrincipal: "op-1",
-      rbacRole: "analyst",
+      operatorToken: gates.sessionAuthority.issueToken("op-1", "analyst"),
       payloadSha256: w1.open_gate!.payload_sha256,
       checkNote: "Proceed to Wave 2.",
     });

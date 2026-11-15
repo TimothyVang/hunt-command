@@ -20,6 +20,7 @@ packages/daemon/src/omp-pool.ts
 packages/daemon/src/ontology-validator.ts
 packages/daemon/src/ports.ts
 packages/daemon/src/rpc-server.ts
+packages/daemon/src/runtime-lock.ts
 packages/daemon/src/scrubber-and-fence.ts
 packages/daemon/src/slack-bridge.ts
 packages/daemon/src/state-store.ts
@@ -28,6 +29,7 @@ packages/daemon/src/wave-engine.ts
 packages/daemon/test/gates-slack-rpc.test.ts
 packages/daemon/test/omp-pool-live.test.ts
 packages/daemon/test/ontology-validator.test.ts
+packages/daemon/test/review-regressions.test.ts
 packages/daemon/test/scrubber-and-fence.test.ts
 packages/daemon/test/wave-engine-and-durability.test.ts
 packages/data-plane/package.json

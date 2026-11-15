@@ -161,13 +161,12 @@ describe("Governed Human Gates, EgressGuard, Slack Socket Mode & NDJSON RPC", ()
         gate: "scope",
         action: "approve",
         via: "automated",
-        authenticatedPrincipal: "ci-bot",
-        rbacRole: "admin",
+        operatorToken: gates.sessionAuthority.issueToken("ci-bot", "admin"),
         payloadSha256: openGate.payload_sha256,
         checkNote: "auto",
         nowMs: 1_010_000,
       }),
-    ).toThrow(GateDecisionError);
+    ).toThrow(/rejects via='automated'/);
 
     // 2. Rejects `viewer` RBAC role
     const viewerToken = gates.sessionAuthority.issueToken("bob-viewer", "viewer");
@@ -498,15 +497,14 @@ describe("Governed Human Gates, EgressGuard, Slack Socket Mode & NDJSON RPC", ()
         action: "approve",
         huntId: "hunt-rpc-01",
         automated: true,
-        operator: "ci",
+        operatorToken: gates.sessionAuthority.issueToken("ci", "admin"),
       }),
     ).rejects.toThrow(/forbidden/);
 
     const gateApprove = await executeDriveGates(engine, {
       action: "approve",
       huntId: "hunt-rpc-01",
-      operator: "cli-alice",
-      rbacRole: "analyst",
+      operatorToken: gates.sessionAuthority.issueToken("cli-alice", "analyst"),
       checkNote: "Approved scope via drive_gates.",
     });
     expect(gateApprove.ok).toBe(true);

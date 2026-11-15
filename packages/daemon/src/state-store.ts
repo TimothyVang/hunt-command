@@ -140,6 +140,12 @@ export type ReserveReceiptOutcome =
       readonly receipt: DispatchReceiptRow;
     };
 
+export type CommitGateDecisionOutcome =
+  | { readonly outcome: "committed"; readonly run: PersistedHuntRun }
+  | { readonly outcome: "gate_not_open" }
+  | { readonly outcome: "decision_id_replayed" }
+  | { readonly outcome: "gate_already_decided" };
+
 export function computeDispatchFingerprint(payload: {
   runId: string;
   stepId: string;
@@ -238,6 +244,14 @@ export class DurableStateStore {
         payload_sha256 TEXT NOT NULL,
         decided_by TEXT NOT NULL,
         decided_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS gate_instance_decisions (
+        hunt_id TEXT NOT NULL,
+        gate TEXT NOT NULL,
+        gate_instance TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        PRIMARY KEY (hunt_id, gate, gate_instance)
       );
     `);
   }
@@ -428,60 +442,9 @@ export class DurableStateStore {
   }
 
   public saveRun(run: PersistedHuntRun): void {
-    const now = new Date().toISOString();
-    run.updated_at = now;
     this.db.exec("BEGIN IMMEDIATE;");
     try {
-      this.db
-        .query(
-          `INSERT INTO hunt_runs (
-            run_id, case_id, data_origin, synthetic_only, wave, wave_index,
-            status, reason_code, step_states_json, results_json,
-            handoff_rejections_json, reviewed_handoffs_json, delegated_ledger_json,
-            open_gate_json, decisions_json, token_ledger_json, citation_receipt_json,
-            snapshot_json, config_json, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(run_id) DO UPDATE SET
-            wave = excluded.wave,
-            wave_index = excluded.wave_index,
-            status = excluded.status,
-            reason_code = excluded.reason_code,
-            step_states_json = excluded.step_states_json,
-            results_json = excluded.results_json,
-            handoff_rejections_json = excluded.handoff_rejections_json,
-            reviewed_handoffs_json = excluded.reviewed_handoffs_json,
-            delegated_ledger_json = excluded.delegated_ledger_json,
-            open_gate_json = excluded.open_gate_json,
-            decisions_json = excluded.decisions_json,
-            token_ledger_json = excluded.token_ledger_json,
-            citation_receipt_json = excluded.citation_receipt_json,
-            snapshot_json = excluded.snapshot_json,
-            config_json = excluded.config_json,
-            updated_at = excluded.updated_at;`,
-        )
-        .run(
-          run.run_id,
-          run.case_id,
-          run.data_origin,
-          run.synthetic_only ? 1 : 0,
-          run.wave,
-          run.wave_index,
-          run.status,
-          run.reason_code,
-          JSON.stringify(run.step_states),
-          JSON.stringify(run.results),
-          JSON.stringify(run.handoff_rejections),
-          JSON.stringify(run.reviewed_handoffs),
-          JSON.stringify(run.delegated_ledger),
-          run.open_gate ? JSON.stringify(run.open_gate) : null,
-          JSON.stringify(run.decisions),
-          JSON.stringify(run.token_ledger),
-          run.citation_receipt ? JSON.stringify(run.citation_receipt) : null,
-          run.snapshot ? JSON.stringify(run.snapshot) : null,
-          JSON.stringify(run.config),
-          run.created_at,
-          run.updated_at,
-        );
+      this.writeRunRow(run);
       this.db.exec("COMMIT;");
     } catch (err) {
       try {
@@ -489,6 +452,61 @@ export class DurableStateStore {
       } catch {}
       throw err;
     }
+  }
+
+  /** Upserts one `hunt_runs` row; callers MUST already hold a `BEGIN IMMEDIATE` transaction. */
+  private writeRunRow(run: PersistedHuntRun): void {
+    run.updated_at = new Date().toISOString();
+    this.db
+      .query(
+        `INSERT INTO hunt_runs (
+          run_id, case_id, data_origin, synthetic_only, wave, wave_index,
+          status, reason_code, step_states_json, results_json,
+          handoff_rejections_json, reviewed_handoffs_json, delegated_ledger_json,
+          open_gate_json, decisions_json, token_ledger_json, citation_receipt_json,
+          snapshot_json, config_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET
+          wave = excluded.wave,
+          wave_index = excluded.wave_index,
+          status = excluded.status,
+          reason_code = excluded.reason_code,
+          step_states_json = excluded.step_states_json,
+          results_json = excluded.results_json,
+          handoff_rejections_json = excluded.handoff_rejections_json,
+          reviewed_handoffs_json = excluded.reviewed_handoffs_json,
+          delegated_ledger_json = excluded.delegated_ledger_json,
+          open_gate_json = excluded.open_gate_json,
+          decisions_json = excluded.decisions_json,
+          token_ledger_json = excluded.token_ledger_json,
+          citation_receipt_json = excluded.citation_receipt_json,
+          snapshot_json = excluded.snapshot_json,
+          config_json = excluded.config_json,
+          updated_at = excluded.updated_at;`,
+      )
+      .run(
+        run.run_id,
+        run.case_id,
+        run.data_origin,
+        run.synthetic_only ? 1 : 0,
+        run.wave,
+        run.wave_index,
+        run.status,
+        run.reason_code,
+        JSON.stringify(run.step_states),
+        JSON.stringify(run.results),
+        JSON.stringify(run.handoff_rejections),
+        JSON.stringify(run.reviewed_handoffs),
+        JSON.stringify(run.delegated_ledger),
+        run.open_gate ? JSON.stringify(run.open_gate) : null,
+        JSON.stringify(run.decisions),
+        JSON.stringify(run.token_ledger),
+        run.citation_receipt ? JSON.stringify(run.citation_receipt) : null,
+        run.snapshot ? JSON.stringify(run.snapshot) : null,
+        JSON.stringify(run.config),
+        run.created_at,
+        run.updated_at,
+      );
   }
 
   private mapRunRow(raw: Record<string, unknown>): PersistedHuntRun {
@@ -579,6 +597,94 @@ export class DurableStateStore {
         );
       this.db.exec("COMMIT;");
       return true;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK;");
+      } catch {}
+      throw err;
+    }
+  }
+
+  /**
+   * Atomically consumes one gate decision inside a single `BEGIN IMMEDIATE` transaction:
+   * re-reads the run, verifies the SAME gate instance is still open, inserts the unique
+   * `decision_id` plus the `(hunt_id, gate, gate_instance)` row, applies `mutate`, and
+   * writes the run. Any failure rolls back, so the `decision_id` is never burned.
+   */
+  public commitGateDecision(params: {
+    decision: AuthenticatedGateDecision;
+    expectedOpenGate: OpenGateState;
+    mutate: (run: PersistedHuntRun) => void;
+  }): CommitGateDecisionOutcome {
+    const { decision, expectedOpenGate } = params;
+    const gateInstance = `${expectedOpenGate.payload_sha256}@${expectedOpenGate.opened_at}`;
+    this.db.exec("BEGIN IMMEDIATE;");
+    try {
+      const raw = this.db
+        .query<Record<string, unknown>, [string]>("SELECT * FROM hunt_runs WHERE run_id = ?;")
+        .get(decision.hunt_id);
+      const run = raw ? this.mapRunRow(raw) : null;
+      const open = run?.open_gate;
+      if (
+        !run ||
+        run.status !== "awaiting_gate" ||
+        !open ||
+        open.gate !== expectedOpenGate.gate ||
+        open.payload_sha256 !== expectedOpenGate.payload_sha256 ||
+        open.opened_at !== expectedOpenGate.opened_at
+      ) {
+        this.db.exec("ROLLBACK;");
+        return { outcome: "gate_not_open" };
+      }
+
+      const seenId = this.db
+        .query<{ decision_id: string }, [string]>(
+          "SELECT decision_id FROM seen_gate_decisions WHERE decision_id = ?;",
+        )
+        .get(decision.decision_id);
+      if (seenId) {
+        this.db.exec("ROLLBACK;");
+        return { outcome: "decision_id_replayed" };
+      }
+
+      const seenInstance = this.db
+        .query<{ decision_id: string }, [string, string, string]>(
+          "SELECT decision_id FROM gate_instance_decisions WHERE hunt_id = ? AND gate = ? AND gate_instance = ?;",
+        )
+        .get(decision.hunt_id, decision.gate, gateInstance);
+      if (seenInstance) {
+        this.db.exec("ROLLBACK;");
+        return { outcome: "gate_already_decided" };
+      }
+
+      this.db
+        .query(
+          `INSERT INTO seen_gate_decisions (
+            decision_id, hunt_id, gate, action, payload_sha256, decided_by, decided_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?);`,
+        )
+        .run(
+          decision.decision_id,
+          decision.hunt_id,
+          decision.gate,
+          decision.action,
+          decision.payload_sha256,
+          decision.decided_by,
+          decision.decided_at,
+        );
+      this.db
+        .query(
+          `INSERT INTO gate_instance_decisions (hunt_id, gate, gate_instance, decision_id)
+           VALUES (?, ?, ?, ?);`,
+        )
+        .run(decision.hunt_id, decision.gate, gateInstance, decision.decision_id);
+
+      run.decisions.push(decision);
+      run.open_gate = null;
+      params.mutate(run);
+      this.writeRunRow(run);
+      this.db.exec("COMMIT;");
+      return { outcome: "committed", run };
     } catch (err) {
       try {
         this.db.exec("ROLLBACK;");
