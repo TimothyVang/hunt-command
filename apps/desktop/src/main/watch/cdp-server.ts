@@ -46,15 +46,23 @@ export class CdpEndpoint {
         rejectUpgrade(socket, 503, "Service Unavailable");
         return;
       }
-      const ws = acceptUpgrade(req, socket, head, { maxMessageBytes: MAX_MESSAGE_BYTES });
+      const ws = acceptUpgrade(req, socket, { maxMessageBytes: MAX_MESSAGE_BYTES });
       if (!ws) return;
       this.#clients += 1;
       const connId = this.#hub.connect(ws);
-      ws.onMessage((text) => this.#hub.message(connId, text));
-      ws.onClose(() => {
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
         this.#clients -= 1;
         this.#hub.disconnect(connId);
-      });
+      };
+      ws.onMessage((text) => this.#hub.message(connId, text));
+      ws.onClose(release);
+      // Belt and braces: whatever way the socket goes away, the client slot is returned.
+      socket.once("close", release);
+      // Only now consume bytes pipelined with the handshake, so they reach the listeners above.
+      ws.feed(head);
     });
   }
 
@@ -69,6 +77,11 @@ export class CdpEndpoint {
     await promise;
     endpoint.#port = (endpoint.#server.address() as AddressInfo).port;
     return endpoint;
+  }
+
+  /** Connected CDP clients currently holding a slot (max {@link MAX_CLIENTS}). */
+  get clientCount(): number {
+    return this.#clients;
   }
 
   get port(): number {

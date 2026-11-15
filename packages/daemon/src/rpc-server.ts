@@ -1,6 +1,7 @@
 import { StringDecoder } from "node:string_decoder";
+import { z } from "zod";
 import {
-  DataPlaneAccessError,
+  CaseMetadataSchema,
   RpcEventNotificationSchema,
   RpcRequestSchema,
   RpcResponseSchema,
@@ -8,10 +9,79 @@ import {
   type RpcRequest,
   type RpcResponse,
 } from "@hunt-command/shared";
+import { extractDataPlaneError } from "@hunt-command/data-plane";
 import { executeDriveGates, type DriveGatesCommandInput } from "./drive-gates.ts";
 import { GateDecisionError } from "./gates.ts";
 import type { DaemonTelemetryEvent, HuntDataPlanePort } from "./ports.ts";
+import {
+  GATE_EVIDENCE_PAGE_MAX,
+  GateContextError,
+  buildGateContext,
+  buildGateEvidencePage,
+  buildRunEvidence,
+  buildRunEvidencePage,
+} from "./gate-context.ts";
+import { scrubCredentials } from "./scrubber-and-fence.ts";
+import {
+  TRANSCRIPT_PAGE_DEFAULT_BYTES,
+  TRANSCRIPT_PAGE_MAX_BYTES,
+  TRANSCRIPT_PAGE_MIN_BYTES,
+  pageTranscript,
+  profileForRunStep,
+  renderStepTranscript,
+} from "./transcript.ts";
 import type { HuntWaveEngine } from "./wave-engine.ts";
+
+/** A refused RPC with its own JSON-RPC code and stable `error_code`. */
+export class RpcRequestError extends Error {
+  constructor(
+    public readonly code: number,
+    public readonly errorCode: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "RpcRequestError";
+  }
+}
+
+const GateContextParamsSchema = z.object({ run_id: z.string().min(1).max(128) }).strict();
+
+const GateEvidencePageParamsSchema = z
+  .object({
+    run_id: z.string().min(1).max(128),
+    cursor: z.string().min(1).max(2048),
+    limit: z.number().int().min(1).max(GATE_EVIDENCE_PAGE_MAX),
+  })
+  .strict();
+
+const GATE_CONTEXT_ERROR_CODES: Record<GateContextError["errorCode"], number> = {
+  no_open_gate: -32009,
+  gate_context_unavailable: -32010,
+  stale_cursor: -32011,
+  invalid_arguments: -32602,
+};
+
+function toGateContextRpcError(err: unknown): RpcRequestError {
+  if (err instanceof RpcRequestError) return err;
+  if (err instanceof GateContextError) {
+    return new RpcRequestError(GATE_CONTEXT_ERROR_CODES[err.errorCode], err.errorCode, err.message);
+  }
+  return new RpcRequestError(-32010, "gate_context_unavailable", err instanceof Error ? err.message : String(err));
+}
+
+const InspectTranscriptPageParamsSchema = z
+  .object({
+    run_id: z.string().min(1).max(128),
+    step_id: z.string().min(1).max(64),
+    byte_offset: z.number().int().min(0).default(0),
+    byte_limit: z
+      .number()
+      .int()
+      .min(TRANSCRIPT_PAGE_MIN_BYTES)
+      .max(TRANSCRIPT_PAGE_MAX_BYTES)
+      .default(TRANSCRIPT_PAGE_DEFAULT_BYTES),
+  })
+  .strict();
 
 export const DEFAULT_MAX_NDJSON_LINE_BYTES = 1_048_576; // 1 MiB
 
@@ -130,9 +200,9 @@ export class HuntDaemonRpcServer {
       return;
     }
 
-    for (const line of lines) {
-      await this.handleLine(line);
-    }
+    const results = await Promise.allSettled(lines.map((line) => this.handleLine(line)));
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
   }
 
   public async handleLine(line: string): Promise<RpcResponse> {
@@ -199,6 +269,22 @@ export class HuntDaemonRpcServer {
           };
         }
 
+        case "case.metadata": {
+          const caseId = typeof params.case_id === "string" ? params.case_id : "";
+          if (!caseId) {
+            throw new Error("case.metadata requires non-empty 'case_id'");
+          }
+          if (!this.resolveDataPlane) {
+            throw new Error("No resolveDataPlane factory configured on HuntDaemonRpcServer");
+          }
+          const dataPlane = await this.resolveDataPlane(caseId);
+          const metadata = CaseMetadataSchema.parse(dataPlane.caseMetadata);
+          if (metadata.case_id !== caseId) {
+            throw new Error(`Resolved case '${metadata.case_id}' does not match requested case '${caseId}'`);
+          }
+          return { jsonrpc: "2.0", id: req.id, result: metadata };
+        }
+
         case "hunt.start": {
           const caseId = typeof params.case_id === "string" ? params.case_id : "";
           const scopeText = typeof params.scope === "string" ? params.scope : "";
@@ -241,6 +327,131 @@ export class HuntDaemonRpcServer {
           return { jsonrpc: "2.0", id: req.id, result: run };
         }
 
+        case "hunt.gateContext": {
+          // Read-only decision context for the run's open gate.
+          const parsed = GateContextParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            throw new RpcRequestError(-32602, "invalid_arguments", "hunt.gateContext requires exactly { run_id: string }");
+          }
+          const run = this.engine.stateStore.getRun(parsed.data.run_id);
+          if (!run) {
+            throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${parsed.data.run_id}'`);
+          }
+          try {
+            const context = await buildGateContext({
+              run,
+              receipts: this.engine.stateStore.listReceiptsForRun(run.run_id),
+              resolveDataPlane: this.resolveDataPlane,
+            });
+            return { jsonrpc: "2.0", id: req.id, result: context };
+          } catch (err) {
+            throw toGateContextRpcError(err);
+          }
+        }
+
+        case "hunt.gateEvidencePage": {
+          // Read-only: the next cited records of the run's CURRENT open gate.
+          const parsed = GateEvidencePageParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            throw new RpcRequestError(
+              -32602,
+              "invalid_arguments",
+              `hunt.gateEvidencePage requires exactly { run_id, cursor, limit: 1..${GATE_EVIDENCE_PAGE_MAX} }`,
+            );
+          }
+          const run = this.engine.stateStore.getRun(parsed.data.run_id);
+          if (!run) {
+            throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${parsed.data.run_id}'`);
+          }
+          try {
+            const page = await buildGateEvidencePage({
+              run,
+              cursor: parsed.data.cursor,
+              limit: parsed.data.limit,
+              resolveDataPlane: this.resolveDataPlane,
+            });
+            return { jsonrpc: "2.0", id: req.id, result: page };
+          } catch (err) {
+            throw toGateContextRpcError(err);
+          }
+        }
+
+        case "hunt.evidence": {
+          const parsed = GateContextParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            throw new RpcRequestError(-32602, "invalid_arguments", "hunt.evidence requires exactly { run_id: string }");
+          }
+          const run = this.engine.stateStore.getRun(parsed.data.run_id);
+          if (!run) throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${parsed.data.run_id}'`);
+          try {
+            const evidence = await buildRunEvidence({ run, resolveDataPlane: this.resolveDataPlane });
+            return { jsonrpc: "2.0", id: req.id, result: evidence };
+          } catch (err) {
+            throw new RpcRequestError(-32010, "evidence_unavailable", err instanceof Error ? err.message : String(err));
+          }
+        }
+
+        case "hunt.evidencePage": {
+          // Read-only: the next records of a run's evidence (cursor from hunt.evidence).
+          const parsed = GateEvidencePageParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            throw new RpcRequestError(
+              -32602,
+              "invalid_arguments",
+              `hunt.evidencePage requires exactly { run_id, cursor, limit: 1..${GATE_EVIDENCE_PAGE_MAX} }`,
+            );
+          }
+          const run = this.engine.stateStore.getRun(parsed.data.run_id);
+          if (!run) throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${parsed.data.run_id}'`);
+          try {
+            const page = await buildRunEvidencePage({
+              run,
+              cursor: parsed.data.cursor,
+              limit: parsed.data.limit,
+              resolveDataPlane: this.resolveDataPlane,
+            });
+            return { jsonrpc: "2.0", id: req.id, result: page };
+          } catch (err) {
+            if (err instanceof GateContextError && (err.errorCode === "stale_cursor" || err.errorCode === "invalid_arguments")) {
+              throw toGateContextRpcError(err);
+            }
+            throw new RpcRequestError(-32010, "evidence_unavailable", err instanceof Error ? err.message : String(err));
+          }
+        }
+
+        case "hunt.inspectTranscriptPage": {
+          // Read-only: reads durable state for exactly one run; never touches gates or run state.
+          const parsed = InspectTranscriptPageParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            const issue = parsed.error.issues[0];
+            throw new RpcRequestError(
+              -32602,
+              "invalid_arguments",
+              `hunt.inspectTranscriptPage: ${issue?.path.join(".") || "params"}: ${issue?.message ?? "invalid"}`,
+            );
+          }
+          const { run_id: runId, step_id: stepId, byte_offset: byteOffset, byte_limit: byteLimit } = parsed.data;
+          const run = this.engine.stateStore.getRun(runId);
+          if (!run) {
+            throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${runId}'`);
+          }
+          const profile = profileForRunStep(run, stepId);
+          if (!profile) {
+            throw new RpcRequestError(-32004, "step_not_found", `Hunt '${runId}' has no step '${stepId}'`);
+          }
+          const transcript = renderStepTranscript(
+            run,
+            this.engine.stateStore.listReceiptsForRun(run.run_id),
+            stepId,
+            profile,
+          );
+          return {
+            jsonrpc: "2.0",
+            id: req.id,
+            result: pageTranscript({ runId: run.run_id, stepId, profile, transcript, byteOffset, byteLimit }),
+          };
+        }
+
         case "hunt.list": {
           const runs = this.engine.stateStore.listRuns();
           return { jsonrpc: "2.0", id: req.id, result: { runs } };
@@ -259,6 +470,23 @@ export class HuntDaemonRpcServer {
               "automated_channel_forbidden",
               "via='slack' is reserved for the in-process Slack bridge and is not accepted over RPC",
             );
+          }
+          if (params.via === "desktop" && params.action !== "reject") {
+            const run = this.engine.stateStore.getRun(String(params.hunt_id ?? ""));
+            if (run?.open_gate && run.open_gate.gate === params.gate && run.open_gate.gate !== "scope") {
+              // Desktop approval needs the gate's full decision context: every cited id has a
+              // status (records are paged). If the context cannot be built, approval is refused.
+              try {
+                await buildGateContext({
+                  run,
+                  receipts: this.engine.stateStore.listReceiptsForRun(run.run_id),
+                  resolveDataPlane: this.resolveDataPlane,
+                });
+              } catch (err) {
+                const rpcErr = toGateContextRpcError(err);
+                throw new RpcRequestError(rpcErr.code, rpcErr.errorCode, `Desktop approval refused: ${rpcErr.message}`);
+              }
+            }
           }
           const updated = await this.engine.submitGateDecision({
             decisionId: typeof params.decision_id === "string" ? params.decision_id : undefined,
@@ -326,17 +554,16 @@ export class HuntDaemonRpcServer {
       }
     } catch (err) {
       const errorCode =
-        err instanceof GateDecisionError
+        err instanceof RpcRequestError || err instanceof GateDecisionError
           ? err.errorCode
-          : err instanceof DataPlaneAccessError
-            ? err.errorCode
-            : "rpc_execution_error";
+          : (extractDataPlaneError(err)?.errorCode ?? "rpc_execution_error");
       return {
         jsonrpc: "2.0",
         id: req.id,
         error: {
-          code: -32000,
-          message: err instanceof Error ? err.message : String(err),
+          code: err instanceof RpcRequestError ? err.code : -32000,
+          // Error text can carry a data source's own diagnostic (connection strings, credentials).
+          message: scrubCredentials(err instanceof Error ? err.message : String(err)),
           error_code: errorCode,
         },
       };

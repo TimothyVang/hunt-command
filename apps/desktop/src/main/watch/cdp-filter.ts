@@ -10,8 +10,9 @@
  *   `Page.setDownloadBehavior`, `Page.setBypassCSP`, and `Security.setIgnoreCertificateErrors`.
  * - Scopes `isOpenableWatchUrl` to `documentAllowed(scope, url)` (pinned `127.0.0.1:<port>` only — zero `localhost`).
  * - Validates `Page.navigate` URLs with the same allowed-document check (CDP-initiated loads skip `will-navigate`),
- *   and denies `Page.navigateToHistoryEntry`, `Page.setDocumentContent`, `Page.printToPDF`, `IO.*`, and
- *   `DOM.setFileInputFiles` outright.
+ *   and denies `Page.navigateToHistoryEntry`, `Page.setDocumentContent`, `Page.printToPDF`, `IO.*`, and every
+ *   local-file route (`DOM.setFileInputFiles`, `DOM.getFileInfo`, `Input.dispatchDragEvent`,
+ *   `Input.setInterceptDrags`, `Page.setInterceptFileChooserDialog`, `Page.handleFileChooser`) outright.
  */
 import { documentAllowed, type WatchScope } from "./browser-policy.ts";
 
@@ -66,7 +67,15 @@ const DENIED_METHODS: Record<string, true> = {
   "Page.navigateToHistoryEntry": true,
   "Page.setDocumentContent": true,
   "Page.printToPDF": true,
+  // Local-file access: every CDP route that lets a client hand the page a file from disk (and then read it
+  // back with Runtime.evaluate) or learn a File's on-disk path. A synthetic drop with `data.files` delivered
+  // the file's bytes to page script, so drag synthesis and drag/file-chooser interception are denied outright.
   "DOM.setFileInputFiles": true,
+  "DOM.getFileInfo": true,
+  "Input.dispatchDragEvent": true,
+  "Input.setInterceptDrags": true,
+  "Page.setInterceptFileChooserDialog": true,
+  "Page.handleFileChooser": true,
 };
 
 /** Commands whose `params.url` loads a document and must pass the session's allowed-document check. */
@@ -87,15 +96,22 @@ export const CDP_ERROR_METHOD_NOT_FOUND = -32601;
  * the hub may handle or forward it. `isOpenableUrl` is the session scope's allowed-document check;
  * without it every URL-carrying navigation is refused (fail closed).
  */
+/**
+ * Exact shape of every Chromium DevTools protocol method name (`Domain.method`, case-sensitive).
+ * Anything else (`io.read`, `Page.printToPDF `, a trailing NUL, `Page..x`) is refused before the
+ * allow/deny tables are consulted, so a near-miss spelling can never slip past an exact-match deny entry.
+ */
+export const CDP_METHOD_NAME_RE = /^[A-Z][A-Za-z]+\.[a-z][A-Za-z]+$/;
+
 export function deniedSessionCommand(
   method: string,
   params: Record<string, unknown> | undefined,
   isOpenableUrl?: (url: string) => boolean,
 ): string | null {
-  const dot = method.indexOf(".");
-  if (dot <= 0) {
-    return `'${method}' is not a valid CDP method`;
+  if (typeof method !== "string" || !CDP_METHOD_NAME_RE.test(method)) {
+    return `'${String(method).slice(0, 80)}' is not a valid CDP method`;
   }
+  const dot = method.indexOf(".");
   const domain = method.slice(0, dot);
 
   if (domain === "Target") {

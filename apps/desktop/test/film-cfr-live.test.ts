@@ -46,6 +46,8 @@ function generateTestBoardJpeg(ffmpegPath: string, outPath: string, hexColor: st
   }
 }
 
+const FILM_ENCODE_TEST_TIMEOUT_MS = 240_000;
+
 describe("Offscreen 1920x1080 CFR 30fps Filming, ASS Margin Styling & Rule 4 Guard (#178 G3.1-G3.3)", () => {
   test("Rule 4 film guard refuses non-synthetic export unless allowWorkFilm=true (which burns crimson watermark)", () => {
     expect(() =>
@@ -223,5 +225,7 @@ describe("Offscreen 1920x1080 CFR 30fps Filming, ASS Margin Styling & Rule 4 Gua
     } finally {
       fs.rmSync(trickyTmpRoot, { recursive: true, force: true });
     }
-  });
+    // Real ffmpeg encodes (1x + 5x + probes) take ~4s on an idle machine; under CI or parallel load this far exceeds
+    // bun's 5s default, which killed ffmpeg mid-encode. Bounded by the per-encode 180s spawn timeout.
+  }, FILM_ENCODE_TEST_TIMEOUT_MS);
 });

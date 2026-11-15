@@ -3,12 +3,13 @@
  *
  * TypeScript port of `framework/hunt_lab/browser_policy.py` hardened for Hunt Command v2 (#178 G1.3, #189):
  * - Pinned `127.0.0.1:<port>` loopback origins ONLY (`localhost`, `0.0.0.0`, `[::1]`, and remote hosts refused).
- * - Lab origin: read-only (`GET` only); `X-Hunt-Lab-Secret` injected ONLY on `labOrigin`, stripped everywhere else.
+ * - Lab origin: read-only (`GET` only), with Arkime route and search restrictions also enforced;
+ *   `X-Hunt-Lab-Secret` injected ONLY on `labOrigin`, stripped everywhere else.
  * - Kibana origin: Discover-only (`/app/discover`), `/internal/bsearch` pinned to `hunt-lab-case-events` +
  *   case time window (`ese`/`es` strategies only; ES|QL, SQL, EQL refused), value suggestions forced to `terms_agg`.
  * - Arkime origin: read-only sessions/spiview/spigraph/unique/connections, every `expression` wrapped in
  *   `(<expr>) && tags == "case:<caseId>"` and clamped to `[startSec, stopSec]`; admin/pcap/raw/scrub/delete routes blocked.
- * - Session proxy blackhole (`http://127.0.0.1:1` with `<allowed 127.0.0.1:ports>;<-loopback>`) backs up CDP `Fetch.enable`.
+ * - Session proxy blackhole (`http://127.0.0.1:1` with `<-loopback>;<allowed 127.0.0.1:ports>`) backs up CDP `Fetch.enable`.
  */
 
 export const SEARCH_KEYS = ["expression", "date", "startTime", "stopTime"] as const;
@@ -174,6 +175,9 @@ export function createWatchScope(input: CreateWatchScopeInput): WatchScope {
         `WatchScope kibanaOrigin must be a pinned 127.0.0.1:<port> URL (got '${input.kibanaOrigin}')`,
       );
     }
+    if (kibanaOrigin === labOrigin || kibanaOrigin === arkimeOrigin) {
+      throw new Error("WatchScope kibanaOrigin must be distinct from labOrigin and arkimeOrigin");
+    }
   }
   const startSec = Math.floor(input.startSec);
   const stopSec = Math.floor(input.stopSec);
@@ -204,6 +208,11 @@ export function listAllowedWatchOrigins(scope: WatchScope): string[] {
  * Builds Electron `session.setProxy` rules that route every non-allowlisted host/port
  * (including `localhost`, `[::1]`, unpinned `127.0.0.1` ports, and all internet egress)
  * into closed loopback port `127.0.0.1:1`.
+ *
+ * Order matters: Chromium evaluates bypass rules last-to-first and the LAST matching rule wins.
+ * `<-loopback>` (which removes the implicit loopback bypass, i.e. "proxy loopback") must therefore
+ * come FIRST so the explicit pinned `127.0.0.1:<port>` entries after it override it. With
+ * `<-loopback>` last, every loopback URL, including the pinned lab origin, went to the blackhole.
  */
 export function buildWatchProxyConfig(scope: WatchScope): {
   proxyRules: string;
@@ -212,7 +221,7 @@ export function buildWatchProxyConfig(scope: WatchScope): {
   const bypassTargets = listAllowedWatchOrigins(scope).map(hostPortFromPinnedOrigin);
   return {
     proxyRules: "http://127.0.0.1:1",
-    proxyBypassRules: [...bypassTargets, "<-loopback>"].join(";"),
+    proxyBypassRules: ["<-loopback>", ...bypassTargets].join(";"),
   };
 }
 
@@ -572,15 +581,15 @@ export function decideWatchRequest(
     if (!source) {
       return { block: "origin_not_lab" };
     }
-    if (source === scope.labOrigin) {
-      return method === "GET" ? ALLOW_VERDICT : { block: "lab_read_only" };
-    }
     const parsedUrl = new URL(url);
     if (scope.kibanaOrigin !== null && source === scope.kibanaOrigin) {
       return decideKibanaRequest(scope, method, parsedUrl, body);
     }
-    if (source !== scope.arkimeOrigin) {
+    if (source !== scope.labOrigin && source !== scope.arkimeOrigin) {
       return { block: "origin_not_lab" };
+    }
+    if (source === scope.labOrigin && method !== "GET") {
+      return { block: "lab_read_only" };
     }
 
     let decodedPath: string;
@@ -594,7 +603,7 @@ export function decideWatchRequest(
     }
 
     const isSearchRoute = ARKIME_SEARCH_PREFIXES.some((prefix) =>
-      parsedUrl.pathname.startsWith(prefix),
+      decodedPath.startsWith(prefix),
     );
     const queryPairs = parseQueryPairs(parsedUrl.search);
     const searchKeySet = new Set<string>(SEARCH_KEYS);

@@ -11,17 +11,36 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import {
   AuthenticatedGateDecisionSchema,
+  CaseMetadataSchema,
+  DATA_ORIGINS,
+  extractInlineCitations,
+  HUNT_WAVES,
+  HandoffSchema,
+  SnapshotSchema,
   type AuthenticatedGateDecision,
   type ProfileId,
   type RuntimePaths,
 } from "@hunt-command/shared";
 import { buildFixtureWorkbenchSnapshot } from "../shared/fixture-workbench.ts";
-import { validateGateSubmission } from "../shared/gate-validation.ts";
+import { missingGateContextReason, validateGateSubmission } from "../shared/gate-validation.ts";
+import {
+  EVIDENCE_PAGE_LIMIT,
+  RUN_EVIDENCE_PAGE_LIMIT,
+  type GateEvidencePaging,
+  projectEvidencePage,
+  projectEvidenceRecords,
+  projectLiveEvidence,
+  projectLiveGate,
+  projectTranscriptPage,
+  type LiveEvidenceProjection,
+} from "./live-gate-context.ts";
 import {
   ExportReportInputSchema,
   FilmCutInputSchema,
+  GateEvidencePageInputSchema,
   GlobalStopInputSchema,
   InspectTranscriptInputSchema,
   QueryDissectorInputSchema,
@@ -31,6 +50,8 @@ import {
   VaultSetSecretInputSchema,
   WatchBoundsInputSchema,
   WatchNavigateInputSchema,
+  type WatchOpenInput,
+  WatchOpenInputSchema,
   type DaemonHealthStatus,
   type FilmExportResult,
   type ReportExportResult,
@@ -45,6 +66,7 @@ import type {
   WatchBrowserState,
   WorkbenchSnapshot,
 } from "../shared/workbench-types.ts";
+import type { PersistedHuntRun } from "../../../../packages/daemon/src/state-store.ts";
 import type { HuntDaemonSidecar } from "./daemon/daemon-sidecar.ts";
 import { exportCustomerReport } from "./export/report-exporter.ts";
 import { resolveFfmpegBinary } from "./film/cfr-editor.ts";
@@ -53,7 +75,8 @@ import type { SecretVault } from "./secret-vault.ts";
 export interface RunSummaryItem {
   huntId: string;
   caseId: string;
-  title: string;
+  title: string | null;
+  metadataAvailable: boolean;
   dataOrigin: WorkbenchSnapshot["caseMetadata"]["data_origin"];
   runStatus: WorkbenchSnapshot["runStatus"];
   openGate: "scope" | "incident" | "reconcile" | null;
@@ -81,7 +104,9 @@ export interface WorkbenchServiceDeps {
   watchHandlers?: {
     getState: () => WatchBrowserState;
     setBounds: (bounds: { x: number; y: number; width: number; height: number } | null) => WatchBrowserState;
+    invalidate: () => void;
     navigate: (runId: string, role: ProfileId, url: string) => Promise<WatchBrowserState>;
+    open: (input: WatchOpenInput) => Promise<WatchBrowserState>;
   };
 }
 
@@ -128,10 +153,54 @@ function buildStepTranscriptText(snapshot: WorkbenchSnapshot, stepId: string): s
 
   return `${stripControlAndBidiChars(lines.join("\n"))}\n`;
 }
+const LiveRunSummarySchema = z.object({
+  run_id: z.string().min(1),
+  case_id: z.string().min(1),
+  data_origin: z.enum(DATA_ORIGINS),
+  status: z.enum(["running", "awaiting_gate", "completed", "failed", "cancelled"]),
+  open_gate: z.object({ gate: z.enum(["scope", "incident", "reconcile"]) }).nullable(),
+});
+
+const LiveStartResultSchema = z.object({
+  run_id: z.string().min(1),
+  case_id: z.string().min(1),
+  status: z.enum(["running", "awaiting_gate", "completed", "failed", "cancelled"]),
+  wave: z.enum(HUNT_WAVES),
+  wave_index: z.number().int().nonnegative(),
+  step_states: z.record(z.string()),
+  results: z.record(z.unknown()),
+  reviewed_handoffs: z.record(HandoffSchema),
+  decisions: z.array(AuthenticatedGateDecisionSchema),
+  token_ledger: z.object({
+    max_total_tokens: z.number(),
+    consumed_total_tokens: z.number(),
+    rejections_tokens: z.number(),
+    actual_billed_usd: z.number(),
+    shadow_api_usd: z.number(),
+    cache_savings_usd: z.number(),
+  }).passthrough(),
+  open_gate: z.object({
+    gate: z.enum(["scope", "incident", "reconcile"]),
+    payload_sha256: z.string(),
+    opened_at: z.string(),
+    expires_at: z.string(),
+    unknown_step_id: z.string().optional(),
+  }).nullable(),
+  snapshot: SnapshotSchema.nullable(),
+  config: z.object({ scopeText: z.string(), followUps: z.number(), maxTotalTokens: z.number() }).passthrough(),
+}).passthrough();
+
 
 export class WorkbenchService {
   readonly #deps: WorkbenchServiceDeps;
   readonly #runs = new Map<string, WorkbenchSnapshot>();
+  readonly #liveRunIds = new Set<string>();
+  /** Cited-record paging per run (F18); holds the opaque cursor, which never reaches the renderer. */
+  readonly #evidencePaging = new Map<string, GateEvidencePaging>();
+  readonly #gateMutations = new Set<string>();
+  readonly #appliedSnapshotVersions = new Map<string, number>();
+  #nextSnapshotVersion = 0;
+  #selectionVersion = 0;
   #activeHuntId: string;
 
   constructor(deps: WorkbenchServiceDeps) {
@@ -168,28 +237,56 @@ export class WorkbenchService {
   }
 
   async listRuns(): Promise<RunSummaryItem[]> {
+    let liveRuns: RunSummaryItem[] = [];
     if (this.#deps.sidecar.isLiveReady) {
-      try {
-        const liveRuns = await this.#deps.sidecar.request<RunSummaryItem[]>("hunt.listRuns");
-        if (Array.isArray(liveRuns) && liveRuns.length > 0) {
-          return liveRuns;
+      const result = await this.#deps.sidecar.request<{ runs: unknown[] }>("hunt.list");
+      const runs = result.runs.map((raw) => LiveRunSummarySchema.parse(raw));
+      const metadataByCase = new Map<string, Promise<string | null>>();
+      for (const run of runs) {
+        this.#liveRunIds.add(run.run_id);
+        if (!metadataByCase.has(run.case_id)) {
+          metadataByCase.set(run.case_id, (async () => {
+            try {
+              const metadata = CaseMetadataSchema.parse(
+                await this.#deps.sidecar.request("case.metadata", { case_id: run.case_id }),
+              );
+              return metadata.case_id === run.case_id ? metadata.title : null;
+            } catch {
+              return null;
+            }
+          })());
         }
-      } catch {
-        // Fall back to local state store if RPC method is unavailable.
       }
+      liveRuns = await Promise.all(runs.map(async (run) => {
+        const title = await metadataByCase.get(run.case_id)!;
+        return {
+          huntId: run.run_id,
+          caseId: run.case_id,
+          title,
+          metadataAvailable: title !== null,
+          dataOrigin: run.data_origin,
+          runStatus: run.status === "awaiting_gate" ? "awaiting_human_gate" : run.status === "cancelled" ? "stopped" : run.status,
+          openGate: run.open_gate?.gate ?? null,
+        };
+      }));
     }
 
-    return [...this.#runs.values()].map((snap) => ({
-      huntId: snap.huntId,
-      caseId: snap.caseMetadata.case_id,
-      title: snap.caseMetadata.title,
-      dataOrigin: snap.caseMetadata.data_origin,
-      runStatus: snap.runStatus,
-      openGate: snap.activeGate?.gate ?? null,
-    }));
+    const snapshots = [...this.#runs.values()]
+      .filter((snap) => !this.#deps.sidecar.isLiveReady || !this.#liveRunIds.has(snap.huntId))
+      .map((snap) => ({
+        huntId: snap.huntId,
+        caseId: snap.caseMetadata.case_id,
+        title: snap.caseMetadata.title,
+        metadataAvailable: true,
+        dataOrigin: snap.caseMetadata.data_origin,
+        runStatus: snap.runStatus,
+        openGate: snap.activeGate?.gate ?? null,
+      }));
+    return [...snapshots, ...liveRuns];
   }
 
   async getWorkbenchState(rawPayload?: unknown): Promise<WorkbenchSnapshot> {
+    const selection = ++this.#selectionVersion;
     const requestedHuntId =
       typeof rawPayload === "object" &&
       rawPayload !== null &&
@@ -198,19 +295,12 @@ export class WorkbenchService {
         ? (rawPayload as { huntId: string }).huntId
         : this.#activeHuntId;
 
-    if (this.#deps.sidecar.isLiveReady) {
-      try {
-        const liveSnap = await this.#deps.sidecar.request<WorkbenchSnapshot>("hunt.getWorkbenchState", {
-          huntId: requestedHuntId,
-        });
-        if (liveSnap && typeof liveSnap.huntId === "string") {
-          this.#runs.set(liveSnap.huntId, liveSnap);
-          this.#activeHuntId = liveSnap.huntId;
-          return this.#attachWatchState(liveSnap);
-        }
-      } catch {
-        // Fall through to cached/fixture run when daemon does not hold this huntId.
-      }
+    if (this.#liveRunIds.has(requestedHuntId) || !this.#runs.has(requestedHuntId)) {
+      const version = ++this.#nextSnapshotVersion;
+      const run = await this.#deps.sidecar.request("hunt.status", { run_id: requestedHuntId });
+      const snap = await this.#liveSnapshot(run, requestedHuntId, version);
+      if (selection === this.#selectionVersion) this.#selectHunt(snap.huntId);
+      return this.#attachWatchState(snap);
     }
 
     const snap =
@@ -218,7 +308,7 @@ export class WorkbenchService {
       this.#runs.get(this.#activeHuntId) ??
       buildFixtureWorkbenchSnapshot({ huntId: requestedHuntId });
     this.#runs.set(snap.huntId, snap);
-    this.#activeHuntId = snap.huntId;
+    if (selection === this.#selectionVersion) this.#selectHunt(snap.huntId);
     return this.#attachWatchState(snap);
   }
 
@@ -226,16 +316,42 @@ export class WorkbenchService {
     const parsed = StartRunInputSchema.parse(rawInput);
 
     if (this.#deps.sidecar.isLiveReady) {
-      try {
-        const started = await this.#deps.sidecar.request<WorkbenchSnapshot>("hunt.startRun", parsed);
-        if (started && typeof started.huntId === "string") {
-          this.#runs.set(started.huntId, started);
-          this.#activeHuntId = started.huntId;
-          return this.#attachWatchState(started);
-        }
-      } catch {
-        // Fall through to local Gate 1 scope run creation when daemon is in standby.
+      const metadata = CaseMetadataSchema.parse(await this.#deps.sidecar.request("case.metadata", { case_id: parsed.caseId }));
+      if (metadata.case_id !== parsed.caseId || metadata.data_origin !== parsed.dataOrigin) {
+        throw new Error("Selected data origin does not match the daemon case metadata.");
       }
+      const runId = randomUUID();
+      this.#liveRunIds.add(runId);
+      const version = ++this.#nextSnapshotVersion;
+      let response: unknown;
+      try {
+        response = await this.#deps.sidecar.request("hunt.start", {
+          run_id: runId,
+          case_id: parsed.caseId,
+          scope: parsed.scope,
+          follow_ups: parsed.followUps,
+          max_total_tokens: parsed.maxTotalTokens,
+        });
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes("timed out")) {
+          throw new Error(`Start failed or its outcome is unknown for hunt '${runId}': ${error instanceof Error ? error.message : String(error)}`);
+        }
+        try {
+          response = await this.#deps.sidecar.request("hunt.status", { run_id: runId });
+        } catch {
+          throw new Error(`Start outcome is unknown for hunt '${runId}'. Check this run ID before starting another hunt.`);
+        }
+      }
+      let snapshot: WorkbenchSnapshot;
+      try {
+        const started = LiveStartResultSchema.parse(response);
+        if (started.run_id !== runId) throw new Error("Daemon returned a different run ID.");
+        snapshot = await this.#liveSnapshot(response, runId, version);
+      } catch (error) {
+        throw new Error(`Hunt '${runId}' may have started but its workbench could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.#selectHunt(runId);
+      return this.#attachWatchState(snapshot);
     }
 
     const newHuntId = `hunt-${Date.now().toString(36)}-${parsed.caseId.slice(0, 16)}`;
@@ -250,17 +366,23 @@ export class WorkbenchService {
       created.activeGate.scopeSummary.followUpCount = parsed.followUps;
     }
     this.#runs.set(newHuntId, created);
-    this.#activeHuntId = newHuntId;
+    this.#selectHunt(newHuntId);
     return this.#attachWatchState(created);
   }
 
   async globalStop(rawInput: unknown): Promise<WorkbenchSnapshot> {
     const parsed = GlobalStopInputSchema.parse(rawInput);
 
-    if (this.#deps.sidecar.isLiveReady) {
-      await this.#deps.sidecar
-        .request("hunt.globalStop", { huntId: parsed.huntId, reason: parsed.reason })
-        .catch(() => {});
+    if (this.#liveRunIds.has(parsed.huntId)) {
+      if (this.#gateMutations.has(parsed.huntId)) throw new Error("A gate decision or stop is already in progress.");
+      this.#gateMutations.add(parsed.huntId);
+      this.#evidencePaging.delete(parsed.huntId);
+      try {
+        await this.#deps.sidecar.request("hunt.cancel", { run_id: parsed.huntId, reason: parsed.reason });
+        return await this.getWorkbenchState({ huntId: parsed.huntId });
+      } finally {
+        this.#gateMutations.delete(parsed.huntId);
+      }
     }
 
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
@@ -282,6 +404,44 @@ export class WorkbenchService {
   async submitGateDecision(rawInput: unknown): Promise<WorkbenchSnapshot> {
     const parsed = SubmitGateDecisionInputSchema.parse(rawInput);
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
+    if (current.provenanceMode === "live_daemon") {
+      if (!parsed.operatorToken?.trim()) throw new Error("An operator token is required for a live gate decision.");
+      if (!current.activeGate || current.activeGate.gate !== parsed.gate) {
+        throw new Error(`No active '${parsed.gate}' gate is currently open for hunt '${parsed.huntId}'.`);
+      }
+      if (parsed.action === "approve") {
+        // Fail closed: never forward an approval for a gate whose decision context is not on screen.
+        const missing = missingGateContextReason(current.activeGate);
+        if (missing) throw new Error(missing);
+        if (current.activeGate.gate === "incident" && !current.activeGate.incidentSummary?.citationReceipt.allVerified) {
+          throw new Error("Gate 2 incident citations are not all verified, so approval is disabled.");
+        }
+      }
+      if (this.#gateMutations.has(parsed.huntId)) throw new Error("A gate decision or stop is already in progress.");
+      this.#gateMutations.add(parsed.huntId);
+      this.#evidencePaging.delete(parsed.huntId);
+      try {
+        try {
+          await this.#deps.sidecar.request("hunt.decideGate", {
+            hunt_id: parsed.huntId,
+            gate: parsed.gate,
+            action: parsed.action,
+            via: "desktop",
+            operator_token: parsed.operatorToken,
+            payload_sha256: parsed.payloadSha256,
+            check_note: parsed.checkNote,
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message.includes("timed out")) {
+            throw new Error(`Gate decision outcome is unknown for hunt '${parsed.huntId}'. Refresh the run before submitting again.`);
+          }
+          throw error;
+        }
+        return await this.getWorkbenchState({ huntId: parsed.huntId });
+      } finally {
+        this.#gateMutations.delete(parsed.huntId);
+      }
+    }
 
     if (!current.activeGate || current.activeGate.gate !== parsed.gate) {
       throw new Error(`No active '${parsed.gate}' gate is currently open for hunt '${parsed.huntId}'.`);
@@ -321,20 +481,6 @@ export class WorkbenchService {
       "utf8",
     );
 
-    if (this.#deps.sidecar.isLiveReady) {
-      try {
-        const liveNext = await this.#deps.sidecar.request<WorkbenchSnapshot>(
-          "hunt.submitGateDecision",
-          { decision },
-        );
-        if (liveNext && typeof liveNext.huntId === "string") {
-          this.#runs.set(liveNext.huntId, liveNext);
-          return this.#attachWatchState(liveNext);
-        }
-      } catch {
-        // Apply state transition locally if daemon RPC is in standby.
-      }
-    }
 
     let nextSnap: WorkbenchSnapshot;
     if (parsed.action === "reject") {
@@ -375,16 +521,71 @@ export class WorkbenchService {
     return this.#attachWatchState(nextSnap);
   }
 
+  /**
+   * Loads the next page of the open gate's cited records (F18) and merges it into the cached snapshot.
+   * The page must continue the complete `cited` list exactly; a stale cursor (the gate or its digest
+   * changed) or any mismatch is an error, and nothing is merged. Approval never depends on this.
+   */
+  async loadMoreGateEvidence(rawInput: unknown): Promise<WorkbenchSnapshot> {
+    const parsed = GateEvidencePageInputSchema.parse(rawInput);
+    if (this.#gateMutations.has(parsed.huntId)) throw new Error("The gate is changing; refresh before loading evidence.");
+    const paging = this.#evidencePaging.get(parsed.huntId);
+    const current = this.#runs.get(parsed.huntId);
+    if (!paging || !current?.activeGate || current.activeGate.payloadSha256 !== paging.payloadSha256) {
+      throw new Error("No paged gate evidence is open for this hunt; refresh the gate.");
+    }
+    if (paging.nextCursor === null) return this.#attachWatchState(current);
+    const cursor = paging.nextCursor;
+    const loaded = paging.loaded;
+    let raw: unknown;
+    try {
+      raw = await this.#deps.sidecar.request("hunt.gateEvidencePage", {
+        run_id: parsed.huntId,
+        cursor,
+        limit: EVIDENCE_PAGE_LIMIT,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        /stale_cursor/.test(message)
+          ? `The gate changed since its evidence was loaded (${message}). Refresh the gate before loading more records.`
+          : `Loading more evidence failed: ${message}`,
+      );
+    }
+    if (this.#gateMutations.has(parsed.huntId) || this.#runs.get(parsed.huntId) !== current ||
+        this.#evidencePaging.get(parsed.huntId) !== paging || paging.loaded !== loaded || paging.nextCursor !== cursor) {
+      throw new Error("The gate changed while evidence was loading; refresh the gate.");
+    }
+    const page = projectEvidencePage(raw, paging);
+    const handoffs = current.activeGate.gate === "reconcile" ? [] : current.handoffs;
+    const added = projectEvidenceRecords(handoffs, page.records);
+    paging.loaded += page.records.length;
+    paging.nextCursor = page.nextCursor;
+    const next: WorkbenchSnapshot = {
+      ...current,
+      activeGate: {
+        ...current.activeGate,
+        evidencePaging: { loaded: paging.loaded, total: paging.cited.length, hasMore: paging.nextCursor !== null },
+      },
+      evidenceCatalog: { ...current.evidenceCatalog, ...added.evidenceCatalog },
+      events: [...current.events, ...added.events].sort((a, b) => a.timestampMs - b.timestampMs),
+    };
+    this.#runs.set(next.huntId, next);
+    return this.#attachWatchState(next);
+  }
+
   async inspectTranscriptPage(rawInput: unknown): Promise<TranscriptPageSlice> {
     const parsed = InspectTranscriptInputSchema.parse(rawInput);
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
 
-    if (this.#deps.sidecar.isLiveReady) {
-      try {
-        return await this.#deps.sidecar.request<TranscriptPageSlice>("hunt.inspectTranscriptPage", parsed);
-      } catch {
-        // Fall back to deterministic step slice.
-      }
+    if (current.provenanceMode === "live_daemon") {
+      const page = await this.#deps.sidecar.request("hunt.inspectTranscriptPage", {
+        run_id: parsed.huntId,
+        step_id: parsed.stepId,
+        byte_offset: parsed.byteOffset,
+        byte_limit: parsed.byteLimit,
+      });
+      return projectTranscriptPage(page, parsed.huntId, parsed.stepId);
     }
 
     const fullText = buildStepTranscriptText(current, parsed.stepId);
@@ -491,23 +692,13 @@ export class WorkbenchService {
 
   getWatchState(): WatchBrowserState {
     if (this.#deps.watchHandlers) {
-      return this.#deps.watchHandlers.getState();
+      const state = this.#deps.watchHandlers.getState();
+      if (state.runId === this.#activeHuntId) return state;
+      return this.#standbyWatchState(this.#activeHuntId);
     }
     const snap = this.#runs.get(this.#activeHuntId);
     return (
-      snap?.watchState ?? {
-        enabled: false,
-        runId: this.#activeHuntId,
-        role: "framework-researcher",
-        partition: `hunt-watch:${this.#activeHuntId}:framework-researcher`,
-        currentUrl: "about:blank",
-        title: "Watch Browser (Standby)",
-        loading: false,
-        allowedOrigins: [],
-        blockedRequestCount: 0,
-        lastBlockedReason: null,
-        cdpEndpointUrl: null,
-      }
+      snap?.watchState ?? this.#standbyWatchState(this.#activeHuntId)
     );
   }
 
@@ -516,11 +707,34 @@ export class WorkbenchService {
     if (!this.#deps.watchHandlers) {
       return this.getWatchState();
     }
-    return this.#deps.watchHandlers.setBounds(parsed.bounds);
+    if (parsed.bounds && (parsed.runId !== this.#activeHuntId ||
+      this.#deps.watchHandlers.getState().runId !== parsed.runId)) {
+      throw new Error("Watch bounds do not belong to the active hunt.");
+    }
+    this.#deps.watchHandlers.setBounds(parsed.bounds);
+    return this.getWatchState();
+  }
+
+  async openWatch(rawInput: unknown): Promise<WatchBrowserState> {
+    const parsed = WatchOpenInputSchema.parse(rawInput);
+    if (parsed.runId !== this.#activeHuntId) {
+      throw new Error("Watch session does not belong to the active hunt.");
+    }
+    const current = this.#runs.get(this.#activeHuntId);
+    if (!current || parsed.caseId !== current.caseMetadata.case_id) {
+      throw new Error("Watch case does not match the active hunt.");
+    }
+    if (!this.#deps.watchHandlers) {
+      throw new Error("Watch Browser controller is not attached in headless test mode.");
+    }
+    return await this.#deps.watchHandlers.open(parsed);
   }
 
   async navigateWatch(rawInput: unknown): Promise<WatchBrowserState> {
     const parsed = WatchNavigateInputSchema.parse(rawInput);
+    if (parsed.runId !== this.#activeHuntId) {
+      throw new Error("Watch session does not belong to the active hunt.");
+    }
     if (!this.#deps.watchHandlers) {
       throw new Error("Watch Browser controller is not attached in headless test mode.");
     }
@@ -584,13 +798,209 @@ export class WorkbenchService {
     return { deleted: true, ref: parsed.ref };
   }
 
-  #attachWatchState(snapshot: WorkbenchSnapshot): WorkbenchSnapshot {
-    if (!this.#deps.watchHandlers) {
+  async #liveSnapshot(raw: unknown, expectedRunId: string, version: number): Promise<WorkbenchSnapshot> {
+    const checked = LiveStartResultSchema.parse(raw);
+    if (checked.run_id !== expectedRunId) throw new Error("Daemon returned a different run ID.");
+    const run = checked as unknown as PersistedHuntRun;
+    const metadata = CaseMetadataSchema.parse(await this.#deps.sidecar.request("case.metadata", { case_id: run.case_id }));
+    if (metadata.case_id !== run.case_id) throw new Error("Daemon returned metadata for a different case.");
+    const handoffs = Object.values(run.reviewed_handoffs).filter(
+      (handoff) => checked.open_gate?.gate !== "scope" || handoff.step_id !== "scope",
+    );
+    const scopeHandoff = HandoffSchema.safeParse(run.results["scope"]?.handoff);
+    if (checked.open_gate?.gate === "scope" && scopeHandoff.success &&
+        scopeHandoff.data.step_id === "scope" && scopeHandoff.data.case_id === run.case_id) {
+      handoffs.push(scopeHandoff.data);
+    }
+    const unknownStepId = run.open_gate?.unknown_step_id;
+    const unverified = HandoffSchema.safeParse(unknownStepId ? run.results[unknownStepId]?.unverified_handoff : undefined);
+    const reconcileHandoff = unverified.success && unverified.data.step_id === unknownStepId &&
+      unverified.data.case_id === run.case_id ? unverified.data : undefined;
+    const incidentHandoff = HandoffSchema.safeParse(run.results["incident"]?.handoff);
+    if ((checked.open_gate?.gate === "incident" || !checked.open_gate) && incidentHandoff.success &&
+        incidentHandoff.data.step_id === "incident" && incidentHandoff.data.case_id === run.case_id) {
+      const index = handoffs.findIndex((h) => h.step_id === incidentHandoff.data.step_id);
+      if (index === -1) handoffs.push(incidentHandoff.data);
+      else handoffs[index] = incidentHandoff.data;
+    }
+    const reviews = handoffs.flatMap((handoff) => handoff.reviews);
+    const waveNumber = (wave: string): 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 =>
+      Math.max(1, Math.min(8, HUNT_WAVES.indexOf(wave as typeof HUNT_WAVES[number]) + 1)) as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+    const emptyReceipt = { totalCited: 0, verifiedCount: 0, unresolvedCount: 0, outOfScopeCount: 0, allVerified: false, entries: [] };
+    let gate: ReturnType<typeof projectLiveGate> | null = null;
+    if (checked.open_gate) {
+      // Incident and reconcile context comes from hunt.gateContext.
+      let rawContext: unknown = null;
+      if (checked.open_gate.gate !== "scope") {
+        try {
+          rawContext = await this.#deps.sidecar.request("hunt.gateContext", { run_id: run.run_id });
+        } catch (error) {
+          rawContext = error instanceof Error ? error : new Error(String(error));
+        }
+      }
+      if (checked.open_gate.gate === "incident" && (!incidentHandoff.success || incidentHandoff.data.step_id !== "incident")) {
+        rawContext = new Error("The incident handoff is unavailable or invalid.");
+      }
+      gate = projectLiveGate(run.run_id, checked.open_gate, handoffs, rawContext, run.config.scopeText, reconcileHandoff);
+    }
+    let evidence: LiveEvidenceProjection | null = null;
+    if (!checked.open_gate && incidentHandoff.success && incidentHandoff.data.step_id === "incident") {
+      try {
+        const rawEvidence = await this.#deps.sidecar.request("hunt.evidence", { run_id: run.run_id });
+        evidence = await projectLiveEvidence(run.run_id, run.case_id, handoffs, rawEvidence, (cursor) =>
+          this.#deps.sidecar.request("hunt.evidencePage", { run_id: run.run_id, cursor, limit: RUN_EVIDENCE_PAGE_LIMIT }));
+      } catch {
+        // A failed read must not retain stale evidence or claim verified citations.
+      }
+    }
+    const snapshot: WorkbenchSnapshot = {
+      provenanceMode: "live_daemon",
+      huntId: run.run_id,
+      runStatus: run.status === "awaiting_gate" ? "awaiting_human_gate" : run.status === "cancelled" ? "stopped" : run.status,
+      caseMetadata: metadata,
+      currentWaveNumber: waveNumber(run.wave),
+      mergeFallbackActive: false,
+      gauges: {
+        totalTokensUsed: run.token_ledger.consumed_total_tokens,
+        handoffRejectionTokens: run.token_ledger.rejections_tokens,
+        maxTotalTokens: run.token_ledger.max_total_tokens,
+        promptCacheHitRatio: 0,
+        cacheBelowTarget: false,
+        billingMode: Object.values(run.results).find((result) => result.usage)?.usage?.billing_mode ?? "oauth_subscription",
+        actualBilledUsd: run.token_ledger.actual_billed_usd,
+        shadowApiUsd: run.token_ledger.shadow_api_usd,
+        cacheSavingsUsd: run.token_ledger.cache_savings_usd,
+        cyberRefusalCount: Object.values(run.results).filter((result) => result.refusal?.refused).length,
+      },
+      steps: Object.values(run.results).map((result) => ({
+        stepId: result.step_id,
+        waveNumber: waveNumber(result.wave),
+        wave: result.wave,
+        profile: result.profile,
+        state: run.step_states[result.step_id] ?? "done",
+        ...(result.reason_code ? { reasonCode: result.reason_code } : {}),
+        model: result.usage?.model ?? "",
+        turnsUsed: result.usage?.turns ?? 0,
+        maxTurns: 0,
+        inputTokens: result.usage?.input_tokens ?? 0,
+        outputTokens: result.usage?.output_tokens ?? 0,
+        cacheReadTokens: result.usage?.cache_read_tokens ?? 0,
+        cacheWriteTokens: result.usage?.cache_write_tokens ?? 0,
+        totalTokens: result.usage?.total_tokens ?? 0,
+        ...(result.refusal ? { refusal: result.refusal } : {}),
+        endedAtIso: result.finished_at,
+      })),
+      ganttSpans: [],
+      activeGate: gate?.activeGate ?? null,
+      gateHistory: run.decisions,
+      claims: handoffs.flatMap((handoff) => handoff.claims.map((claim) => ({
+        claim,
+        stepId: handoff.step_id,
+        waveNumber: waveNumber(run.results[handoff.step_id]?.wave ?? run.wave),
+        profile: handoff.profile,
+        inlineCitations: (() => {
+          const ex = extractInlineCitations(claim.statement);
+          return [
+            ...ex.event_ids.map((id) => ({ id, kind: "evt" as const })),
+            ...ex.frame_ids.map((id) => ({ id, kind: "frame" as const })),
+            ...ex.ioc_ids.map((id) => ({ id, kind: "ioc" as const })),
+          ].map((c) => ({ ...c, status: gate?.citationStatus.get(c.id) ?? evidence?.citationStatus.get(c.id) ?? ("unresolved" as const) }));
+        })(),
+        reviews: reviews.filter((review) => review.claim_ids.includes(claim.claim_id)),
+      }))),
+      limitations: handoffs.flatMap((handoff) => handoff.limitations.map((text) => ({
+        stepId: handoff.step_id, profile: handoff.profile, text,
+      }))),
+      handoffs,
+      snapshot: run.snapshot ?? { schema_version: 1, case_id: run.case_id, entities: [], relations: [] },
+      citationReceipt: gate?.citationReceipt ?? evidence?.citationReceipt ?? emptyReceipt,
+      histogram: { bucketTimestampsSec: [], ecsEventCounts: [], networkFlowCounts: [], intervalSec: 60 },
+      events: gate?.events ?? evidence?.events ?? [], arkimeFlows: [], packets: [], evidenceCatalog: gate?.evidenceCatalog ?? evidence?.evidenceCatalog ?? {},
+      watchState: this.#standbyWatchState(run.run_id),
+    };
+    if ((this.#appliedSnapshotVersions.get(run.run_id) ?? 0) > version) {
+      const latest = this.#runs.get(run.run_id);
+      if (!latest || latest.provenanceMode !== "live_daemon") {
+        throw new Error("Workbench refresh was superseded; refresh the hunt.");
+      }
+      return latest;
+    }
+    this.#appliedSnapshotVersions.set(run.run_id, version);
+    this.#liveRunIds.add(run.run_id);
+    const merged = this.#carryLoadedEvidence(run.run_id, snapshot, gate?.pagingState);
+    this.#runs.set(run.run_id, merged);
+    return merged;
+  }
+
+  /**
+   * A refresh re-reads the gate's first record page. When the run, gate, digest and complete cited list are
+   * unchanged, records the operator already paged in are kept (and the cursor continues); any change, such
+   * as a status moving after a source came back, starts again from the daemon's first page.
+   */
+  #carryLoadedEvidence(runId: string, snapshot: WorkbenchSnapshot, fresh: GateEvidencePaging | undefined): WorkbenchSnapshot {
+    const prior = this.#evidencePaging.get(runId);
+    const previous = this.#runs.get(runId);
+    if (!fresh) {
+      this.#evidencePaging.delete(runId);
       return snapshot;
     }
+    const sameCited = (a: GateEvidencePaging, b: GateEvidencePaging) =>
+      a.cited.length === b.cited.length &&
+      a.cited.every((c, i) => c.id === b.cited[i]!.id && c.kind === b.cited[i]!.kind && c.status === b.cited[i]!.status);
+    if (
+      !prior || !previous || !snapshot.activeGate || prior.runId !== fresh.runId || prior.gate !== fresh.gate ||
+      prior.payloadSha256.toLowerCase() !== fresh.payloadSha256.toLowerCase() || prior.loaded <= fresh.loaded || !sameCited(prior, fresh)
+    ) {
+      this.#evidencePaging.set(runId, fresh);
+      return snapshot;
+    }
+    const keep = new Set(prior.cited.slice(0, prior.loaded).map((c) => c.id));
+    const carried = Object.fromEntries(Object.entries(previous.evidenceCatalog).filter(([id]) => keep.has(id)));
+    const eventIds = new Set(snapshot.events.map((e) => e.eventId));
+    const events = [...snapshot.events, ...previous.events.filter((e) => keep.has(e.eventId) && !eventIds.has(e.eventId))]
+      .sort((a, b) => a.timestampMs - b.timestampMs);
+    this.#evidencePaging.set(runId, prior);
     return {
       ...snapshot,
-      watchState: this.#deps.watchHandlers.getState(),
+      evidenceCatalog: { ...carried, ...snapshot.evidenceCatalog },
+      events,
+      activeGate: {
+        ...snapshot.activeGate,
+        evidencePaging: { loaded: prior.loaded, total: prior.cited.length, hasMore: prior.nextCursor !== null },
+      },
+    };
+  }
+
+  #selectHunt(huntId: string): void {
+    if (this.#activeHuntId !== huntId) {
+      this.#deps.watchHandlers?.invalidate();
+      this.#activeHuntId = huntId;
+    }
+  }
+
+  #standbyWatchState(runId: string): WatchBrowserState {
+    return {
+      enabled: false,
+      runId,
+      role: "framework-researcher",
+      partition: `hunt-watch:${runId}:framework-researcher`,
+      currentUrl: "about:blank",
+      title: "Watch Browser (Standby)",
+      loading: false,
+      allowedOrigins: [],
+      blockedRequestCount: 0,
+      lastBlockedReason: null,
+      cdpEndpointUrl: null,
+    };
+  }
+
+  #attachWatchState(snapshot: WorkbenchSnapshot): WorkbenchSnapshot {
+    if (!this.#deps.watchHandlers) return snapshot;
+    return {
+      ...snapshot,
+      watchState: snapshot.huntId === this.#activeHuntId
+        ? this.getWatchState()
+        : this.#standbyWatchState(snapshot.huntId),
     };
   }
 }

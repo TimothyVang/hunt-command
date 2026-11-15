@@ -19,7 +19,17 @@ export interface GateDraftFields {
   checkNote: string;
 }
 
+/**
+ * Whether the renderer has real data from the main process. Until a snapshot arrives the panes are not
+ * rendered at all, so a missing preload bridge shows an explicit error instead of placeholder hunts.
+ */
+export type WorkbenchConnection =
+  | { readonly kind: "connecting" }
+  | { readonly kind: "ready" }
+  | { readonly kind: "unavailable"; readonly code: string; readonly message: string };
+
 export interface WorkbenchUiState {
+  connection: WorkbenchConnection;
   workbench: WorkbenchSnapshot;
   selectedCitationId: string | null;
   selectedClaimId: string | null;
@@ -47,6 +57,7 @@ const DEFAULT_ROLE: GateDraftFields["rbacRole"] = "lead_hunter";
 
 export class WorkbenchStore {
   #state: WorkbenchUiState;
+  #snapshotVersion = 0;
   readonly #listeners = new Set<() => void>();
 
   constructor(initialSnapshot?: WorkbenchSnapshot) {
@@ -56,6 +67,7 @@ export class WorkbenchStore {
     const firstEntity = snap.snapshot.entities[0]?.entity_id ?? null;
 
     this.#state = {
+      connection: initialSnapshot ? { kind: "ready" } : { kind: "connecting" },
       workbench: snap,
       selectedCitationId: firstCitation,
       selectedClaimId: firstClaim,
@@ -77,6 +89,8 @@ export class WorkbenchStore {
 
   getState = (): WorkbenchUiState => this.#state;
 
+  getSnapshotVersion = (): number => this.#snapshotVersion;
+
   subscribe = (listener: () => void): (() => void) => {
     this.#listeners.add(listener);
     return () => {
@@ -85,6 +99,7 @@ export class WorkbenchStore {
   };
 
   setWorkbenchSnapshot(nextSnapshot: WorkbenchSnapshot): void {
+    this.#snapshotVersion++;
     const prevGateKey = this.#state.workbench.activeGate
       ? buildGateDraftKey(this.#state.workbench.activeGate)
       : null;
@@ -110,12 +125,19 @@ export class WorkbenchStore {
 
     this.#setState({
       ...this.#state,
+      connection: { kind: "ready" },
       workbench: nextSnapshot,
       selectedEvidenceId: firstEvidence,
       centerTab:
         nextGateKey && nextGateKey !== prevGateKey ? "gate" : this.#state.centerTab,
       gateDrafts: nextDrafts,
     });
+  }
+
+  /** Records that the main process could not provide a snapshot (for example, no preload bridge). */
+  setConnectionUnavailable(code: string, message: string): void {
+    if (this.#state.connection.kind === "ready") return;
+    this.#setState({ ...this.#state, connection: { kind: "unavailable", code, message } });
   }
 
   /**

@@ -108,7 +108,7 @@ export function runDoctorChecks(repoRoot: string): DoctorCheckResult[] {
       id: "pi_natives_addon",
       status: "warn",
       detail:
-        "pi_natives.win32-x64-baseline.node not yet installed in node_modules (expected until Slice 2 merges; stage-extra-resources ready)",
+        "pi_natives.win32-x64-baseline.node not found in node_modules/@oh-my-pi/pi-natives-win32-x64 or bun's isolated node_modules/.bun/@oh-my-pi+pi-natives-win32-x64@*/ layout (run `bun install`)",
     });
   }
 

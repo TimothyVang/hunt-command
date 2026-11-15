@@ -227,7 +227,11 @@ export const QUERY_FIELDS = [
   "file.path.text",
 ] as const;
 
-export const LEADING_WILDCARD_RE = /(?:^|[\s(\[{:,"+!-])[*?]/;
+/**
+ * A `*`/`?` that starts a term: at the start, after a delimiter, or after a prefix operator
+ * (`+`, `!`, `-`) that itself starts the term. A `-` inside a term (`workstation-*`) is not one.
+ */
+export const LEADING_WILDCARD_RE = /(?:^|[\s(\[{:,"])[+!-]?[*?]/;
 
 export const INTERVALS = {
   "1m": 60,

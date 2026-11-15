@@ -375,14 +375,68 @@ describe("Review regressions (slice 2)", () => {
     store.close();
   });
 
-  // Finding 3
-  test("serve fails fast without a data-plane factory and wires the factory into hunt.start", async () => {
-    const runtimeDir = makeTmpDir();
-    const c1 = captureIo();
-    expect(await runHuntCli(["serve", "--runtime-dir", runtimeDir], c1.io, { stdin: linesOf() })).toBe(2);
-    expect(c1.err.join("")).toContain("no case data-plane factory is configured");
-    expect(fs.existsSync(runtimeLockPath(resolveRuntimeDir(runtimeDir).stateDir))).toBe(false);
+  // F3 follow-up: a resolved data plane must serve the run's own case before anything changes.
+  test("gate resume, hunt.resume and data-plane registration refuse a plane for another case", async () => {
+    const tmp = makeTmpDir();
+    const dbPath = path.join(tmp, "s.sqlite");
+    const decisionsDir = path.join(tmp, "dec");
+    const first = makeEngine(dbPath, decisionsDir);
+    const parked = await first.engine.startHunt({
+      runId: "hunt-bind-01",
+      scopeText: "Binding scope.",
+      dataPlane: makeDataPlane(),
+      followUps: 0,
+    });
+    expect(parked.open_gate?.gate).toBe("scope");
+    first.store.close();
 
+    // A restarted daemon whose resolver returns a different case for this run's case_id.
+    const wrong = makeEngine(dbPath, decisionsDir, { resolveDataPlane: () => makeDataPlane({ caseId: "case-other-99" }) });
+    const before = wrong.store.getRun("hunt-bind-01")!;
+    const rpc = new HuntDaemonRpcServer({ engine: wrong.engine, writeLine: () => {} });
+    const decide = (operatorToken: string) => ({
+      jsonrpc: "2.0",
+      id: "d1",
+      method: "hunt.decideGate",
+      params: {
+        decision_id: "dec-bind-01",
+        hunt_id: "hunt-bind-01",
+        gate: "scope",
+        action: "approve",
+        operator_token: operatorToken,
+        payload_sha256: parked.open_gate!.payload_sha256,
+        check_note: "Approved.",
+      },
+    });
+    const refused = await rpc.handleLine(
+      JSON.stringify(decide(wrong.gates.sessionAuthority.issueToken("alice", "analyst"))),
+    );
+    expect(refused.error?.error_code).toBe("case_mismatch");
+    expect(wrong.store.getRun("hunt-bind-01")).toEqual(before);
+
+    const resumeRefused = await rpc.handleLine(
+      JSON.stringify({ jsonrpc: "2.0", id: "r1", method: "hunt.resume", params: { run_id: "hunt-bind-01" } }),
+    );
+    expect(resumeRefused.error?.error_code).toBe("case_mismatch");
+    expect(() => wrong.engine.registerDataPlaneForRun("hunt-bind-01", makeDataPlane({ caseId: "case-other-99" }))).toThrow(
+      /case-other-99/,
+    );
+    expect(wrong.store.getRun("hunt-bind-01")).toEqual(before);
+    wrong.store.close();
+
+    // The decision id was not burned: the same decision succeeds once the right case resolves.
+    const right = makeEngine(dbPath, decisionsDir, { resolveDataPlane: () => makeDataPlane() });
+    const accepted = await new HuntDaemonRpcServer({ engine: right.engine, writeLine: () => {} }).handleLine(
+      JSON.stringify(decide(right.gates.sessionAuthority.issueToken("alice", "analyst"))),
+    );
+    expect(accepted.error).toBeUndefined();
+    expect((accepted.result as PersistedHuntRun).decisions.map((d) => d.decision_id)).toContain("dec-bind-01");
+    right.store.close();
+  });
+
+  // Finding 3
+  test("serve wires an injected data-plane factory into hunt.start", async () => {
+    const runtimeDir = makeTmpDir();
     const requested: string[] = [];
     const c2 = captureIo();
     const code = await runHuntCli(["serve", "--runtime-dir", runtimeDir], c2.io, {

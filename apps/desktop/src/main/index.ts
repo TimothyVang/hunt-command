@@ -21,13 +21,18 @@ import { resolveDaemonLaunch } from "./daemon/resolve-daemon.ts";
 import { renderHtmlToPdfViaChromium } from "./export/pdf-print.ts";
 import { recordOffscreenWorkbenchAndCutFilm } from "./film/offscreen-recorder.ts";
 import { createLogger } from "./logger.ts";
+import { applyNetworkQuietSwitches } from "./network-quiet.ts";
 import { SecretVault } from "./secret-vault.ts";
 import { hardenSession, hardenWindow, TrustedRenderers } from "./security.ts";
+import { createWatchScope } from "./watch/browser-policy.ts";
 import { WatchBrowserController } from "./watch/watch-panel.ts";
 import { WorkbenchService } from "./workbench-service.ts";
 
 // Must be called before app.whenReady() so every renderer & utility process runs OS-sandboxed.
 app.enableSandbox();
+// Also before ready: no mDNS responder (UDP 0.0.0.0/[::]:5353), no Cast/DIAL discovery, and no
+// non-proxied WebRTC UDP in any webContents (Watch view, main window, film and PDF windows).
+applyNetworkQuietSwitches(app);
 
 const mainDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(mainDir, "../../../..");
@@ -92,6 +97,8 @@ async function bootstrap(): Promise<void> {
         isPackaged: app.isPackaged,
         resourcesPath: process.resourcesPath,
         repoRoot,
+        runtimeDir: runtimePaths.rootDir,
+        casesDir: process.env.HUNT_COMMAND_CASES_DIR?.trim() || null,
       }),
     runtimeRootDir: runtimePaths.rootDir,
     log,
@@ -157,7 +164,25 @@ async function bootstrap(): Promise<void> {
     watchHandlers: {
       getState: () => watch.getState(),
       setBounds: (bounds) => watch.setBounds(bounds),
+      invalidate: () => watch.invalidate(),
       navigate: async (runId, role, url) => await watch.navigate(runId, role, url),
+      open: async (input) => {
+        const labOrigin = input.labOrigin;
+        const scope = createWatchScope({
+          caseId: input.caseId,
+          labOrigin,
+          arkimeOrigin: input.arkimeOrigin ?? labOrigin,
+          kibanaOrigin: input.kibanaOrigin ?? null,
+          startSec: input.startSec,
+          stopSec: input.stopSec,
+        });
+        return await watch.openFencedSession(
+          input.runId,
+          input.role,
+          scope,
+          input.initialUrl ?? `${scope.labOrigin}/`,
+        );
+      },
     },
   });
 
@@ -177,6 +202,8 @@ async function bootstrap(): Promise<void> {
         return await service.globalStop(payload);
       case "hunt:submitGateDecision":
         return await service.submitGateDecision(payload);
+      case "hunt:gateEvidencePage":
+        return await service.loadMoreGateEvidence(payload);
       case "hunt:inspectTranscriptPage":
         return await service.inspectTranscriptPage(payload);
       case "hunt:queryDissector":
@@ -187,6 +214,8 @@ async function bootstrap(): Promise<void> {
         return service.getWatchState();
       case "watch:setBounds":
         return service.setWatchBounds(payload);
+      case "watch:open":
+        return await service.openWatch(payload);
       case "watch:navigate":
         return await service.navigateWatch(payload);
       case "export:customerReport":

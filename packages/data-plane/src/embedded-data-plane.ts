@@ -8,6 +8,7 @@ import {
   ARKIME_DEFAULT_FIELDS,
   ARKIME_SESSION_FIELDS,
   ARKIME_UNIQUE_FIELDS,
+  type CaseMetadata,
   type DataOrigin,
   type DataPlaneToolName,
   DEFAULT_FIELDS,
@@ -41,6 +42,7 @@ import {
   type ArkimeUniqueParams,
   type ArkimeUniqueResult,
   type CitationVerificationResult,
+  type CitedRecord,
   coerceBoundedInt,
   type DetectionTestParams,
   type DetectionTestResult,
@@ -1465,6 +1467,38 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     return structuredClone(this.pack.rawCaseObject);
   }
 
+  /**
+   * The validated case as the shared `CaseMetadata` contract. `sources` lists the evidence
+   * artifacts this data plane actually serves (the source ids a handoff may cite).
+   */
+  public describeCase(): CaseMetadata {
+    this.assertOpen();
+    const relArtifact = (absPath: string): string =>
+      path.relative(this.pack.caseDir, absPath).split(path.sep).join("/");
+    const sources = [this.pack.eventsPath, this.pack.intelPath, this.pack.pcapPath]
+      .filter((p): p is string => p !== null)
+      .map(relArtifact);
+    const rawTitle = this.pack.rawCaseObject.title;
+    const title =
+      typeof rawTitle === "string" && rawTitle.trim().length > 0
+        ? rawTitle.trim()
+        : this.pack.question.trim() || this.caseId;
+    return {
+      case_id: this.caseId,
+      title,
+      data_origin: this.dataOrigin,
+      synthetic_only: this.syntheticOnly,
+      time_window: {
+        start_iso: this.pack.startInclusiveIso,
+        end_iso: this.pack.endExclusiveIso,
+      },
+      sources,
+      ...(this.pack.pcapPath !== null && this.hasNetworkCapture
+        ? { pcap_relpath: relArtifact(this.pack.pcapPath) }
+        : {}),
+    };
+  }
+
   public elasticSearch(params: ElasticSearchParams): ElasticSearchResult {
     this.assertOpen();
     this.assertCaseParam(params.case_id);
@@ -2118,6 +2152,80 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
       blocked_requests: 0,
       html_preview: rendered.html.slice(0, 4096),
     };
+  }
+
+  /**
+   * Reads the records behind cited ids, with the same case scoping as {@link verifyCitations}
+   * (events inside the window and host scope, frames inside the window). Ids that do not resolve,
+   * or are malformed, are simply absent from the result. Records are raw case data: callers that
+   * show them must scrub them.
+   */
+  public readCitedRecords(ids: readonly string[]): CitedRecord[] {
+    this.assertOpen();
+    const records: CitedRecord[] = [];
+    const eventScope = this.buildScopedEventWhere(undefined);
+    const evtQuery = this.db.query(
+      `SELECT e.doc_id, e.ts_iso FROM events_hot e WHERE e.event_id = ? AND ${eventScope.whereSql} LIMIT 1`,
+    );
+    const iocQuery = this.db.query(
+      "SELECT feed_name, indicator_value, flat_json FROM intel_items WHERE ioc_id = ? LIMIT 1",
+    );
+    const hasPackets =
+      this.hasNetworkCapture &&
+      this.db
+        .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'packets'")
+        .get() !== null;
+    const frameQuery = hasPackets
+      ? this.db.query(
+          "SELECT CAST(ts_ns AS TEXT) AS ts_ns_str, ws_protocol, row_json FROM packets WHERE frame_number = ? AND ts_ns >= ? AND ts_ns < ? LIMIT 1",
+        )
+      : null;
+
+    for (const id of [...new Set(ids)]) {
+      if (/^evt-[A-Za-z0-9_-]{1,120}$/.test(id)) {
+        const row = evtQuery.get(id, ...eventScope.params) as { doc_id: number; ts_iso: string } | null;
+        if (!row) continue;
+        const doc = this.loadEventSourceDoc(row.doc_id);
+        const message = (doc as { message?: unknown }).message;
+        const action = ((doc as { event?: { action?: unknown } }).event ?? {}).action;
+        records.push({
+          id,
+          kind: "evt",
+          timestamp_iso: row.ts_iso,
+          title: typeof message === "string" ? message : typeof action === "string" ? action : id,
+          record: doc,
+        });
+        continue;
+      }
+      const frameMatch = /^frame-0*([1-9][0-9]{0,9})$/.exec(id);
+      if (frameMatch) {
+        const row = frameQuery?.get(Number.parseInt(frameMatch[1]!, 10), this.pack.startNs, this.pack.endNs) as
+          | { ts_ns_str: string; ws_protocol: string; row_json: string }
+          | null
+          | undefined;
+        if (!row) continue;
+        records.push({
+          id,
+          kind: "frame",
+          timestamp_iso: new Date(epochMillisFromNs(BigInt(row.ts_ns_str))).toISOString(),
+          title: `${row.ws_protocol} frame ${frameMatch[1]}`,
+          record: JSON.parse(row.row_json) as Record<string, unknown>,
+        });
+        continue;
+      }
+      if (/^ioc-[A-Za-z0-9_-]{1,120}$/.test(id)) {
+        const row = iocQuery.get(id) as { feed_name: string; indicator_value: string; flat_json: string } | null;
+        if (!row) continue;
+        records.push({
+          id,
+          kind: "ioc",
+          timestamp_iso: null,
+          title: `${row.feed_name}: ${row.indicator_value}`,
+          record: JSON.parse(row.flat_json) as Record<string, unknown>,
+        });
+      }
+    }
+    return records;
   }
 
   public verifyCitations(citations: readonly string[]): CitationVerificationResult {

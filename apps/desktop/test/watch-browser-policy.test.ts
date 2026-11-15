@@ -47,8 +47,32 @@ describe("Hardened Watch Browser request policy, proxy blackhole & CDP filter (#
     const proxy = buildWatchProxyConfig(TEST_SCOPE);
     expect(proxy.proxyRules).toBe("http://127.0.0.1:1");
     expect(proxy.proxyBypassRules).toBe(
-      "127.0.0.1:18400;127.0.0.1:18401;127.0.0.1:15601;<-loopback>",
+      "<-loopback>;127.0.0.1:18400;127.0.0.1:18401;127.0.0.1:15601",
     );
+
+    // Chromium (net/base/scheme_host_port_matcher.cc) evaluates bypass rules in REVERSE order and the
+    // first hit wins, so later rules override earlier ones; with no hit, loopback is implicitly bypassed.
+    // `<-loopback>` answers "do not bypass" for loopback hosts.
+    const routes = (bypassRules: string, url: string): "DIRECT" | "PROXY" => {
+      const u = new URL(url);
+      const port = u.port || (u.protocol === "https:" ? "443" : "80");
+      const loopback = u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "[::1]";
+      for (const rule of bypassRules.split(";").reverse()) {
+        if (rule === "<-loopback>") {
+          if (loopback) return "PROXY";
+        } else if (rule === `${u.hostname}:${port}`) {
+          return "DIRECT";
+        }
+      }
+      return loopback ? "DIRECT" : "PROXY";
+    };
+    const rules = proxy.proxyBypassRules;
+    expect(routes(rules, "http://127.0.0.1:18400/")).toBe("DIRECT");
+    expect(routes(rules, "http://127.0.0.1:18401/api/sessions")).toBe("DIRECT");
+    expect(routes(rules, "http://127.0.0.1:15601/app/discover")).toBe("DIRECT");
+    expect(routes(rules, "http://127.0.0.1:18402/")).toBe("PROXY");
+    expect(routes(rules, "http://localhost:18400/")).toBe("PROXY");
+    expect(routes(rules, "https://example.invalid/")).toBe("PROXY");
   });
 
   test("documentAllowed permits only lab, Arkime, about:blank, and Kibana /app/discover", () => {
@@ -90,6 +114,33 @@ describe("Hardened Watch Browser request policy, proxy blackhole & CDP filter (#
     expect(
       decideWatchRequest(TEST_SCOPE, "POST", "http://127.0.0.1:18401/api/delete").block,
     ).toBe("arkime_route_denied");
+  });
+
+  test("lab requests cannot bypass Arkime restrictions even with a distinct Arkime origin", () => {
+    const base = "http://127.0.0.1:18400";
+    const verdict = decideWatchRequest(TEST_SCOPE, "GET", `${base}/api/%73essions?date=-1`);
+    expect(verdict.url).toBeDefined();
+    const query = new URL(verdict.url!).searchParams;
+    expect(query.get("expression")).toBe('tags == "case:northvale-lab-001"');
+    expect(query.get("startTime")).toBe(String(TEST_SCOPE.startSec));
+    expect(query.get("stopTime")).toBe(String(TEST_SCOPE.stopSec));
+    expect(query.has("date")).toBe(false);
+    expect(decideWatchRequest(TEST_SCOPE, "GET", `${base}/api/sessions?expression=x&expression=y`).block)
+      .toBe("arkime_ambiguous_search");
+    expect(decideWatchRequest(TEST_SCOPE, "GET", `${base}/api/sessions.pcap`).block)
+      .toBe("arkime_route_denied");
+    expect(decideWatchRequest(TEST_SCOPE, "POST", `${base}/api/sessions`, "{}").block)
+      .toBe("lab_read_only");
+    expect(decideWatchRequest(TEST_SCOPE, "GET", `${base}/watch/arkime_sessions?key=fixture`))
+      .toEqual({});
+  });
+
+  test("rejects ambiguous Kibana origin overlaps", () => {
+    for (const kibanaOrigin of [TEST_SCOPE.labOrigin, TEST_SCOPE.arkimeOrigin]) {
+      expect(() => createWatchScope({ ...TEST_SCOPE, kibanaOrigin })).toThrow(
+        "kibanaOrigin must be distinct",
+      );
+    }
   });
 
   test("decideWatchRequest pins Kibana /internal/bsearch to hunt-lab-case-events and case @timestamp window", () => {

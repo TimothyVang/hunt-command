@@ -6,52 +6,20 @@ import type {
   WorkbenchSnapshot,
 } from "./workbench-types.ts";
 
-/**
- * Strict Preload <-> Main IPC Channel Allowlist.
- *
- * Security invariants (#178 G1.2):
- * - NO `app:openExternal` (`shell.openExternal` is deleted globally).
- * - NO `terminal:*`, `workspace:*`, `git:*`, `mcp:*`, `connectors:*`, `collab:*`, `extensions:*`.
- */
-export const INVOKE_CHANNEL_LIST = [
-  "daemon:status",
-  "daemon:restart",
-  "hunt:listRuns",
-  "hunt:getWorkbenchState",
-  "hunt:startRun",
-  "hunt:globalStop",
-  "hunt:submitGateDecision",
-  "hunt:inspectTranscriptPage",
-  "hunt:queryDissector",
-  "hunt:resolveEvidence",
-  "watch:getState",
-  "watch:setBounds",
-  "watch:navigate",
-  "export:customerReport",
-  "film:recordAndCut",
-  "film:status",
-  "vault:status",
-  "vault:hasSecret",
-  "vault:setSecret",
-  "vault:deleteSecret",
-] as const;
-
-export type InvokeChannel = (typeof INVOKE_CHANNEL_LIST)[number];
-export const INVOKE_CHANNELS: ReadonlySet<string> = new Set<string>(INVOKE_CHANNEL_LIST);
-
-export const EVENT_CHANNEL_LIST = [
-  "daemon:eventBatch",
-  "daemon:stateChanged",
-  "watch:stateChanged",
-  "film:progress",
-] as const;
-
-export type EventChannel = (typeof EVENT_CHANNEL_LIST)[number];
-export const EVENT_CHANNELS: ReadonlySet<string> = new Set<string>(EVENT_CHANNEL_LIST);
+export {
+  EVENT_CHANNEL_LIST,
+  EVENT_CHANNELS,
+  type EventChannel,
+  INVOKE_CHANNEL_LIST,
+  INVOKE_CHANNELS,
+  type InvokeChannel,
+} from "./ipc-channels.ts";
+import type { EventChannel, InvokeChannel } from "./ipc-channels.ts";
 
 export const StartRunInputSchema = z
   .object({
     caseId: z.string().min(1).max(128),
+    scope: z.string().max(100_000).refine((value) => value.trim().length > 0, "Scope is required"),
     dataOrigin: DataOriginSchema,
     maxTotalTokens: z.number().int().min(10_000).max(50_000_000).default(4_000_000),
     followUps: z.number().int().min(0).max(12).default(6),
@@ -86,6 +54,7 @@ export const SubmitGateDecisionInputSchema = z
       .max(1000, '"What did you check?" note cannot exceed 1000 chars')
       .refine((s) => s.trim().length >= 1, '"What did you check?" note cannot be blank'),
     payloadSha256: z.string().regex(/^[a-f0-9]{64}$/i, "Expected 64-hex SHA-256 payload digest"),
+    operatorToken: z.string().min(1).max(8192).optional(),
   })
   .strict();
 
@@ -118,6 +87,7 @@ export type QueryDissectorInput = z.infer<typeof QueryDissectorInputSchema>;
 
 export const WatchBoundsInputSchema = z
   .object({
+    runId: z.string().min(1).max(128),
     bounds: z
       .object({
         x: z.number().int(),
@@ -134,6 +104,33 @@ export const WatchNavigateInputSchema = z
     runId: z.string().min(1).max(128),
     role: ProfileIdSchema,
     url: z.string().min(1).max(2048),
+  })
+  .strict();
+
+/**
+ * Opens the fenced Watch session for a run/role. Every origin is re-validated in the main process by
+ * `createWatchScope` (pinned `http(s)://127.0.0.1:<port>` only); `arkimeOrigin` defaults to `labOrigin`.
+ */
+export const WatchOpenInputSchema = z
+  .object({
+    runId: z.string().min(1).max(128),
+    role: ProfileIdSchema,
+    caseId: z.string().min(1).max(128),
+    labOrigin: z.string().min(1).max(2048),
+    arkimeOrigin: z.string().min(1).max(2048).optional(),
+    kibanaOrigin: z.string().min(1).max(2048).nullable().optional(),
+    startSec: z.number().int().nonnegative(),
+    stopSec: z.number().int().positive(),
+    initialUrl: z.string().min(1).max(2048).optional(),
+  })
+  .strict();
+
+export type WatchOpenInput = z.infer<typeof WatchOpenInputSchema>;
+
+/** Load the next page of the open gate's cited records; the cursor stays in the main process. */
+export const GateEvidencePageInputSchema = z
+  .object({
+    huntId: z.string().min(1).max(128),
   })
   .strict();
 

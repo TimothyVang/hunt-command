@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { AlertOctagon, CheckCircle2, FileCheck2, Lock, ShieldAlert, XCircle } from "lucide-react";
 import {
   formatRealDataOriginText,
@@ -5,27 +6,87 @@ import {
   PROFILE_DISPLAY_TITLES,
   type CaseMetadata,
 } from "@hunt-command/shared";
-import { validateGateSubmission } from "../../../shared/gate-validation.ts";
+import { missingGateContextReason, reconcileOutcomeText, validateGateSubmission } from "../../../shared/gate-validation.ts";
+import { SafeForensicText } from "../components/SafeForensicText.tsx";
 import type { ActiveGatePrompt } from "../../../shared/workbench-types.ts";
 import type { GateDraftFields } from "../state/workbench-store.ts";
 
 export interface AuthorityGateCardProps {
   activeGate: ActiveGatePrompt;
   caseMetadata: CaseMetadata;
+  requiresToken: boolean;
   draft: GateDraftFields;
   onUpdateDraft: (patch: Partial<GateDraftFields>) => void;
-  onSubmitDecision: (action: "approve" | "reject") => void;
+  onSubmitDecision: (action: "approve" | "reject", operatorToken?: string) => void;
   onSelectCitation: (citationId: string) => void;
+  /** Loads the next page of cited records; resolves to an error message, or null on success. */
+  onLoadMoreEvidence?: () => Promise<string | null>;
+}
+
+/**
+ * "N of M records loaded" for paged gate evidence (F18). Citation statuses above are complete; only the
+ * record details below are paged, and a partial list is always labelled as partial.
+ */
+export function EvidencePagingBar({
+  paging,
+  onLoadMore,
+}: {
+  paging: { loaded: number; total: number; hasMore: boolean };
+  onLoadMore?: () => Promise<string | null>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const partial = paging.loaded < paging.total;
+  return (
+    <div data-testid="evidence-paging" className="rounded border border-slate-800 bg-slate-950/70 px-2 py-1 text-[11px] font-mono space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <span className={partial ? "text-amber-200" : "text-slate-300"}>
+          {paging.loaded} of {paging.total} records loaded
+          {partial ? " (partial record list; every citation status above is complete)" : " (all records loaded)"}
+        </span>
+        {paging.hasMore && onLoadMore && (
+          <button
+            type="button"
+            data-testid="evidence-load-more"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              setError(null);
+              void onLoadMore().then((err) => {
+                setBusy(false);
+                setError(err);
+              });
+            }}
+            className="rounded border border-cyan-500/50 bg-cyan-950/70 px-2 py-0.5 text-cyan-100 disabled:opacity-40 cursor-pointer"
+          >
+            {busy ? "Loading…" : "Load more"}
+          </button>
+        )}
+      </div>
+      {error && (
+        <div role="alert" data-testid="evidence-paging-error" className="text-rose-300">
+          {error}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function AuthorityGateCard({
   activeGate,
   caseMetadata,
+  requiresToken,
   draft,
   onUpdateDraft,
   onSubmitDecision,
   onSelectCitation,
+  onLoadMoreEvidence,
 }: AuthorityGateCardProps) {
+  const [operatorToken, setOperatorToken] = useState("");
+  const submit = (action: "approve" | "reject") => {
+    onSubmitDecision(action, requiresToken ? operatorToken : undefined);
+    setOperatorToken("");
+  };
   const approveValidation = validateGateSubmission(activeGate, {
     operatorName: draft.operatorName,
     rbacRole: draft.rbacRole,
@@ -41,6 +102,8 @@ export function AuthorityGateCard({
     payloadSha256: activeGate.payloadSha256,
     action: "reject",
   });
+
+  const contextMissing = missingGateContextReason(activeGate);
 
   const citationBlocked =
     activeGate.gate === "incident" &&
@@ -97,6 +160,20 @@ export function AuthorityGateCard({
         </div>
       )}
 
+      {activeGate.gate === "scope" && activeGate.scopeText && (
+        <div className="rounded border border-slate-800 bg-slate-950/80 p-2 text-xs">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">Hunt scope</div>
+          <SafeForensicText text={activeGate.scopeText} className="whitespace-pre-wrap break-words text-slate-100" />
+        </div>
+      )}
+      {activeGate.gate === "scope" && activeGate.scopeHandoff && (
+        <section data-testid="scope-handoff" className="space-y-2 rounded border border-slate-800 bg-slate-950/80 p-2 text-xs">
+          <h3 className="font-semibold text-slate-100">Generated scope handoff</h3>
+          <SafeForensicText text={JSON.stringify(activeGate.scopeHandoff, null, 2)} className="whitespace-pre-wrap break-words text-slate-100" />
+        </section>
+      )}
+
+
       {/* Gate 1: Scope Details + Read-Only Role Tool Ownership Matrix */}
       {activeGate.gate === "scope" && activeGate.scopeSummary && (
         <div className="space-y-2.5 text-xs">
@@ -143,6 +220,24 @@ export function AuthorityGateCard({
             </div>
           </div>
         </div>
+      )}
+
+      {activeGate.gate === "incident" && activeGate.incidentHandoff && (
+        <section data-testid="incident-handoff" className="space-y-2 rounded border border-slate-800 bg-slate-950/80 p-2 text-xs">
+          <h3 className="font-semibold text-slate-100">Incident handoff</h3>
+          {activeGate.incidentHandoff.claims.map((claim) => (
+            <div key={claim.claim_id}>
+              <div className="font-mono text-slate-400">{claim.claim_id} · {claim.kind}</div>
+              <SafeForensicText text={claim.statement} className="whitespace-pre-wrap break-words text-slate-100" />
+            </div>
+          ))}
+          <h4 className="font-semibold text-slate-300">Limitations</h4>
+          {activeGate.incidentHandoff.limitations.length === 0 ? (
+            <p className="text-slate-400">None reported.</p>
+          ) : activeGate.incidentHandoff.limitations.map((text, index) => (
+            <SafeForensicText key={index} text={text} className="whitespace-pre-wrap break-words text-slate-300" />
+          ))}
+        </section>
       )}
 
       {/* Gate 2: Automated Citation Verification Receipt + Epistemic Split + Purple Summary */}
@@ -224,13 +319,14 @@ export function AuthorityGateCard({
       )}
 
       {/* Crash-Recovery Reconcile Gate */}
-      {activeGate.gate === "reconcile" && activeGate.reconcileContext && (
+      {activeGate.gate === "reconcile" && activeGate.reconcileContext?.reasonCode === "previous_dispatch_unknown" && (
         <div
           data-testid="reconcile-gate-context"
           className="rounded border border-amber-500/50 bg-amber-950/30 p-2.5 font-mono text-[11px] space-y-1"
         >
           <div className="font-bold text-amber-200">
-            reason_code: {activeGate.reconcileContext.reasonCode}
+            reason_code: previous_dispatch_unknown — the daemon restarted while this step's dispatch was
+            reserved, so whether the model call ran is unknown.
           </div>
           <div className="text-slate-300">
             execution_id: {activeGate.reconcileContext.executionId} · session_id:{" "}
@@ -241,10 +337,78 @@ export function AuthorityGateCard({
             input_id: {activeGate.reconcileContext.inputId}
           </div>
           <div className="text-slate-400">
-            reserved_at: {activeGate.reconcileContext.reservedAtIso} — Daemon crashed after reserving
-            step execution receipt; operator must approve replay or reject to halt run cleanly.
+            reserved_at: {activeGate.reconcileContext.reservedAtIso} — approval drops an optional unknown
+            step and resumes the run, or fails the run if the step is required. The dispatch is not replayed.
+            Rejection fails the run.
+            {activeGate.reconcileContext.additionalReceiptCount
+              ? ` ${activeGate.reconcileContext.additionalReceiptCount} more unknown dispatch(es) are covered by this gate.`
+              : ""}
           </div>
+          {activeGate.reconcileContext.affectedStep && (
+            <ul data-testid="reconcile-outcomes" className="list-disc pl-4 text-slate-300 space-y-0.5">
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).approve}</li>
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).reject}</li>
+            </ul>
+          )}
         </div>
+      )}
+
+      {activeGate.gate === "reconcile" && activeGate.reconcileContext?.reasonCode === "citation_source_unavailable" && (
+        <div
+          data-testid="reconcile-gate-context"
+          className="rounded border border-amber-500/50 bg-amber-950/30 p-2.5 font-mono text-[11px] space-y-1"
+        >
+          <div className="font-bold text-amber-200">
+            reason_code: citation_source_unavailable — the citation source could not be reached while
+            verifying this step&apos;s citations, so its handoff was not accepted.
+          </div>
+          {activeGate.reconcileContext.affectedStep ? (
+            <div data-testid="reconcile-affected-step" className="text-slate-200">
+              affected step: {activeGate.reconcileContext.affectedStep.stepId} (
+              {activeGate.reconcileContext.affectedStep.profile}) · wave{" "}
+              {activeGate.reconcileContext.affectedStep.wave} ·{" "}
+              {activeGate.reconcileContext.affectedStep.optional ? "optional" : "required"}
+            </div>
+          ) : (
+            <div data-testid="reconcile-affected-step-missing" className="text-rose-300">
+              affected step: not identified by the daemon
+            </div>
+          )}
+          <div className="text-slate-300">
+            unavailable sources:{" "}
+            {activeGate.reconcileContext.unavailableSources.length > 0
+              ? activeGate.reconcileContext.unavailableSources.join(", ")
+              : "none now (the source is reachable again; statuses below are re-checked)"}
+          </div>
+          <div className="text-slate-300">
+            citations: {activeGate.reconcileContext.citationReceipt.verifiedCount}/
+            {activeGate.reconcileContext.citationReceipt.totalCited} verified · unresolved=
+            {activeGate.reconcileContext.citationReceipt.unresolvedCount} · out_of_scope=
+            {activeGate.reconcileContext.citationReceipt.outOfScopeCount}
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {activeGate.reconcileContext.citationReceipt.entries.map((entry) => (
+              <button
+                key={entry.citationId}
+                type="button"
+                onClick={() => onSelectCitation(entry.citationId)}
+                className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-200 cursor-pointer"
+              >
+                {entry.citationId} · {entry.status}
+              </button>
+            ))}
+          </div>
+          {activeGate.reconcileContext.affectedStep && (
+            <ul data-testid="reconcile-outcomes" className="list-disc pl-4 text-slate-300 space-y-0.5">
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).approve}</li>
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).reject}</li>
+            </ul>
+          )}
+        </div>
+      )}
+
+      {activeGate.evidencePaging && (
+        <EvidencePagingBar paging={activeGate.evidencePaging} onLoadMore={onLoadMoreEvidence} />
       )}
 
       {/* 64-Hex SHA-256 Tamper-Evident Payload Digest */}
@@ -286,6 +450,15 @@ export function AuthorityGateCard({
         </label>
       </div>
 
+      {requiresToken && (
+        <label className="block space-y-1 text-xs">
+          <span className="text-slate-300">Signed operator token</span>
+          <input type="password" autoComplete="off" value={operatorToken}
+            onChange={(e) => setOperatorToken(e.target.value)}
+            className="w-full rounded border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-slate-100 focus:border-cyan-500 focus:outline-none" />
+        </label>
+      )}
+
       <label className="block space-y-1">
         <div className="flex items-center justify-between text-[11px]">
           <span className="font-semibold text-slate-200">
@@ -313,13 +486,23 @@ export function AuthorityGateCard({
         </div>
       )}
 
+      {contextMissing && (
+        <div
+          role="alert"
+          data-testid="gate-context-unavailable"
+          className="rounded border border-rose-500/70 bg-rose-950/60 px-2.5 py-1.5 text-[11px] font-medium text-rose-200"
+        >
+          {contextMissing} You can still reject this gate.
+        </div>
+      )}
+
       {/* Action Buttons */}
       <div className="flex items-center justify-end gap-2 pt-1">
         <button
           type="button"
           data-testid="gate-reject-button"
-          disabled={!rejectValidation.valid}
-          onClick={() => onSubmitDecision("reject")}
+          disabled={!rejectValidation.valid || (requiresToken && !operatorToken.trim())}
+          onClick={() => submit("reject")}
           className="inline-flex items-center gap-1.5 rounded border border-rose-500/70 bg-rose-950/70 px-3 py-1.5 text-xs font-semibold text-rose-100 hover:bg-rose-900 disabled:opacity-40 cursor-pointer"
         >
           <XCircle className="h-3.5 w-3.5" />
@@ -328,8 +511,8 @@ export function AuthorityGateCard({
         <button
           type="button"
           data-testid="gate-approve-button"
-          disabled={!approveValidation.valid}
-          onClick={() => onSubmitDecision("approve")}
+          disabled={contextMissing !== null || !approveValidation.valid || (requiresToken && !operatorToken.trim())}
+          onClick={() => submit("approve")}
           className="inline-flex items-center gap-1.5 rounded border border-emerald-400/70 bg-emerald-700 px-3.5 py-1.5 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-40 cursor-pointer"
         >
           <CheckCircle2 className="h-3.5 w-3.5" />

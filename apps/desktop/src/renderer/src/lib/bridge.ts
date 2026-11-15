@@ -6,23 +6,55 @@ import type {
   IpcResult,
 } from "../../../shared/ipc.ts";
 
-function getNativeBridge(): DesktopBridge | null {
-  if (typeof window !== "undefined" && window.huntWorkbench) {
-    return window.huntWorkbench;
-  }
-  return null;
+/** Error code returned on every channel when the Electron preload bridge is missing. */
+export const PRELOAD_UNAVAILABLE = "PRELOAD_UNAVAILABLE";
+
+/** `?preview=fixtures` opts a dev-server renderer into labelled synthetic fixture data. */
+export const FIXTURE_PREVIEW_QUERY = "fixtures";
+
+interface RendererWindow {
+  huntWorkbench?: DesktopBridge;
+  location: { search: string };
 }
 
-export async function invokeDesktop<T>(
-  channel: InvokeChannel,
-  payload?: unknown,
-): Promise<IpcResult<T>> {
-  const bridge = getNativeBridge();
-  if (bridge) {
-    return await bridge.invoke<T>(channel, payload);
-  }
+/** `window` without requiring DOM lib types (this module is also type-checked by the node project). */
+function rendererWindow(): RendererWindow | undefined {
+  return (globalThis as { window?: RendererWindow }).window;
+}
 
-  // Standalone browser preview fallback when opened outside Electron preload.
+function getNativeBridge(): DesktopBridge | null {
+  return rendererWindow()?.huntWorkbench ?? null;
+}
+
+export function hasDesktopBridge(): boolean {
+  return getNativeBridge() !== null;
+}
+
+/**
+ * Fixture data is served only when explicitly requested on a dev-server renderer
+ * (`electron-vite dev` / `vite` with `?preview=fixtures`). A packaged or built renderer
+ * without the preload bridge reports {@link PRELOAD_UNAVAILABLE} instead of inventing hunts.
+ */
+export function isFixturePreviewRequested(): boolean {
+  const env = (import.meta as { env?: { DEV?: boolean } }).env;
+  const win = rendererWindow();
+  if (env?.DEV !== true || win === undefined) {
+    return false;
+  }
+  return new URLSearchParams(win.location.search).get("preview") === FIXTURE_PREVIEW_QUERY;
+}
+
+function previewFixture<T>(channel: InvokeChannel, payload?: unknown): IpcResult<T> | null {
+  if (channel === "hunt:listRuns") {
+    return {
+      ok: true,
+      data: [
+        { huntId: "hunt-20261115-nv01", caseId: "northvale-lab-001", title: "Northvale Scheduled Task & C2 DNS/TLS Beaconing Investigation", metadataAvailable: true, runStatus: "awaiting_human_gate" },
+        { huntId: "hunt-20261115-scope-work", caseId: "northvale-lab-001", title: "Northvale Scheduled Task & C2 DNS/TLS Beaconing Investigation", metadataAvailable: true, runStatus: "awaiting_human_gate" },
+        { huntId: "hunt-20261115-reconcile", caseId: "northvale-lab-001", title: "Northvale Scheduled Task & C2 DNS/TLS Beaconing Investigation", metadataAvailable: true, runStatus: "awaiting_human_gate" },
+      ] as unknown as T,
+    };
+  }
   if (channel === "hunt:getWorkbenchState") {
     const huntId =
       typeof payload === "object" && payload !== null && "huntId" in payload
@@ -39,44 +71,30 @@ export async function invokeDesktop<T>(
       data: buildFixtureWorkbenchSnapshot({ huntId, openGate, dataOrigin }) as unknown as T,
     };
   }
+  return null;
+}
 
-  if (channel === "hunt:listRuns") {
-    return {
-      ok: true,
-      data: [
-        {
-          huntId: "hunt-20261115-nv01",
-          caseId: "northvale-lab-001",
-          title: "Northvale Scheduled Task & C2 DNS/TLS Beaconing",
-          dataOrigin: "synthetic",
-          runStatus: "awaiting_human_gate",
-          openGate: "incident",
-        },
-        {
-          huntId: "hunt-20261115-scope-work",
-          caseId: "northvale-lab-001",
-          title: "Work Export Scope Gate Preview",
-          dataOrigin: "work-export",
-          runStatus: "awaiting_human_gate",
-          openGate: "scope",
-        },
-        {
-          huntId: "hunt-20261115-reconcile",
-          caseId: "northvale-lab-001",
-          title: "Crash-Recovery Reconcile Gate Preview",
-          dataOrigin: "synthetic",
-          runStatus: "awaiting_human_gate",
-          openGate: "reconcile",
-        },
-      ] as unknown as T,
-    };
+export async function invokeDesktop<T>(
+  channel: InvokeChannel,
+  payload?: unknown,
+): Promise<IpcResult<T>> {
+  const bridge = getNativeBridge();
+  if (bridge) {
+    return await bridge.invoke<T>(channel, payload);
+  }
+
+  if (isFixturePreviewRequested()) {
+    const fixture = previewFixture<T>(channel, payload);
+    if (fixture) return fixture;
   }
 
   return {
     ok: false,
     error: {
-      code: "PRELOAD_UNAVAILABLE",
-      message: `Channel '${channel}' requires the Electron preload bridge`,
+      code: PRELOAD_UNAVAILABLE,
+      message:
+        `The Hunt Command desktop bridge is unavailable, so '${channel}' cannot reach the app. ` +
+        "The preload script did not load; no hunt data is shown.",
     },
   };
 }

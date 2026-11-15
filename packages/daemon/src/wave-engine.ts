@@ -1,3 +1,4 @@
+import { throwDataPlaneError } from "@hunt-command/data-plane";
 import crypto from "node:crypto";
 import {
   CaseMetadataSchema,
@@ -41,6 +42,7 @@ import {
 import {
   computeDispatchFingerprint,
   type DurableStateStore,
+  type OpenGateState,
   type PersistedHuntRun,
   type StepResultRecord,
   type TokenLedgerSummary,
@@ -476,6 +478,53 @@ export type DataPlaneResolver = (
   caseId: string,
 ) => Promise<HuntDataPlanePort> | HuntDataPlanePort;
 
+/**
+ * What approving a `reconcile` gate does, from the run's own wave graph: an optional unknown step
+ * is dropped (`reconcile_drop`); a required or unidentifiable one halts the run
+ * (`reconcile_halt`). The engine's transition and the desktop's gate context both use this.
+ */
+export function planReconcileApproval(
+  run: Pick<PersistedHuntRun, "config">,
+  gate: Pick<OpenGateState, "unknown_step_id">,
+): { unknownStepId?: string; spec?: WaveStepSpec; approve: "reconcile_drop" | "reconcile_halt" } {
+  const unknownStepId = gate.unknown_step_id;
+  const spec = unknownStepId
+    ? buildEightWaveGraph({
+        followUps: run.config.followUps,
+        optionalOverrides: run.config.optionalOverrides,
+      })
+        .flat()
+        .find((s) => s.stepId === unknownStepId)
+    : undefined;
+  return { unknownStepId, spec, approve: unknownStepId && spec?.optional ? "reconcile_drop" : "reconcile_halt" };
+}
+
+/**
+ * Fails closed (`case_mismatch` / `case_origin_mismatch`) unless `dataPlane` serves the exact case
+ * and data origin a persisted run was started on. Every path that binds a resolved data plane to
+ * an existing run calls this before it changes any state.
+ */
+export function assertDataPlaneBindsRun(
+  run: Pick<PersistedHuntRun, "run_id" | "case_id" | "data_origin">,
+  dataPlane: HuntDataPlanePort,
+): void {
+  const meta = dataPlane.caseMetadata;
+  if (meta?.case_id !== run.case_id) {
+    throwDataPlaneError(
+      400,
+      "case_mismatch",
+      `Data plane for case '${String(meta?.case_id)}' cannot serve hunt '${run.run_id}' on case '${run.case_id}'`,
+    );
+  }
+  if (meta.data_origin !== run.data_origin) {
+    throwDataPlaneError(
+      400,
+      "case_origin_mismatch",
+      `Data plane origin '${meta.data_origin}' does not match hunt '${run.run_id}' origin '${run.data_origin}'`,
+    );
+  }
+}
+
 export class HuntWaveEngine {
   public readonly stateStore: DurableStateStore;
   public readonly gateAuthority: GateAuthority;
@@ -497,6 +546,8 @@ export class HuntWaveEngine {
   }
 
   public registerDataPlaneForRun(runId: string, dataPlane: HuntDataPlanePort): void {
+    const run = this.stateStore.getRun(runId);
+    if (run) assertDataPlaneBindsRun(run, dataPlane);
     this.dataPlanesByRun.set(runId, dataPlane);
   }
 
@@ -663,6 +714,9 @@ export class HuntWaveEngine {
     }
 
     const runId = input.runId?.trim() || `hunt-${crypto.randomUUID()}`;
+    if (this.stateStore.getRun(runId)) {
+      throw new Error(`Hunt run_id '${runId}' already exists`);
+    }
     const now = new Date().toISOString();
 
     const run: PersistedHuntRun = {
@@ -757,6 +811,8 @@ export class HuntWaveEngine {
           `Hunt '${snapshot.run_id}' cannot resume after gate '${activeGate.gate}': no HuntDataPlanePort is bound or resolvable (decision NOT recorded)`,
         );
       }
+      // Before any state change: the decision id is not consumed if the plane is for another case.
+      assertDataPlaneBindsRun(snapshot, dp);
     }
 
     const committed = this.stateStore.commitGateDecision({
@@ -868,13 +924,8 @@ export class HuntWaveEngine {
 
     if (activeGate.gate === RECONCILE_GATE) {
       // Human operator explicitly reconciled an unknown step
-      const unknownStepId = activeGate.unknown_step_id;
-      const waves = buildEightWaveGraph({
-        followUps: run.config.followUps,
-        optionalOverrides: run.config.optionalOverrides,
-      });
-      const spec = waves.flat().find((s) => s.stepId === unknownStepId);
-      if (unknownStepId && spec?.optional) {
+      const { unknownStepId, spec, approve } = planReconcileApproval(run, activeGate);
+      if (approve === "reconcile_drop" && unknownStepId && spec) {
         return {
           kind: "reconcile_drop",
           resume: true,
@@ -931,11 +982,12 @@ export class HuntWaveEngine {
     runId: string,
     dataPlane: HuntDataPlanePort,
   ): Promise<PersistedHuntRun> {
-    this.dataPlanesByRun.set(runId, dataPlane);
     const run = this.stateStore.getRun(runId);
     if (!run) {
       throw new Error(`Unknown hunt run_id '${runId}'`);
     }
+    assertDataPlaneBindsRun(run, dataPlane);
+    this.dataPlanesByRun.set(runId, dataPlane);
     if (run.status !== "running") {
       return run;
     }
@@ -1049,7 +1101,9 @@ export class HuntWaveEngine {
             `${runId}:wave-${run.wave_index + 1}`,
             controller.signal,
           );
+          if (controller.signal.aborted) return this.cancelRun(runId, "global_stop");
         } catch (err) {
+          if (controller.signal.aborted) return this.cancelRun(runId, "global_stop");
           run.status = "failed";
           run.reason_code = "oauth_preflight_failed";
           this.stateStore.saveRun(run);
@@ -1246,6 +1300,9 @@ export class HuntWaveEngine {
       }
 
       return run;
+    } catch (err) {
+      if (controller.signal.aborted) return this.cancelRun(runId, "global_stop");
+      throw err;
     } finally {
       this.activeControllers.delete(runId);
     }
@@ -1682,6 +1739,7 @@ export class HuntWaveEngine {
           diagnostic: turnDiagnostic ?? null,
         });
       }
+      if (params.signal.aborted) return;
 
       if (turnStatus === "cancelled") {
         run.step_states[spec.stepId] = "stopped";
@@ -1773,6 +1831,8 @@ export class HuntWaveEngine {
             attempts: attempt,
             usage: turnUsage,
             diagnostic: citationCheck.errorMessage,
+            unverified_handoff: validated.handoff,
+            citation_receipt: citationCheck.receipt,
             finished_at: new Date().toISOString(),
           };
           this.stateStore.saveRun(run);

@@ -739,6 +739,15 @@ export interface CitationVerificationResult {
   malformed: string[];
 }
 
+/** A record behind a cited `evt-*`, `frame-*` or `ioc-*` id (raw case data, unscrubbed). */
+export interface CitedRecord {
+  id: string;
+  kind: "evt" | "frame" | "ioc";
+  timestamp_iso: string | null;
+  title: string;
+  record: Record<string, unknown>;
+}
+
 export interface HuntDataPlane {
   readonly caseId: string;
   readonly dataOrigin: DataOrigin;
@@ -762,6 +771,8 @@ export interface HuntDataPlane {
     authorizeTool?: AuthorizeWatchTool,
   ): Promise<LabBrowserResult> | LabBrowserResult;
   verifyCitations(citations: readonly string[]): Promise<CitationVerificationResult> | CitationVerificationResult;
+  /** Optional: reads the case-scoped records behind cited ids (absent ids are omitted). */
+  readCitedRecords?(ids: readonly string[]): Promise<CitedRecord[]> | CitedRecord[];
   close(): Promise<void> | void;
 }
 
@@ -893,52 +904,10 @@ export function createRoleCapabilityMint(explicitSecret?: Uint8Array): RoleCapab
       assertReadOnlyOperation(method !== "GET");
       assertRoleOwnsTool(token.profile, tool, token.stepId);
 
-      if (args.case_id !== undefined && args.case_id !== dataPlane.caseId) {
-        if (typeof args.case_id !== "string" || !CASE_ID_RE.test(args.case_id)) {
-          throwDataPlaneError(400, "explicit_case_id_required", "Invalid or missing case_id");
-        }
-        throwDataPlaneError(400, "case_mismatch", `Case mismatch: expected '${dataPlane.caseId}'`);
-      }
-
-      let rawResult: unknown;
-      switch (tool) {
-        case "elastic_search":
-          rawResult = await dataPlane.elasticSearch(args as unknown as ElasticSearchParams);
-          break;
-        case "elastic_aggregate":
-          rawResult = await dataPlane.elasticAggregate(args as unknown as ElasticAggregateParams);
-          break;
-        case "detection_test":
-          rawResult = await dataPlane.detectionTest(args as unknown as DetectionTestParams);
-          break;
-        case "intel_lookup":
-          rawResult = await dataPlane.intelLookup(args as unknown as IntelLookupParams);
-          break;
-        case "arkime_sessions":
-          rawResult = await dataPlane.arkimeSessions(args as unknown as ArkimeSessionsParams);
-          break;
-        case "arkime_unique":
-          rawResult = await dataPlane.arkimeUnique(args as unknown as ArkimeUniqueParams);
-          break;
-        case "packet_fields":
-          rawResult = await dataPlane.packetFields(args as unknown as PacketFieldsParams);
-          break;
-        case "hunt_lab_query":
-          rawResult = await dataPlane.huntLabQuery(args as unknown as HuntLabQueryParams);
-          break;
-        case "lab_browser":
-          rawResult = await dataPlane.labBrowser(
-            args as unknown as LabBrowserParams,
-            (pageTool) => {
-              verifyCapability(token, dataPlane.caseId);
-              assertRoleOwnsTool(token.profile, pageTool, token.stepId);
-            },
-          );
-          break;
-        default:
-          throwDataPlaneError(403, "tool_not_owned", `Unknown data-plane tool '${String(tool)}'`);
-      }
-
+      const rawResult = await dispatchDataPlaneTool(dataPlane, tool, args, (pageTool) => {
+        verifyCapability(token, dataPlane.caseId);
+        assertRoleOwnsTool(token.profile, pageTool, token.stepId);
+      });
       return fenceToolResult(rawResult);
     };
 
@@ -955,4 +924,45 @@ export function createRoleCapabilityMint(explicitSecret?: Uint8Array): RoleCapab
     verifyCapability,
     bindDataPlane,
   });
+}
+
+/**
+ * Runs one read-only data-plane tool against `dataPlane` and returns its raw result.
+ * Callers own authorization: `authorizePageTool` is asked before a Watch page runs its tool.
+ */
+export async function dispatchDataPlaneTool(
+  dataPlane: HuntDataPlane,
+  tool: DataPlaneToolName,
+  args: Record<string, unknown>,
+  authorizePageTool?: AuthorizeWatchTool,
+): Promise<unknown> {
+  if (args.case_id !== undefined && args.case_id !== dataPlane.caseId) {
+    if (typeof args.case_id !== "string" || !CASE_ID_RE.test(args.case_id)) {
+      throwDataPlaneError(400, "explicit_case_id_required", "Invalid or missing case_id");
+    }
+    throwDataPlaneError(400, "case_mismatch", `Case mismatch: expected '${dataPlane.caseId}'`);
+  }
+
+  switch (tool) {
+    case "elastic_search":
+      return dataPlane.elasticSearch(args as unknown as ElasticSearchParams);
+    case "elastic_aggregate":
+      return dataPlane.elasticAggregate(args as unknown as ElasticAggregateParams);
+    case "detection_test":
+      return dataPlane.detectionTest(args as unknown as DetectionTestParams);
+    case "intel_lookup":
+      return dataPlane.intelLookup(args as unknown as IntelLookupParams);
+    case "arkime_sessions":
+      return dataPlane.arkimeSessions(args as unknown as ArkimeSessionsParams);
+    case "arkime_unique":
+      return dataPlane.arkimeUnique(args as unknown as ArkimeUniqueParams);
+    case "packet_fields":
+      return dataPlane.packetFields(args as unknown as PacketFieldsParams);
+    case "hunt_lab_query":
+      return dataPlane.huntLabQuery(args as unknown as HuntLabQueryParams);
+    case "lab_browser":
+      return dataPlane.labBrowser(args as unknown as LabBrowserParams, authorizePageTool);
+    default:
+      throwDataPlaneError(403, "tool_not_owned", `Unknown data-plane tool '${String(tool)}'`);
+  }
 }

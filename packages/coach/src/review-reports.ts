@@ -5,9 +5,9 @@ import {
   compareByLengthThenLex,
   compareLexicographic,
   escapeRegExp,
-  EVENT_ID_SOURCE,
-  FRAME_ID_SOURCE,
-  INTEL_ID_SOURCE,
+  eventIdMatcher,
+  frameIdMatcher,
+  intelIdMatcher,
   loadJsonText,
   names,
   normalizeFrameCitation,
@@ -181,7 +181,7 @@ export function readHandoff(text: string): Record<string, unknown> {
 
 export function extractEventIds(text: string): string[] {
   const set = new Set<string>();
-  for (const m of text.matchAll(new RegExp(EVENT_ID_SOURCE, "g"))) {
+  for (const m of text.matchAll(eventIdMatcher())) {
     set.add(m[0]);
   }
   return [...set].sort(compareLexicographic);
@@ -189,7 +189,7 @@ export function extractEventIds(text: string): string[] {
 
 export function extractFrameIds(text: string): string[] {
   const set = new Set<string>();
-  for (const m of text.matchAll(new RegExp(FRAME_ID_SOURCE, "gi"))) {
+  for (const m of text.matchAll(frameIdMatcher())) {
     if (m[1] !== undefined) {
       set.add(normalizeFrameCitation(m[1]));
     }
@@ -199,7 +199,7 @@ export function extractFrameIds(text: string): string[] {
 
 export function extractIntelIds(text: string): string[] {
   const set = new Set<string>();
-  for (const m of text.matchAll(new RegExp(INTEL_ID_SOURCE, "g"))) {
+  for (const m of text.matchAll(intelIdMatcher())) {
     set.add(m[0]);
   }
   return [...set].sort(compareByLengthThenLex);

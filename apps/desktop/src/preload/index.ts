@@ -4,16 +4,17 @@
  * Modified for Hunt Command v2:
  * - Exposes only allowlisted Hunt Command IPC channels (`INVOKE_CHANNELS` / `EVENT_CHANNELS`).
  * - Zero `app:openExternal`, zero `terminal`, zero `workspace`, zero `mcp` or `connectors` channels.
+ * - Sandbox-safe: the sandboxed preload may `require` only `electron`, so runtime imports come solely from
+ *   the dependency-free `ipc-channels.ts` (everything from `ipc.ts` is type-only and erased at build time).
  */
 import { contextBridge, type IpcRendererEvent, ipcRenderer } from "electron";
 import {
-  type DesktopBridge,
   EVENT_CHANNELS,
   type EventChannel,
   INVOKE_CHANNELS,
   type InvokeChannel,
-  type IpcResult,
-} from "../shared/ipc.ts";
+} from "../shared/ipc-channels.ts";
+import type { DesktopBridge, IpcResult } from "../shared/ipc.ts";
 
 const bridge: DesktopBridge = {
   invoke<T = unknown>(channel: InvokeChannel, payload?: unknown): Promise<IpcResult<T>> {

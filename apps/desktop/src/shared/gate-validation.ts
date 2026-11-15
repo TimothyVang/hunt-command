@@ -125,6 +125,51 @@ export interface GateValidationOutcome {
 }
 
 /**
+ * What Approve and Reject do on a reconcile gate, worded from the daemon engine's `planGateTransition`
+ * (packages/daemon/src/wave-engine.ts): approve on an optional step marks it `dropped` with reason
+ * `reconciled_drop` and resumes the run; approve on a required step fails the run with
+ * `reconciled_halt_required_step`; reject fails the run with `reconcile_rejected` and stops steps
+ * awaiting review or approval. Nothing is re-run in any case.
+ */
+export function reconcileOutcomeText(step: {
+  stepId: string;
+  approveTransition: "reconcile_drop" | "reconcile_halt";
+}): { approve: string; reject: string } {
+  return {
+    approve:
+      step.approveTransition === "reconcile_drop"
+        ? `Approve: step '${step.stepId}' is optional, so it is marked dropped (reason_code reconciled_drop) without being re-run, and the run resumes.`
+        : `Approve: step '${step.stepId}' is required and has no verified handoff, so the run fails (status failed, reason_code reconciled_halt_required_step). The step is not re-run.`,
+    reject:
+      "Reject: the run fails (status failed, reason_code reconcile_rejected); steps awaiting review or approval are stopped.",
+  };
+}
+
+/**
+ * Why `approve` must be refused because the gate's decision context is not on screen, or `null`.
+ * Fail closed: nobody may approve a gate whose context (scope text or summary, incident citation
+ * summary, reconcile receipt) failed to load or was never provided. Rejecting stays possible.
+ */
+export function missingGateContextReason(activeGate: ActiveGatePrompt): string | null {
+  if (activeGate.contextError) {
+    return `Gate context could not be loaded, so approval is disabled: ${sanitizeSingleLine(activeGate.contextError).slice(0, 300)}`;
+  }
+  if (activeGate.gate === "scope" && !activeGate.scopeText && !activeGate.scopeSummary) {
+    return "Gate 1 scope text is not available, so approval is disabled.";
+  }
+  if (activeGate.gate === "incident" && !activeGate.incidentSummary) {
+    return "Gate 2 incident summary and citations are not available, so approval is disabled.";
+  }
+  if (activeGate.gate === "reconcile" && !activeGate.reconcileContext) {
+    return "Reconcile dispatch receipt is not available, so approval is disabled.";
+  }
+  if (activeGate.gate === "reconcile" && !activeGate.reconcileContext?.affectedStep) {
+    return "The step this reconcile gate decides could not be identified, so approval is disabled.";
+  }
+  return null;
+}
+
+/**
  * Validates human Gate 1 (`scope`), Gate 2 (`incident`), and `reconcile` submissions:
  * - Strips bidi/zero-width/ANSI control characters from operator principal and check-note.
  * - Requires `1..1000` chars in `"What did you check?"` (`checkNote`).
@@ -158,6 +203,11 @@ export function validateGateSubmission(
   const expiresMs = Date.parse(activeGate.expiresAtIso);
   if (!Number.isNaN(expiresMs) && nowMs > expiresMs) {
     errors.push("Gate prompt has expired; refresh workbench state to obtain a current gate token.");
+  }
+
+  if (draft.action === "approve") {
+    const missing = missingGateContextReason(activeGate);
+    if (missing) errors.push(missing);
   }
 
   if (

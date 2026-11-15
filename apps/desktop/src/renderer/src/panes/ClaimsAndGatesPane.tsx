@@ -7,11 +7,14 @@ import type {
 } from "../../../shared/workbench-types.ts";
 import { SafeForensicText } from "../components/SafeForensicText.tsx";
 import { invokeDesktop } from "../lib/bridge.ts";
+import { type TranscriptView, transcriptViewFor } from "../lib/transcript-view.ts";
+import { buildWatchOpenRequest } from "../lib/watch-open.ts";
 import type { CenterPaneTab, GateDraftFields } from "../state/workbench-store.ts";
 import { AuthorityGateCard } from "./AuthorityGateCard.tsx";
 
 export interface ClaimsAndGatesPaneProps {
   workbench: WorkbenchSnapshot;
+  switchingHunt: boolean;
   centerTab: CenterPaneTab;
   claimKindFilter: ClaimKind | "all";
   selectedClaimId: string | null;
@@ -24,7 +27,8 @@ export interface ClaimsAndGatesPaneProps {
   onSelectCitation: (citationId: string) => void;
   onSelectStep: (stepId: string) => void;
   onUpdateGateDraft: (patch: Partial<GateDraftFields>) => void;
-  onSubmitGateDecision: (action: "approve" | "reject") => void;
+  onSubmitGateDecision: (action: "approve" | "reject", operatorToken?: string) => void;
+  onLoadMoreEvidence?: () => Promise<string | null>;
 }
 
 const CLAIM_KIND_BADGE: Record<ClaimKind, string> = {
@@ -36,6 +40,7 @@ const CLAIM_KIND_BADGE: Record<ClaimKind, string> = {
 
 export function ClaimsAndGatesPane({
   workbench,
+  switchingHunt,
   centerTab,
   claimKindFilter,
   selectedClaimId,
@@ -49,11 +54,41 @@ export function ClaimsAndGatesPane({
   onSelectStep,
   onUpdateGateDraft,
   onSubmitGateDecision,
+  onLoadMoreEvidence,
 }: ClaimsAndGatesPaneProps) {
-  const [transcriptPage, setTranscriptPage] = useState<TranscriptPageSlice | null>(null);
+  const [transcriptView, setTranscriptView] = useState<TranscriptView>({ kind: "loading" });
+  const transcriptPage = transcriptView.kind === "page" ? transcriptView.page : null;
   const [byteOffset, setByteOffset] = useState(0);
   const [watchUrlInput, setWatchUrlInput] = useState("http://127.0.0.1:18400/");
+  const [watchError, setWatchError] = useState<string | null>(null);
   const watchViewportRef = useRef<HTMLDivElement | null>(null);
+  const currentHuntRef = useRef(workbench.huntId);
+  currentHuntRef.current = workbench.huntId;
+  const watchIsCurrent = !switchingHunt && workbench.watchState.enabled && workbench.watchState.runId === workbench.huntId;
+
+  const handleWatchGo = () => {
+    if (switchingHunt) return;
+    const huntId = workbench.huntId;
+    setWatchError(null);
+    if (!watchIsCurrent) {
+      const built = buildWatchOpenRequest(workbench, watchUrlInput);
+      if (!built.ok) {
+        setWatchError(built.error);
+        return;
+      }
+      void invokeDesktop("watch:open", built.request).then((res) => {
+        if (currentHuntRef.current === huntId && !res.ok) setWatchError(res.error?.message ?? "Watch session could not be opened");
+      });
+      return;
+    }
+    void invokeDesktop("watch:navigate", {
+      runId: workbench.huntId,
+      role: workbench.watchState.role,
+      url: watchUrlInput,
+    }).then((res) => {
+      if (currentHuntRef.current === huntId && !res.ok) setWatchError(res.error?.message ?? "Navigation blocked");
+    });
+  };
 
   const citationStatusMap = useMemo(
     () =>
@@ -64,21 +99,23 @@ export function ClaimsAndGatesPane({
   );
 
   useEffect(() => {
+    setWatchError(null);
+  }, [workbench.huntId]);
+
+  useEffect(() => {
     setByteOffset(0);
   }, [selectedStepId, workbench.huntId]);
 
   useEffect(() => {
     if (centerTab !== "transcript") return;
     let cancelled = false;
+    const request = { huntId: workbench.huntId, stepId: selectedStepId, byteOffset };
+    setTranscriptView({ kind: "loading" });
     void invokeDesktop<TranscriptPageSlice>("hunt:inspectTranscriptPage", {
-      huntId: workbench.huntId,
-      stepId: selectedStepId,
-      byteOffset,
+      ...request,
       byteLimit: 16_384,
     }).then((res) => {
-      if (!cancelled && res.ok && res.data) {
-        setTranscriptPage(res.data);
-      }
+      if (!cancelled) setTranscriptView(transcriptViewFor(request, res));
     });
     return () => {
       cancelled = true;
@@ -87,8 +124,8 @@ export function ClaimsAndGatesPane({
 
   // Synchronize WebContentsView bounds only while the Watch tab is active.
   useEffect(() => {
-    if (centerTab !== "watch") {
-      void invokeDesktop("watch:setBounds", { bounds: null });
+    if (centerTab !== "watch" || !watchIsCurrent) {
+      void invokeDesktop("watch:setBounds", { runId: workbench.huntId, bounds: null });
       return;
     }
     const reportBounds = () => {
@@ -97,6 +134,7 @@ export function ClaimsAndGatesPane({
       const rect = el.getBoundingClientRect();
       if (rect.width >= 100 && rect.height >= 100) {
         void invokeDesktop("watch:setBounds", {
+          runId: workbench.huntId,
           bounds: {
             x: Math.round(rect.left),
             y: Math.round(rect.top),
@@ -110,9 +148,9 @@ export function ClaimsAndGatesPane({
     window.addEventListener("resize", reportBounds);
     return () => {
       window.removeEventListener("resize", reportBounds);
-      void invokeDesktop("watch:setBounds", { bounds: null });
+      void invokeDesktop("watch:setBounds", { runId: workbench.huntId, bounds: null });
     };
-  }, [centerTab]);
+  }, [centerTab, workbench.huntId, watchIsCurrent]);
 
   const filteredClaims =
     claimKindFilter === "all"
@@ -189,12 +227,15 @@ export function ClaimsAndGatesPane({
           <>
             {workbench.activeGate ? (
               <AuthorityGateCard
+                key={`${workbench.activeGate.huntId}:${workbench.activeGate.gate}:${workbench.activeGate.payloadSha256}`}
+                requiresToken={workbench.provenanceMode === "live_daemon"}
                 activeGate={workbench.activeGate}
                 caseMetadata={workbench.caseMetadata}
                 draft={gateDraft}
                 onUpdateDraft={onUpdateGateDraft}
                 onSubmitDecision={onSubmitGateDecision}
                 onSelectCitation={onSelectCitation}
+                onLoadMoreEvidence={onLoadMoreEvidence}
               />
             ) : (
               <div className="rounded border border-emerald-500/40 bg-emerald-950/25 p-4 text-xs text-emerald-200">
@@ -396,7 +437,7 @@ export function ClaimsAndGatesPane({
                 <button
                   type="button"
                   disabled={!transcriptPage?.hasMore}
-                  onClick={() => setByteOffset(byteOffset + 16_384)}
+                  onClick={() => setByteOffset(transcriptPage?.nextByteOffset ?? byteOffset + 16_384)}
                   className="rounded border border-slate-700 px-2 py-0.5 text-slate-200 disabled:opacity-40 cursor-pointer"
                 >
                   Next
@@ -404,8 +445,17 @@ export function ClaimsAndGatesPane({
               </div>
             </div>
             <pre className="rounded border border-slate-800 bg-[#070b13] p-3 font-mono text-[11px] text-slate-200 whitespace-pre-wrap break-words">
-              {transcriptPage?.content ?? "Loading byte-paged bot transcript slice..."}
+              {transcriptView.kind === "page"
+                ? transcriptView.page.content
+                : transcriptView.kind === "loading"
+                  ? "Loading byte-paged bot transcript slice..."
+                  : ""}
             </pre>
+            {transcriptView.kind === "error" && (
+              <div role="alert" data-testid="transcript-error" className="rounded border border-rose-500/60 bg-rose-950/60 px-2.5 py-1.5 font-mono text-[11px] text-rose-200">
+                Transcript unavailable: {transcriptView.message}
+              </div>
+            )}
           </div>
         )}
 
@@ -437,18 +487,19 @@ export function ClaimsAndGatesPane({
               />
               <button
                 type="button"
-                onClick={() => {
-                  void invokeDesktop("watch:navigate", {
-                    runId: workbench.watchState.runId,
-                    role: workbench.watchState.role,
-                    url: watchUrlInput,
-                  });
-                }}
+                onClick={handleWatchGo}
+                disabled={switchingHunt}
+                data-testid="watch-go"
                 className="rounded border border-cyan-500/50 bg-cyan-950/70 px-3 py-1 text-xs font-medium text-cyan-100 cursor-pointer"
               >
-                Navigate (Pinned 127.0.0.1)
+                {watchIsCurrent ? "Navigate (Pinned 127.0.0.1)" : "Open Fenced Session"}
               </button>
             </div>
+            {watchError && (
+              <div role="alert" className="text-[11px] font-mono text-rose-300">
+                {watchError}
+              </div>
+            )}
 
             <div
               ref={watchViewportRef}

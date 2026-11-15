@@ -31,6 +31,13 @@ export interface StepResultRecord {
   readonly usage?: StepTokenUsage;
   readonly refusal?: ModelRefusalReport;
   readonly diagnostic?: string;
+  /**
+   * Set only on `unknown` / `citation_source_unavailable` results: the validated handoff whose
+   * citations could not be checked, and the unavailable receipt. Never used as a step output;
+   * kept so the reconcile gate can show the operator what is being decided.
+   */
+  readonly unverified_handoff?: Handoff;
+  readonly citation_receipt?: CitationVerificationReceipt;
   readonly finished_at: string;
 }
 
@@ -482,7 +489,8 @@ export class DurableStateStore {
           citation_receipt_json = excluded.citation_receipt_json,
           snapshot_json = excluded.snapshot_json,
           config_json = excluded.config_json,
-          updated_at = excluded.updated_at;`,
+          updated_at = excluded.updated_at
+        WHERE hunt_runs.status != 'cancelled' OR excluded.status = 'cancelled';`,
       )
       .run(
         run.run_id,
