@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { FORBIDDEN_SUBSCRIPTION_ENV_KEYS } from "./omp-pool.ts";
+import { FORBIDDEN_SUBSCRIPTION_ENV_KEYS } from "./hunter-policy.ts";
 import { GateDecisionError, MAX_CHECK_NOTE_CHARS, type RbacRole, type SubmitGateDecisionInput } from "./gates.ts";
 import type { PendingGateReviewEnvelope } from "./gates.ts";
 

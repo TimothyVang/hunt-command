@@ -17,7 +17,7 @@ import {
   type ProfileId,
 } from "@hunt-command/shared";
 import { GateAuthority, GateDecisionError, type SubmitGateDecisionInput } from "./gates.ts";
-import { SHARED_CACHE_HEADER, validateNonSyntheticGuidanceText } from "./omp-pool.ts";
+import { SHARED_CACHE_HEADER, validateNonSyntheticGuidanceText } from "./hunter-policy.ts";
 import {
   FINAL_HANDOFF_BYTES,
   OntologyValidationError,

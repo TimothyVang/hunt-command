@@ -51,6 +51,7 @@ import {
   type PlaybookProposal,
   type RoundEvalMetrics,
   type ScenarioTruth,
+  cleanRoomTempRoot,
 } from "../src/index.ts";
 
 /**
@@ -117,7 +118,7 @@ const SYNTH_STORY_A_EVENTS = CaseEvents.fromRecords([
 
 describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stage promotion", () => {
   test("clean-room temp dir guard enforces empty OS temp dir outside repo & runtime/ and strips all *_API_KEY env vars", () => {
-    const validTmp = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-coach-unit-"));
+    const validTmp = fs.mkdtempSync(path.join(cleanRoomTempRoot(), "hunt-coach-unit-"));
     try {
       expect(() =>
         assertEmptyOutsideRepoAndRuntimeDir(validTmp, {
@@ -228,7 +229,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
 
   test("in-process and REAL out-of-process clean-room worker enforce 0 tools and hard-abort immediately on tool_execution_start", async () => {
     // 1. In-process test: non-zero active tools before prompt -> immediate rejection
-    const tmp1 = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-coach-inproc1-"));
+    const tmp1 = fs.mkdtempSync(path.join(cleanRoomTempRoot(), "hunt-coach-inproc1-"));
     try {
       await expect(
         executeInProcessCleanRoomOmpTurn(
@@ -746,7 +747,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
   }, 30_000);
 
   test("3-stage promotion gate enforces probe -> pass^2 (+1.0 on BOTH rounds, <= decoys, g2_1_pass) -> unanimous 3-verifier panel & emits hunt.coach.eval", async () => {
-    const tmpOut = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-coach-promo-"));
+    const tmpOut = fs.mkdtempSync(path.join(cleanRoomTempRoot(), "hunt-coach-promo-"));
     try {
       const ledgerPath = path.join(tmpOut, "ledger.json");
       const telemetryPath = path.join(tmpOut, "coach-telemetry.jsonl");

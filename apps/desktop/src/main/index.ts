@@ -44,6 +44,12 @@ if (customUserData && customUserData.trim().length > 0) {
   app.setPath("userData", resolvedUserData);
 } else {
   app.setName("HuntCommand");
+  if (!app.isPackaged) {
+    // Run from a checkout: keep the app's own data in the workspace runtime folder, not the user profile.
+    const workspaceUserData = path.join(resolveRuntimeDir(undefined, { repoRoot }).rootDir, "desktop-userdata");
+    fs.mkdirSync(workspaceUserData, { recursive: true });
+    app.setPath("userData", workspaceUserData);
+  }
 }
 
 if (!customUserData) {
@@ -76,8 +82,9 @@ async function bootstrap(): Promise<void> {
   const userDataDir = app.getPath("userData");
   const log = createLogger(path.join(userDataDir, "logs"));
 
+  // Packaged: beside the app's user data. From a checkout: the workspace runtime folder the CLI also uses.
   const runtimeCandidate =
-    process.env.HUNT_COMMAND_RUNTIME_DIR ?? path.join(userDataDir, "runtime");
+    process.env.HUNT_COMMAND_RUNTIME_DIR ?? (app.isPackaged ? path.join(userDataDir, "runtime") : undefined);
   const runtimePaths = resolveRuntimeDir(runtimeCandidate, { repoRoot });
   fs.mkdirSync(runtimePaths.rootDir, { recursive: true });
 

@@ -47,7 +47,65 @@ import {
   isAllowedSearchField,
   resolveEgressCardMode,
   resolveRuntimeDir,
+  resolveWorkspaceTempDir,
 } from "../src/index.ts";
+
+describe("resolveWorkspaceTempDir keeps scratch files in the workspace", () => {
+  function withTempOverride<T>(value: string | undefined, run: () => T): T {
+    const saved = process.env.HUNT_COMMAND_TEMP_DIR;
+    if (value === undefined) delete process.env.HUNT_COMMAND_TEMP_DIR;
+    else process.env.HUNT_COMMAND_TEMP_DIR = value;
+    try {
+      return run();
+    } finally {
+      if (saved === undefined) delete process.env.HUNT_COMMAND_TEMP_DIR;
+      else process.env.HUNT_COMMAND_TEMP_DIR = saved;
+    }
+  }
+
+  test("defaults to a tmp folder beside the runtime directory, not inside it, and creates it", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-cmd-wstmp-"));
+    try {
+      const runtime = path.join(base, "runtime");
+      const tempDir = withTempOverride(undefined, () => resolveWorkspaceTempDir(runtime));
+      expect(tempDir).toBe(path.join(fs.realpathSync(base), "tmp"));
+      expect(fs.statSync(tempDir).isDirectory()).toBe(true);
+      expect(tempDir.startsWith(fs.realpathSync(base) + path.sep + "runtime")).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("HUNT_COMMAND_TEMP_DIR overrides the location", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-cmd-wstmp-"));
+    try {
+      const chosen = path.join(base, "elsewhere");
+      const tempDir = withTempOverride(chosen, () => resolveWorkspaceTempDir(path.join(base, "runtime")));
+      expect(tempDir).toBe(path.join(fs.realpathSync(base), "elsewhere"));
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses a temp folder inside a Git tree and creates nothing there", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-cmd-wstmp-"));
+    try {
+      const fakeRepo = path.join(base, "repo");
+      fs.mkdirSync(path.join(fakeRepo, ".git"), { recursive: true });
+      // A runtime directory directly inside a checkout would put `tmp` in the checkout too.
+      expect(() => withTempOverride(undefined, () => resolveWorkspaceTempDir(path.join(fakeRepo, "runtime")))).toThrow(
+        RuntimeFenceError,
+      );
+      expect(() => withTempOverride(path.join(fakeRepo, "scratch"), () => resolveWorkspaceTempDir())).toThrow(
+        RuntimeFenceError,
+      );
+      expect(fs.existsSync(path.join(fakeRepo, "tmp"))).toBe(false);
+      expect(fs.existsSync(path.join(fakeRepo, "scratch"))).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("resolveRuntimeDir git-tree fence", () => {
   test("rejects a runtime path inside a standard .git directory repository", () => {

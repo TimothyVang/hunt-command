@@ -2,13 +2,6 @@ import fs from "node:fs";
 
 export const SCORER_SCHEMA_VERSION = 1 as const;
 
-// The Python reference (`scenario.py`) compiles `str` patterns, so `re` is
-// Unicode-aware there: `\w`/`\b` cover every letter, number and `_`, `\d` is any
-// decimal digit (Nd) and `\s` is `str.isspace()`. JS `\b`, `\d` and `\s` are
-// ASCII-only or a different set, so every scorer pattern spells those classes
-// out below and is compiled with the `u` flag (see `PY_RE_FLAGS`).
-/** Python `str` `\w`: letters, numbers and `_`. */
-export const PY_WORD_CLASS = String.raw`[\p{L}\p{N}_]`;
 /** Python `\b` before a word character. */
 export const PY_WORD_START = String.raw`(?<![\p{L}\p{N}_])`;
 /** Python `\b` after a word character. */
@@ -37,10 +30,6 @@ const INTEL_ID_SOURCE = `${PY_WORD_START}ioc-${PY_DIGIT}{5,}${PY_WORD_END}`;
 export const eventIdMatcher = (): RegExp => new RegExp(EVENT_ID_SOURCE, `g${PY_RE_FLAGS}`);
 export const frameIdMatcher = (): RegExp => new RegExp(FRAME_ID_SOURCE, `g${PY_RE_FLAGS}`);
 export const intelIdMatcher = (): RegExp => new RegExp(INTEL_ID_SOURCE, `g${PY_RE_FLAGS}`);
-
-export const EVENT_ID_EXACT_RE = /^evt-\d{6,}$/;
-export const FRAME_ID_EXACT_RE = /^frame-(\d+)$/i;
-export const INTEL_ID_EXACT_RE = /^ioc-\d{5,}$/;
 
 export const ALTERNATIVE_GROUPS = [
   ["evidence_frame_groups", "cited_frames"],
@@ -92,8 +81,6 @@ export const BENIGN_TERMS = [
 ] as const;
 
 const COMP_NEG_SOURCE = `${B0}(?:not|no|never|neither|nor|without|lacks?|ruled?${S}+out|ruling${S}+out|rather${S}+than|instead${S}+of|looks?${S}+like|looked${S}+like|resembles?|resembled|mimics?|appeared${S}+to${S}+be|appears${S}+to${S}+be|false${S}+positive(?:${S}+for)?)${B1}`;
-
-export const COMP_NEG_RE = new RegExp(COMP_NEG_SOURCE, PY_RE_FLAGS);
 
 export const COMP_POST_NEG_RE = new RegExp(
   `(?<!not${S})(?<!never${S})${B0}(?:(?:was|were|is|are|been)${S}+(?:ruled${S}+out|disproved|refuted|unfounded|false${S}+positive|not${S}+(?:observed|found|detected|confirmed|present))|ruled${S}+out|disproved|refuted|not${S}+(?:observed|found|detected))${B1}`,

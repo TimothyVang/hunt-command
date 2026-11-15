@@ -94,6 +94,26 @@ function computeDefaultRuntimeDir(repoRoot: string): string {
   return path.resolve(repoRoot, "../runtime");
 }
 
+/**
+ * Scratch space for this workspace: `tmp` beside the runtime directory. Never the system temp folder,
+ * never inside a Git tree, and not inside the runtime directory itself, so a coach clean room created
+ * here stays outside runtime data. `HUNT_COMMAND_TEMP_DIR` overrides the location.
+ */
+export function resolveWorkspaceTempDir(runtimeRootDir?: string): string {
+  const override = process.env.HUNT_COMMAND_TEMP_DIR;
+  const target =
+    override && override.trim().length > 0
+      ? override
+      : path.join(path.dirname(runtimeRootDir ?? resolveRuntimeDir().rootDir), "tmp");
+  const canonical = canonicalizeWithExistingAncestor(target);
+  const enclosingGit = findEnclosingGitMarker(canonical);
+  if (enclosingGit !== null) {
+    throw new RuntimeFenceError(canonical, enclosingGit);
+  }
+  fs.mkdirSync(canonical, { recursive: true });
+  return canonical;
+}
+
 export function resolveRuntimeDir(
   candidatePath?: string,
   options?: ResolveRuntimeDirOptions,

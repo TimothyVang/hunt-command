@@ -470,12 +470,6 @@ export function buildKibanaCaseRange(scope: WatchScope): Record<string, unknown>
   };
 }
 
-export function kibanaWindow(scope: WatchScope): readonly [string, string] {
-  const startIso = new Date(scope.startSec * 1000).toISOString();
-  const stopIso = new Date(scope.stopSec * 1000 - 1).toISOString();
-  return [startIso, stopIso];
-}
-
 function pinKibanaBatchSearch(scope: WatchScope, body: string | null | undefined): string {
   const values = parseKibanaJsonBody(body);
   const batch = values.batch;

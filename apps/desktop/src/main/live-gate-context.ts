@@ -152,8 +152,6 @@ export const GateContextResultSchema = z
   })
   .strict();
 
-export type GateContextResult = z.infer<typeof GateContextResultSchema>;
-
 /** Completed-run evidence (hunt.evidence): the same complete `cited` statuses and paged records as a gate. */
 const LiveEvidenceResultSchema = z.object({
   run_id: z.string().min(1),

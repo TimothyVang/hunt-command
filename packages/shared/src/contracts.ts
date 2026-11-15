@@ -24,10 +24,6 @@ export const REAL_DATA_ORIGIN_LABELS: Readonly<
   ],
 } as const;
 
-export function isSyntheticDataOrigin(origin: DataOrigin): boolean {
-  return origin === "synthetic";
-}
-
 export function formatRealDataOriginText(origin: Exclude<DataOrigin, "synthetic">): string {
   const [name, detail] = REAL_DATA_ORIGIN_LABELS[origin];
   return `${name} (${detail})`;
@@ -44,10 +40,6 @@ export const FRAMEWORK_PROFILES = [
 
 export type ProfileId = (typeof FRAMEWORK_PROFILES)[number];
 export const ProfileIdSchema = z.enum(FRAMEWORK_PROFILES);
-
-export const AGENT_ROLES = FRAMEWORK_PROFILES;
-export type AgentRole = ProfileId;
-export const AgentRoleSchema = ProfileIdSchema;
 
 export const PROFILE_DISPLAY_TITLES: Readonly<Record<ProfileId, string>> = {
   "framework-coordinator": "Hunt Lead",
@@ -71,14 +63,11 @@ export const DATA_PLANE_TOOLS = [
 ] as const;
 
 export type DataPlaneToolName = (typeof DATA_PLANE_TOOLS)[number];
-export const DataPlaneToolNameSchema = z.enum(DATA_PLANE_TOOLS);
 
 export const DAEMON_META_TOOLS = ["hunt_lab_batch", "delegate_task"] as const;
-export type DaemonMetaToolName = (typeof DAEMON_META_TOOLS)[number];
 
 export const ALL_HUNT_TOOLS = [...DATA_PLANE_TOOLS, ...DAEMON_META_TOOLS] as const;
 export type HuntToolName = (typeof ALL_HUNT_TOOLS)[number];
-export const HuntToolNameSchema = z.enum(ALL_HUNT_TOOLS);
 
 export const ROLE_TOOL_OWNERSHIP: Readonly<Record<ProfileId, readonly HuntToolName[]>> = {
   "framework-coordinator": ["delegate_task"],
@@ -102,8 +91,6 @@ export const ROLE_TOOL_OWNERSHIP: Readonly<Record<ProfileId, readonly HuntToolNa
   "framework-reviewer": ["elastic_search", "arkime_sessions", "detection_test"],
 } as const;
 
-export const TOOL_OWNERSHIP = ROLE_TOOL_OWNERSHIP;
-
 export const BATCH_MAX_ITEMS = 5;
 export const BATCH_MAX_ITEM_SIZE = 25;
 export const BATCH_MAX_BYTES = 96 * 1024;
@@ -112,8 +99,6 @@ export const BATCH_EXCLUDED_TOOLS = [
   "lab_browser",
   "hunt_lab_batch",
 ] as const;
-
-export type BatchExcludedToolName = (typeof BATCH_EXCLUDED_TOOLS)[number];
 
 export const DATA_PLANE_ERROR_CODES = [
   "tool_not_owned",
@@ -185,7 +170,6 @@ export const HUNT_WAVES = [
 ] as const;
 
 export type HuntWave = (typeof HUNT_WAVES)[number];
-export const HuntWaveSchema = z.enum(HUNT_WAVES);
 
 export const WAVE_GATE_IDS = [
   "wave-1",
@@ -230,7 +214,6 @@ export type StepState = (typeof STEP_STATES)[number];
 
 export const DEFAULT_FOLLOW_UPS = 6;
 export const MAX_FOLLOW_UPS = 12;
-export const MAX_FOCUS_CLAIMS = 16;
 export const MAX_DELEGATED_QUESTIONS = 3;
 
 export interface WaveDefinition {
@@ -318,7 +301,6 @@ export const HUNT_WAVE_TOPOLOGY: readonly WaveDefinition[] = [
 ] as const;
 
 export const MAX_PROMPT_BYTES = 65_536;
-export const MAX_TEAM_HUNT_BYTES = 262_144;
 export const MAX_SNAPSHOT_BYTES = 32_768;
 export const MAX_HANDOFF_BYTES = 16_384;
 export const MAX_PREDECESSORS = 16;
@@ -350,7 +332,6 @@ export const PREDICATES = [
   "spawned",
 ] as const;
 
-export type Predicate = (typeof PREDICATES)[number];
 export const PredicateSchema = z.enum(PREDICATES);
 
 export const CLAIM_KINDS = ["observed", "inference", "hypothesis", "finding"] as const;
@@ -358,10 +339,7 @@ export type ClaimKind = (typeof CLAIM_KINDS)[number];
 export const ClaimKindSchema = z.enum(CLAIM_KINDS);
 
 export const DISPOSITIONS = ["needs_revision", "needs_validation", "review_ready"] as const;
-export type Disposition = (typeof DISPOSITIONS)[number];
 export const DispositionSchema = z.enum(DISPOSITIONS);
-export const REVIEW_DISPOSITIONS = DISPOSITIONS;
-export const HANDOFF_DISPOSITIONS = DISPOSITIONS;
 
 export const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 export const SAFE_CLAIM_OR_REVIEW_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}$/;
@@ -399,8 +377,6 @@ export const EntitySchema = z
   })
   .strict();
 
-export type OntologyEntity = z.infer<typeof EntitySchema>;
-
 export const RelationSchema = z
   .object({
     relation_id: SafeIdent128Schema,
@@ -414,8 +390,6 @@ export const RelationSchema = z
       .refine(hasUniqueItems, "Duplicate evidence_ids"),
   })
   .strict();
-
-export type OntologyRelation = z.infer<typeof RelationSchema>;
 
 export const SnapshotSchema = z
   .object({
@@ -642,7 +616,6 @@ export function extractInlineCitations(statement: string): InlineCitationLineage
 }
 
 export const HUMAN_GATES = ["scope", "incident"] as const;
-export type HumanGateName = (typeof HUMAN_GATES)[number];
 export const RECONCILE_GATE = "reconcile" as const;
 
 export const GATE_CHANNELS = ["cli", "desktop", "slack", "automated"] as const;

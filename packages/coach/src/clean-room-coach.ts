@@ -300,12 +300,25 @@ export function buildCleanRoomChildEnv(
   return clean;
 }
 
+/**
+ * Where clean rooms are created. This is the one use of the system temp folder: a clean room must sit
+ * outside the repository, its worktrees and the runtime directory, so it cannot live in the workspace
+ * temp folder. It is always empty and is removed after each coach turn.
+ * `HUNT_COMMAND_CLEAN_ROOM_TEMP` overrides the location.
+ */
+export function cleanRoomTempRoot(): string {
+  const override = process.env.HUNT_COMMAND_CLEAN_ROOM_TEMP;
+  if (override && override.trim().length > 0) return override;
+  // health: allow SYSTEM_TEMP -- a clean room must be outside the workspace; see the comment above
+  return os.tmpdir();
+}
+
 export function createEmptyCleanRoomTempDir(options?: {
   repoRoot?: string;
   baseTempRoot?: string;
   prefix?: string;
 }): string {
-  const baseRoot = options?.baseTempRoot ?? os.tmpdir();
+  const baseRoot = options?.baseTempRoot ?? cleanRoomTempRoot();
   const prefix = options?.prefix ?? "hunt-coach-clean-";
   const created = fs.mkdtempSync(path.join(baseRoot, prefix));
   try {
