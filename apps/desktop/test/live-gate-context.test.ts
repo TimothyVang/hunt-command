@@ -104,7 +104,7 @@ describe("F4: gate approval requires the gate's decision context", () => {
       ["schema", { run_id: "run-1" }],
       ["digest mismatch", incidentContext({ payload_sha256: "b".repeat(64) })],
       ["other run", incidentContext({ run_id: "run-2" })],
-      ["other gate", { ...incidentContext(), gate: "reconcile", incident: undefined, reconcile: { receipts: [{ execution_id: "e", session_id: "s", input_id: "i", step_id: "x", profile: "framework-coordinator", reserved_at: "t", reason_code: "previous_dispatch_unknown" }] } }],
+      ["other gate", { ...incidentContext(), gate: "reconcile", incident: undefined, reconcile: { reason_code: "previous_dispatch_unknown", receipts: [{ execution_id: "e", session_id: "s", input_id: "i", step_id: "x", profile: "framework-coordinator", reserved_at: "t", reason_code: "previous_dispatch_unknown" }] } }],
       ["no incident block", { run_id: "run-1", case_id: "c1", gate: "incident", payload_sha256: DIGEST }],
       ["uncovered citation", incidentContext({ incident: { ...incidentContext().incident, evidence: [] } })],
       ["backend unavailable", incidentContext({ incident: { ...incidentContext().incident, citation_receipt: { ...incidentContext().incident.citation_receipt, source_status: "unavailable" } } })],
@@ -121,7 +121,7 @@ describe("F4: gate approval requires the gate's decision context", () => {
     const open = { ...OPEN, gate: "reconcile" as const };
     const p = projectLiveGate("run-1", open, HANDOFFS, {
       run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
-      reconcile: { receipts: [{ execution_id: "exec-1", session_id: "sess-1", input_id: "in-1", step_id: "analysis", profile: "framework-coordinator", reserved_at: "2026-11-14T10:00:05Z", reason_code: "previous_dispatch_unknown" }] },
+      reconcile: { reason_code: "previous_dispatch_unknown", receipts: [{ execution_id: "exec-1", session_id: "sess-1", input_id: "in-1", step_id: "analysis", profile: "framework-coordinator", reserved_at: "2026-11-14T10:00:05Z", reason_code: "previous_dispatch_unknown" }] },
     });
     expect(p.activeGate.reconcileContext).toEqual({
       executionId: "exec-1", sessionId: "sess-1", inputId: "in-1", stepId: "analysis",
@@ -129,13 +129,53 @@ describe("F4: gate approval requires the gate's decision context", () => {
     });
     expect(missingGateContextReason(p.activeGate)).toBeNull();
   });
+
+  test("a citation_source_unavailable reconcile gate shows its reason and evidence and stays approvable", () => {
+    const open = { ...OPEN, gate: "reconcile" as const };
+    const inc = incidentContext().incident;
+    const p = projectLiveGate("run-1", open, HANDOFFS, {
+      run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
+      reconcile: {
+        reason_code: "citation_source_unavailable",
+        citation_receipt: { ...inc.citation_receipt, verified: false, source_status: "unavailable" },
+        unavailable_sources: ["elastic"],
+        evidence: [{ ...inc.evidence[0]!, status: "unresolved", timestamp_iso: null, title: "", fields: {} }],
+        evidence_truncated: false,
+      },
+    });
+    expect(p.activeGate.contextError).toBeUndefined();
+    const rc = p.activeGate.reconcileContext!;
+    expect(rc.reasonCode).toBe("citation_source_unavailable");
+    if (rc.reasonCode !== "citation_source_unavailable") throw new Error("narrowing");
+    expect(rc.unavailableSources).toEqual(["elastic"]);
+    expect(rc.citationReceipt.entries.map((e) => [e.citationId, e.status])).toEqual([[EVT, "unresolved"]]);
+    expect(missingGateContextReason(p.activeGate)).toBeNull();
+    expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(true);
+  });
+
+  test("an unparseable reconcile context (no receipts) fails closed", () => {
+    const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, {
+      run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
+      reconcile: { reason_code: "previous_dispatch_unknown", receipts: [] },
+    });
+    expect(p.activeGate.contextError).toBeDefined();
+    expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
+  });
 });
 
 describe("F8: live transcript pages", () => {
   test("daemon page is validated and mapped; mismatched or failed pages become an error view", () => {
-    const raw = { run_id: "run-1", step_id: "incident", profile: "framework-coordinator", byte_offset: 0, byte_length: 5, total_bytes: 9, has_more: true, content: "hello" };
+    const nonce = "0123456789abcdef0123456789abcdef";
+    const fenced = (t: string, n = nonce) => `<untrusted_tool_result_${n}>
+${t}
+</untrusted_tool_result_${n}>`;
+    const raw = { run_id: "run-1", step_id: "incident", profile: "framework-coordinator", byte_offset: 0, byte_length: 5, total_bytes: 9, has_more: true, next_byte_offset: 5, fence_nonce: nonce, content: fenced("hello") };
     const page = projectTranscriptPage(raw, "run-1", "incident");
-    expect(page).toEqual({ huntId: "run-1", stepId: "incident", profile: "framework-coordinator", byteOffset: 0, byteLength: 5, totalBytes: 9, hasMore: true, content: "hello" });
+    expect(page).toEqual({ huntId: "run-1", stepId: "incident", profile: "framework-coordinator", byteOffset: 0, byteLength: 5, totalBytes: 9, hasMore: true, nextByteOffset: 5, content: "hello" });
+    expect(projectTranscriptPage({ ...raw, content: fenced(""), byte_length: 0, has_more: false }, "run-1", "incident").content).toBe("");
+    // Wrong nonce, missing fence, or unfenced text is refused rather than rendered.
+    expect(() => projectTranscriptPage({ ...raw, content: fenced("hello", "f".repeat(32)) }, "run-1", "incident")).toThrow(/fence/);
+    expect(() => projectTranscriptPage({ ...raw, content: "hello" }, "run-1", "incident")).toThrow(/fence/);
     expect(() => projectTranscriptPage({ ...raw, step_id: "other" }, "run-1", "incident")).toThrow();
     expect(() => projectTranscriptPage({ ...raw, extra: 1 }, "run-1", "incident")).toThrow();
 
@@ -143,10 +183,14 @@ describe("F8: live transcript pages", () => {
     expect(transcriptViewFor(req, { ok: true, data: page })).toEqual({ kind: "page", page });
     expect(transcriptViewFor(req, { ok: false, error: { code: "IPC_HANDLER_ERROR", message: "method_not_found" } })).toEqual({ kind: "error", message: "method_not_found" });
     expect(transcriptViewFor({ ...req, stepId: "analysis" }, { ok: true, data: page }).kind).toBe("error");
+    // The daemon may snap an offset forward to a UTF-8 boundary (at most 3 bytes).
+    expect(transcriptViewFor({ ...req, byteOffset: 0 }, { ok: true, data: { ...page, byteOffset: 2 } }).kind).toBe("page");
+    expect(transcriptViewFor({ ...req, byteOffset: 0 }, { ok: true, data: { ...page, byteOffset: 9 } }).kind).toBe("error");
   });
 });
 
 /** In-process daemon (real engine, store, gates, RPC server) behind a sidecar-shaped adapter. */
+/** `gateContext` may override hunt.gateContext; returning `undefined` uses the real daemon RPC. */
 async function liveHarness(gateContext: (params: Record<string, unknown>, store: DurableStateStore) => unknown) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "hc-live-gate-"));
   const caseId = "gate-case";
@@ -193,7 +237,10 @@ async function liveHarness(gateContext: (params: Record<string, unknown>, store:
     request: async (method: string, params?: Record<string, unknown>) => {
       calls.push(method);
       recorded.push([method, params]);
-      if (method === "hunt.gateContext") return gateContext(params ?? {}, store);
+      if (method === "hunt.gateContext") {
+        const override = gateContext(params ?? {}, store);
+        if (override !== undefined) return override;
+      }
       const id = ++seq;
       await rpc.handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) }));
       const reply = replies.get(id);
@@ -226,17 +273,8 @@ async function toIncidentGate(h: Awaited<ReturnType<typeof liveHarness>>) {
 }
 
 describe("F4 end to end through WorkbenchService and the real daemon engine", () => {
-  test("the incident gate shows daemon-supplied context and can be approved", async () => {
-    const h = await liveHarness((params, store) => {
-      const run = store.getRun(String(params.run_id))!;
-      return {
-        run_id: run.run_id, case_id: run.case_id, gate: run.open_gate!.gate, payload_sha256: run.open_gate!.payload_sha256,
-        incident: {
-          citation_receipt: { verified: true, checked_at: "t", case_id: run.case_id, total_checked: 0, missing_event_ids: [], missing_frame_ids: [], missing_ioc_ids: [], ambiguous_ids: [], out_of_scope_ids: [], source_status: "ok" },
-          evidence: [], evidence_truncated: false,
-        },
-      };
-    });
+  test("the incident gate shows the real daemon's hunt.gateContext and can be approved", async () => {
+    const h = await liveHarness(() => undefined);
     try {
       const snap = await toIncidentGate(h);
       expect(snap.activeGate?.contextError).toBeUndefined();
@@ -276,19 +314,25 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
     }
   });
 
-  test("live transcript inspection calls hunt.inspectTranscriptPage and surfaces a daemon failure", async () => {
-    const h = await liveHarness(() => null);
+  test("live transcript inspection pages through the daemon's hunt.inspectTranscriptPage", async () => {
+    const h = await liveHarness(() => undefined);
     try {
       const started = await h.service.startRun({ caseId: h.caseId, dataOrigin: "synthetic", scope: "Investigate the process.", followUps: 0, maxTotalTokens: 100_000 });
-      // This daemon build has no such method: the error propagates (the pane renders it); nothing is invented.
-      await expect(
-        h.service.inspectTranscriptPage({ huntId: started.huntId, stepId: "scope", byteOffset: 0, byteLimit: 4096 }),
-      ).rejects.toThrow(/method_not_found|Unknown RPC method/);
+      const stepId = Object.keys(h.store.getRun(started.huntId)!.results)[0]!;
+      const first = await h.service.inspectTranscriptPage({ huntId: started.huntId, stepId, byteOffset: 0, byteLimit: 600 });
       expect(h.recorded.find(([m]) => m === "hunt.inspectTranscriptPage")?.[1]).toEqual({
-        run_id: started.huntId, step_id: "scope", byte_offset: 0, byte_limit: 4096,
+        run_id: started.huntId, step_id: stepId, byte_offset: 0, byte_limit: 600,
       });
+      expect(first.content.length).toBeGreaterThan(0);
+      expect(first.content).not.toContain("untrusted_tool_result_");
+      expect(first.totalBytes).toBeGreaterThan(first.byteLength);
+      expect(first.hasMore).toBe(true);
+      const second = await h.service.inspectTranscriptPage({ huntId: started.huntId, stepId, byteOffset: first.nextByteOffset!, byteLimit: 600 });
+      expect(second.byteOffset).toBe(first.nextByteOffset!);
+      await expect(h.service.inspectTranscriptPage({ huntId: started.huntId, stepId: "no-such-step", byteOffset: 0, byteLimit: 600 })).rejects.toThrow(/step_not_found/);
     } finally {
       await h.close();
     }
   });
+
 });

@@ -434,7 +434,7 @@ export function ClaimsAndGatesPane({
                 <button
                   type="button"
                   disabled={!transcriptPage?.hasMore}
-                  onClick={() => setByteOffset(byteOffset + 16_384)}
+                  onClick={() => setByteOffset(transcriptPage?.nextByteOffset ?? byteOffset + 16_384)}
                   className="rounded border border-slate-700 px-2 py-0.5 text-slate-200 disabled:opacity-40 cursor-pointer"
                 >
                   Next

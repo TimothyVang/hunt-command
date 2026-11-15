@@ -242,13 +242,14 @@ export function AuthorityGateCard({
       )}
 
       {/* Crash-Recovery Reconcile Gate */}
-      {activeGate.gate === "reconcile" && activeGate.reconcileContext && (
+      {activeGate.gate === "reconcile" && activeGate.reconcileContext?.reasonCode === "previous_dispatch_unknown" && (
         <div
           data-testid="reconcile-gate-context"
           className="rounded border border-amber-500/50 bg-amber-950/30 p-2.5 font-mono text-[11px] space-y-1"
         >
           <div className="font-bold text-amber-200">
-            reason_code: {activeGate.reconcileContext.reasonCode}
+            reason_code: previous_dispatch_unknown — the daemon restarted while this step's dispatch was
+            reserved, so whether the model call ran is unknown.
           </div>
           <div className="text-slate-300">
             execution_id: {activeGate.reconcileContext.executionId} · session_id:{" "}
@@ -259,8 +260,44 @@ export function AuthorityGateCard({
             input_id: {activeGate.reconcileContext.inputId}
           </div>
           <div className="text-slate-400">
-            reserved_at: {activeGate.reconcileContext.reservedAtIso} — Daemon crashed after reserving
-            step execution receipt; operator must approve replay or reject to halt run cleanly.
+            reserved_at: {activeGate.reconcileContext.reservedAtIso} — approve to replay or reject to halt
+            the run cleanly.
+            {activeGate.reconcileContext.additionalReceiptCount
+              ? ` ${activeGate.reconcileContext.additionalReceiptCount} more unknown dispatch(es) are covered by this gate.`
+              : ""}
+          </div>
+        </div>
+      )}
+
+      {activeGate.gate === "reconcile" && activeGate.reconcileContext?.reasonCode === "citation_source_unavailable" && (
+        <div
+          data-testid="reconcile-gate-context"
+          className="rounded border border-amber-500/50 bg-amber-950/30 p-2.5 font-mono text-[11px] space-y-1"
+        >
+          <div className="font-bold text-amber-200">
+            reason_code: citation_source_unavailable — the citation source could not be reached, so the
+            cited records below could not all be verified.
+          </div>
+          <div className="text-slate-300">
+            unavailable sources: {activeGate.reconcileContext.unavailableSources.join(", ") || "(not named)"}
+          </div>
+          <div className="text-slate-300">
+            citations: {activeGate.reconcileContext.citationReceipt.verifiedCount}/
+            {activeGate.reconcileContext.citationReceipt.totalCited} verified · unresolved=
+            {activeGate.reconcileContext.citationReceipt.unresolvedCount} · out_of_scope=
+            {activeGate.reconcileContext.citationReceipt.outOfScopeCount}
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {activeGate.reconcileContext.citationReceipt.entries.map((entry) => (
+              <button
+                key={entry.citationId}
+                type="button"
+                onClick={() => onSelectCitation(entry.citationId)}
+                className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-200 cursor-pointer"
+              >
+                {entry.citationId} · {entry.status}
+              </button>
+            ))}
           </div>
         </div>
       )}

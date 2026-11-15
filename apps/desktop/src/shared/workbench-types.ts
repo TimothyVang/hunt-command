@@ -96,7 +96,8 @@ export interface CitationVerificationReceipt {
   entries: CitationStatusEntry[];
 }
 
-export interface ReconcileReceiptContext {
+/** Reconcile gate after a crash: a step dispatch was reserved but its outcome is unknown. */
+export interface ReconcileDispatchContext {
   executionId: string;
   sessionId: string;
   inputId: string;
@@ -104,7 +105,18 @@ export interface ReconcileReceiptContext {
   profile: ProfileId;
   reservedAtIso: string;
   reasonCode: "previous_dispatch_unknown";
+  /** Further reserved-but-unknown dispatches beyond the one shown. */
+  additionalReceiptCount?: number;
 }
+
+/** Reconcile gate because the citation source could not be reached while verifying citations. */
+export interface ReconcileCitationSourceContext {
+  reasonCode: "citation_source_unavailable";
+  unavailableSources: string[];
+  citationReceipt: CitationVerificationReceipt;
+}
+
+export type ReconcileReceiptContext = ReconcileDispatchContext | ReconcileCitationSourceContext;
 
 export interface ActiveGatePrompt {
   gate: "scope" | "incident" | "reconcile";
@@ -263,6 +275,8 @@ export interface TranscriptPageSlice {
   byteLength: number;
   totalBytes: number;
   hasMore: boolean;
+  /** Where the next page starts (the daemon snaps offsets to UTF-8 boundaries). */
+  nextByteOffset?: number;
   content: string;
 }
 

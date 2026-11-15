@@ -22,7 +22,9 @@ export function transcriptViewFor(request: TranscriptRequest, res: IpcResult<Tra
     return { kind: "error", message: res.error?.message ?? "Transcript page could not be loaded." };
   }
   const page = res.data;
-  if (page.huntId !== request.huntId || page.stepId !== request.stepId || page.byteOffset !== request.byteOffset) {
+  // The daemon may move an offset forward by up to 3 bytes to the next UTF-8 code point boundary.
+  const offsetMatches = page.byteOffset >= request.byteOffset && page.byteOffset <= request.byteOffset + 3;
+  if (page.huntId !== request.huntId || page.stepId !== request.stepId || !offsetMatches) {
     return { kind: "error", message: "Transcript page does not match the requested hunt, step, or offset." };
   }
   return { kind: "page", page };

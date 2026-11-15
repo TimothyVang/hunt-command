@@ -64,25 +64,40 @@ export const GateContextResultSchema = z
       })
       .strict()
       .optional(),
+    // Tagged on reason_code: a crash left a dispatch's outcome unknown, or the citation source was
+    // unreachable while verifying citations. Both are approvable once their context is shown.
     reconcile: z
-      .object({
-        receipts: z
-          .array(
-            z
-              .object({
-                execution_id: z.string().min(1),
-                session_id: z.string().min(1),
-                input_id: z.string().min(1),
-                step_id: z.string().min(1),
-                profile: ProfileIdSchema,
-                reserved_at: z.string().min(1),
-                reason_code: z.literal("previous_dispatch_unknown"),
-              })
-              .strict(),
-          )
-          .min(1),
-      })
-      .strict()
+      .discriminatedUnion("reason_code", [
+        z
+          .object({
+            reason_code: z.literal("previous_dispatch_unknown"),
+            receipts: z
+              .array(
+                z
+                  .object({
+                    execution_id: z.string().min(1),
+                    session_id: z.string().min(1),
+                    input_id: z.string().min(1),
+                    step_id: z.string().min(1),
+                    profile: ProfileIdSchema,
+                    reserved_at: z.string().min(1),
+                    reason_code: z.literal("previous_dispatch_unknown"),
+                  })
+                  .strict(),
+              )
+              .min(1),
+          })
+          .strict(),
+        z
+          .object({
+            reason_code: z.literal("citation_source_unavailable"),
+            citation_receipt: DaemonCitationReceiptSchema,
+            unavailable_sources: z.array(z.string()),
+            evidence: z.array(EvidenceSchema).max(500),
+            evidence_truncated: z.boolean().optional(),
+          })
+          .strict(),
+      ])
       .optional(),
   })
   .strict();
@@ -98,15 +113,32 @@ export const LiveTranscriptPageSchema = z
     byte_length: z.number().int().nonnegative(),
     total_bytes: z.number().int().nonnegative(),
     has_more: z.boolean(),
+    next_byte_offset: z.number().int().nonnegative(),
+    fence_nonce: z.string().regex(/^[0-9a-f]{32}$/),
     content: z.string(),
   })
   .strict();
+
+/**
+ * Removes the daemon's per-call untrusted-output fence. The page must be wrapped in exactly
+ * `<untrusted_tool_result_<nonce>>` + newline ... newline + `</untrusted_tool_result_<nonce>>`; anything
+ * else is refused. The inner text is still untrusted model output and is rendered as inert text only.
+ */
+export function unwrapFencedPage(content: string, nonce: string): string {
+  const open = `<untrusted_tool_result_${nonce}>\n`;
+  const close = `\n</untrusted_tool_result_${nonce}>`;
+  if (!content.startsWith(open) || !content.endsWith(close) || content.length < open.length + close.length) {
+    throw new Error("Transcript page is not wrapped in the expected untrusted-output fence.");
+  }
+  return content.slice(open.length, content.length - close.length);
+}
 
 export function projectTranscriptPage(raw: unknown, huntId: string, stepId: string): TranscriptPageSlice {
   const page = LiveTranscriptPageSchema.parse(raw);
   if (page.run_id !== huntId || page.step_id !== stepId) {
     throw new Error(`Daemon returned a transcript page for ${page.run_id}/${page.step_id}, not ${huntId}/${stepId}.`);
   }
+  const content = unwrapFencedPage(page.content, page.fence_nonce);
   return {
     huntId: page.run_id,
     stepId: page.step_id,
@@ -115,7 +147,8 @@ export function projectTranscriptPage(raw: unknown, huntId: string, stepId: stri
     byteLength: page.byte_length,
     totalBytes: page.total_bytes,
     hasMore: page.has_more,
-    content: page.content,
+    nextByteOffset: page.next_byte_offset,
+    content,
   };
 }
 
@@ -223,25 +256,48 @@ export function projectLiveGate(
   }
 
   if (ctx.gate === "reconcile") {
-    const receipt = ctx.reconcile?.receipts[0];
-    if (!receipt) return fail("reconcile gate context has no dispatch receipt");
+    const reconcile = ctx.reconcile;
+    if (!reconcile) return fail("reconcile gate context is missing");
+    if (reconcile.reason_code === "previous_dispatch_unknown") {
+      const [receipt, ...rest] = reconcile.receipts;
+      return {
+        activeGate: {
+          ...base,
+          reconcileContext: {
+            executionId: receipt!.execution_id,
+            sessionId: receipt!.session_id,
+            inputId: receipt!.input_id,
+            stepId: receipt!.step_id,
+            profile: receipt!.profile as ProfileId,
+            reservedAtIso: receipt!.reserved_at,
+            reasonCode: "previous_dispatch_unknown",
+            ...(rest.length > 0 ? { additionalReceiptCount: rest.length } : {}),
+          },
+        },
+        citationReceipt: null,
+        evidenceCatalog: {},
+        events: [],
+        citationStatus: new Map(),
+      };
+    }
+    // citation_source_unavailable: the reason itself is the context; show what could and could not be checked.
+    const projected = projectEvidence(handoffs, reconcile.evidence, reconcile.evidence_truncated ?? false, reconcile.citation_receipt.verified);
+    if (projected.uncovered) {
+      return fail(`gate context does not cover cited ids: ${projected.uncovered.slice(0, 5).join(", ")}`);
+    }
     return {
       activeGate: {
         ...base,
         reconcileContext: {
-          executionId: receipt.execution_id,
-          sessionId: receipt.session_id,
-          inputId: receipt.input_id,
-          stepId: receipt.step_id,
-          profile: receipt.profile as ProfileId,
-          reservedAtIso: receipt.reserved_at,
-          reasonCode: receipt.reason_code,
+          reasonCode: "citation_source_unavailable",
+          unavailableSources: reconcile.unavailable_sources,
+          citationReceipt: projected.receipt,
         },
       },
-      citationReceipt: null,
-      evidenceCatalog: {},
-      events: [],
-      citationStatus: new Map(),
+      citationReceipt: projected.receipt,
+      evidenceCatalog: projected.evidenceCatalog,
+      events: projected.events,
+      citationStatus: projected.status,
     };
   }
 
@@ -250,12 +306,58 @@ export function projectLiveGate(
   if (incident.citation_receipt.source_status !== "ok") {
     return fail(`citation backend unavailable: ${incident.citation_receipt.diagnostic ?? "source_status=unavailable"}`);
   }
+  const projected = projectEvidence(handoffs, incident.evidence, incident.evidence_truncated, incident.citation_receipt.verified);
+  if (projected.uncovered) {
+    return fail(`gate context does not cover cited ids: ${projected.uncovered.slice(0, 5).join(", ")}`);
+  }
+  const { receipt, evidenceCatalog, events, status } = projected;
+  const claims = handoffs.flatMap((h) => h.claims);
+  const reviews = handoffs.flatMap((h) => h.reviews);
+  return {
+    activeGate: {
+      ...base,
+      incidentSummary: {
+        citationReceipt: receipt,
+        observedCount: claims.filter((c) => c.kind === "observed").length,
+        findingCount: claims.filter((c) => c.kind === "finding").length,
+        inferenceCount: claims.filter((c) => c.kind === "inference").length,
+        hypothesisCount: claims.filter((c) => c.kind === "hypothesis").length,
+        limitationCount: handoffs.reduce((n, h) => n + h.limitations.length, 0),
+        purpleVerdictCounts: {
+          review_ready: reviews.filter((r) => r.disposition === "review_ready").length,
+          needs_validation: reviews.filter((r) => r.disposition === "needs_validation").length,
+          needs_revision: reviews.filter((r) => r.disposition === "needs_revision").length,
+        },
+      },
+    },
+    citationReceipt: receipt,
+    evidenceCatalog,
+    events,
+    citationStatus: status,
+  };
+}
+
+/** Citation receipt, evidence catalog and Dissector events from the daemon's evidence entries. */
+function projectEvidence(
+  handoffs: readonly Handoff[],
+  evidence: z.infer<typeof EvidenceSchema>[],
+  truncated: boolean,
+  receiptVerified: boolean,
+):
+  | { uncovered: string[] }
+  | {
+      uncovered?: undefined;
+      receipt: CitationVerificationReceipt;
+      evidenceCatalog: Record<string, EvidenceRecordDetail>;
+      events: DissectorEventRow[];
+      status: Map<string, "verified" | "unresolved" | "out_of_scope">;
+    } {
   const refs = citedReferences(handoffs);
-  const byId = new Map(incident.evidence.map((e) => [e.id, e]));
-  if (!incident.evidence_truncated) {
+  const byId = new Map(evidence.map((e) => [e.id, e]));
+  if (!truncated) {
     const uncovered = [...refs.keys()].filter((id) => !byId.has(id));
     if (uncovered.length > 0) {
-      return fail(`gate context does not cover cited ids: ${uncovered.slice(0, 5).join(", ")}`);
+      return { uncovered };
     }
   }
 
@@ -266,7 +368,7 @@ export function projectLiveGate(
   let verified = 0;
   let unresolved = 0;
   let outOfScope = 0;
-  for (const ev of [...incident.evidence].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+  for (const ev of [...evidence].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
     const s = ev.status === "ambiguous" ? "unresolved" : ev.status;
     status.set(ev.id, s);
     if (s === "verified") verified++;
@@ -316,31 +418,8 @@ export function projectLiveGate(
     verifiedCount: verified,
     unresolvedCount: unresolved,
     outOfScopeCount: outOfScope,
-    allVerified: incident.citation_receipt.verified && unresolved === 0 && outOfScope === 0,
+    allVerified: receiptVerified && unresolved === 0 && outOfScope === 0,
     entries,
   };
-  const claims = handoffs.flatMap((h) => h.claims);
-  const reviews = handoffs.flatMap((h) => h.reviews);
-  return {
-    activeGate: {
-      ...base,
-      incidentSummary: {
-        citationReceipt: receipt,
-        observedCount: claims.filter((c) => c.kind === "observed").length,
-        findingCount: claims.filter((c) => c.kind === "finding").length,
-        inferenceCount: claims.filter((c) => c.kind === "inference").length,
-        hypothesisCount: claims.filter((c) => c.kind === "hypothesis").length,
-        limitationCount: handoffs.reduce((n, h) => n + h.limitations.length, 0),
-        purpleVerdictCounts: {
-          review_ready: reviews.filter((r) => r.disposition === "review_ready").length,
-          needs_validation: reviews.filter((r) => r.disposition === "needs_validation").length,
-          needs_revision: reviews.filter((r) => r.disposition === "needs_revision").length,
-        },
-      },
-    },
-    citationReceipt: receipt,
-    evidenceCatalog,
-    events: events.sort((a, b) => a.timestampMs - b.timestampMs),
-    citationStatus: status,
-  };
+  return { receipt, evidenceCatalog, events: events.sort((a, b) => a.timestampMs - b.timestampMs), status };
 }
