@@ -1,4 +1,5 @@
 import { StringDecoder } from "node:string_decoder";
+import { z } from "zod";
 import {
   CaseMetadataSchema,
   RpcEventNotificationSchema,
@@ -12,7 +13,41 @@ import { extractDataPlaneError } from "@hunt-command/data-plane";
 import { executeDriveGates, type DriveGatesCommandInput } from "./drive-gates.ts";
 import { GateDecisionError } from "./gates.ts";
 import type { DaemonTelemetryEvent, HuntDataPlanePort } from "./ports.ts";
+import {
+  TRANSCRIPT_PAGE_DEFAULT_BYTES,
+  TRANSCRIPT_PAGE_MAX_BYTES,
+  TRANSCRIPT_PAGE_MIN_BYTES,
+  pageTranscript,
+  profileForRunStep,
+  renderStepTranscript,
+} from "./transcript.ts";
 import type { HuntWaveEngine } from "./wave-engine.ts";
+
+/** A refused RPC with its own JSON-RPC code and stable `error_code`. */
+export class RpcRequestError extends Error {
+  constructor(
+    public readonly code: number,
+    public readonly errorCode: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "RpcRequestError";
+  }
+}
+
+const InspectTranscriptPageParamsSchema = z
+  .object({
+    huntId: z.string().min(1).max(128),
+    stepId: z.string().min(1).max(64),
+    byteOffset: z.number().int().min(0).default(0),
+    byteLimit: z
+      .number()
+      .int()
+      .min(TRANSCRIPT_PAGE_MIN_BYTES)
+      .max(TRANSCRIPT_PAGE_MAX_BYTES)
+      .default(TRANSCRIPT_PAGE_DEFAULT_BYTES),
+  })
+  .strict();
 
 export const DEFAULT_MAX_NDJSON_LINE_BYTES = 1_048_576; // 1 MiB
 
@@ -258,6 +293,39 @@ export class HuntDaemonRpcServer {
           return { jsonrpc: "2.0", id: req.id, result: run };
         }
 
+        case "hunt.inspectTranscriptPage": {
+          // Read-only: reads durable state for exactly one run; never touches gates or run state.
+          const parsed = InspectTranscriptPageParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            const issue = parsed.error.issues[0];
+            throw new RpcRequestError(
+              -32602,
+              "invalid_params",
+              `hunt.inspectTranscriptPage: ${issue?.path.join(".") || "params"}: ${issue?.message ?? "invalid"}`,
+            );
+          }
+          const { huntId, stepId, byteOffset, byteLimit } = parsed.data;
+          const run = this.engine.stateStore.getRun(huntId);
+          if (!run) {
+            throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${huntId}'`);
+          }
+          const profile = profileForRunStep(run, stepId);
+          if (!profile) {
+            throw new RpcRequestError(-32004, "step_not_found", `Hunt '${huntId}' has no step '${stepId}'`);
+          }
+          const transcript = renderStepTranscript(
+            run,
+            this.engine.stateStore.listReceiptsForRun(run.run_id),
+            stepId,
+            profile,
+          );
+          return {
+            jsonrpc: "2.0",
+            id: req.id,
+            result: pageTranscript({ huntId: run.run_id, stepId, profile, transcript, byteOffset, byteLimit }),
+          };
+        }
+
         case "hunt.list": {
           const runs = this.engine.stateStore.listRuns();
           return { jsonrpc: "2.0", id: req.id, result: { runs } };
@@ -343,14 +411,14 @@ export class HuntDaemonRpcServer {
       }
     } catch (err) {
       const errorCode =
-        err instanceof GateDecisionError
+        err instanceof RpcRequestError || err instanceof GateDecisionError
           ? err.errorCode
           : (extractDataPlaneError(err)?.errorCode ?? "rpc_execution_error");
       return {
         jsonrpc: "2.0",
         id: req.id,
         error: {
-          code: -32000,
+          code: err instanceof RpcRequestError ? err.code : -32000,
           message: err instanceof Error ? err.message : String(err),
           error_code: errorCode,
         },

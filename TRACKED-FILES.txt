@@ -110,6 +110,7 @@ packages/daemon/src/scrubber-and-fence.ts
 packages/daemon/src/slack-bridge.ts
 packages/daemon/src/state-store.ts
 packages/daemon/src/tools.ts
+packages/daemon/src/transcript.ts
 packages/daemon/src/wave-engine.ts
 packages/daemon/test/case-data-plane.test.ts
 packages/daemon/test/cli-errors.test.ts
@@ -119,6 +120,7 @@ packages/daemon/test/ontology-validator.test.ts
 packages/daemon/test/review-regressions.test.ts
 packages/daemon/test/runtime-lock-race.test.ts
 packages/daemon/test/scrubber-and-fence.test.ts
+packages/daemon/test/transcript-rpc.test.ts
 packages/daemon/test/wave-engine-and-durability.test.ts
 packages/data-plane/package.json
 packages/data-plane/src/connected-data-plane.ts
