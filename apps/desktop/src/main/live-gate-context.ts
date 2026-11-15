@@ -281,7 +281,16 @@ export function projectLiveGate(
       };
     }
     // citation_source_unavailable: the reason itself is the context; show what could and could not be checked.
-    const projected = projectEvidence(handoffs, reconcile.evidence, reconcile.evidence_truncated ?? false, reconcile.citation_receipt.verified);
+    // While a source is still down the daemon sends no evidence for it, so every cited id it could not
+    // read is listed as unresolved instead of failing closed (the gate exists to decide exactly this).
+    const evidence = [...reconcile.evidence];
+    if (reconcile.unavailable_sources.length > 0) {
+      const have = new Set(evidence.map((e) => e.id));
+      for (const [id, ref] of citedReferences(handoffs)) {
+        if (!have.has(id)) evidence.push({ id, kind: ref.kind, status: "unresolved", timestamp_iso: null, title: "", fields: {} });
+      }
+    }
+    const projected = projectEvidence(handoffs, evidence, reconcile.evidence_truncated ?? false, reconcile.citation_receipt.verified);
     if (projected.uncovered) {
       return fail(`gate context does not cover cited ids: ${projected.uncovered.slice(0, 5).join(", ")}`);
     }
