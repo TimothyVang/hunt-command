@@ -13,6 +13,7 @@ import { type BrowserWindow, type Rectangle, session, WebContentsView } from "el
 import type { ProfileId } from "@hunt-command/shared";
 import type { WatchBrowserState } from "../../shared/workbench-types.ts";
 import type { Logger } from "../logger.ts";
+import { WEBRTC_IP_HANDLING_POLICY } from "../network-quiet.ts";
 import {
   buildWatchProxyConfig,
   decideWatchRequest,
@@ -135,6 +136,8 @@ export class WatchBrowserController {
 
     const wc = view.webContents;
     wc.setAudioMuted(true);
+    // Explicit here as well as app-wide: no non-proxied WebRTC UDP; the session proxy is the blackhole.
+    wc.setWebRTCIPHandlingPolicy(WEBRTC_IP_HANDLING_POLICY);
     wc.setWindowOpenHandler(() => ({ action: "deny" }));
     wc.on("will-attach-webview", (ev) => ev.preventDefault());
     wc.on("will-navigate", (ev, targetUrl) => {

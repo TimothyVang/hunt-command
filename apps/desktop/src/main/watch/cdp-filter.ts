@@ -10,8 +10,9 @@
  *   `Page.setDownloadBehavior`, `Page.setBypassCSP`, and `Security.setIgnoreCertificateErrors`.
  * - Scopes `isOpenableWatchUrl` to `documentAllowed(scope, url)` (pinned `127.0.0.1:<port>` only — zero `localhost`).
  * - Validates `Page.navigate` URLs with the same allowed-document check (CDP-initiated loads skip `will-navigate`),
- *   and denies `Page.navigateToHistoryEntry`, `Page.setDocumentContent`, `Page.printToPDF`, `IO.*`, and
- *   `DOM.setFileInputFiles` outright.
+ *   and denies `Page.navigateToHistoryEntry`, `Page.setDocumentContent`, `Page.printToPDF`, `IO.*`, and every
+ *   local-file route (`DOM.setFileInputFiles`, `DOM.getFileInfo`, `Input.dispatchDragEvent`,
+ *   `Input.setInterceptDrags`, `Page.setInterceptFileChooserDialog`, `Page.handleFileChooser`) outright.
  */
 import { documentAllowed, type WatchScope } from "./browser-policy.ts";
 
@@ -66,7 +67,15 @@ const DENIED_METHODS: Record<string, true> = {
   "Page.navigateToHistoryEntry": true,
   "Page.setDocumentContent": true,
   "Page.printToPDF": true,
+  // Local-file access: every CDP route that lets a client hand the page a file from disk (and then read it
+  // back with Runtime.evaluate) or learn a File's on-disk path. A synthetic drop with `data.files` delivered
+  // the file's bytes to page script, so drag synthesis and drag/file-chooser interception are denied outright.
   "DOM.setFileInputFiles": true,
+  "DOM.getFileInfo": true,
+  "Input.dispatchDragEvent": true,
+  "Input.setInterceptDrags": true,
+  "Page.setInterceptFileChooserDialog": true,
+  "Page.handleFileChooser": true,
 };
 
 /** Commands whose `params.url` loads a document and must pass the session's allowed-document check. */

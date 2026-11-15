@@ -124,3 +124,66 @@ describe("CDP method-name normalization", () => {
     expect(deniedSessionCommand("Page.captureScreenshot", undefined, () => true)).toBeNull();
   });
 });
+
+describe("CDP local-file access is denied on Watch page sessions", () => {
+  const FILE_ROUTES: Array<[string, Record<string, unknown>]> = [
+    ["Input.dispatchDragEvent", { type: "drop", x: 5, y: 5, data: { items: [], files: ["C:/Windows/win.ini"], dragOperationsMask: 1 } }],
+    ["Input.dispatchDragEvent", { type: "dragEnter", x: 5, y: 5, data: { items: [{ mimeType: "text/plain", data: "x" }], dragOperationsMask: 1 } }],
+    ["Input.setInterceptDrags", { enabled: true }],
+    ["Page.setInterceptFileChooserDialog", { enabled: true }],
+    ["Page.handleFileChooser", { action: "accept", files: ["C:/Windows/win.ini"] }],
+    ["DOM.setFileInputFiles", { files: ["C:/Windows/win.ini"], nodeId: 1 }],
+    ["DOM.getFileInfo", { objectId: "1" }],
+  ];
+
+  test("filter denies every file route, with or without files in the payload", () => {
+    for (const [method, params] of FILE_ROUTES) {
+      expect(deniedSessionCommand(method, params, () => true)).toMatch(/denied/);
+    }
+    // Ordinary input that cannot carry a file stays available to the bot.
+    expect(deniedSessionCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1 }, () => true)).toBeNull();
+    expect(deniedSessionCommand("Input.dispatchKeyEvent", { type: "keyDown" }, () => true)).toBeNull();
+  });
+
+  test("hub never forwards a file route to the page", async () => {
+    const forwarded: string[] = [];
+    const page: HubPage = {
+      id: 1,
+      url: () => "about:blank",
+      title: () => "",
+      attach() {},
+      detach() {},
+      send: async (method) => {
+        forwarded.push(method);
+        return {};
+      },
+    };
+    const hub = new CdpHub({
+      pages: () => [page],
+      createPage: async () => page,
+      closePage: async () => {},
+      activatePage() {},
+      isOpenableUrl: (u) => isOpenableWatchUrl(SCOPE, u),
+      version: () => ({ product: "t", userAgent: "t" }),
+    });
+    const replies = new Map<number, Record<string, unknown>>();
+    const conn = hub.connect({
+      send: (text) => {
+        const msg = JSON.parse(text) as Record<string, unknown>;
+        if (typeof msg.id === "number") replies.set(msg.id, msg);
+      },
+      close() {},
+    });
+    hub.message(conn, JSON.stringify({ id: 1, method: "Target.attachToTarget", params: { targetId: "PAGE1", flatten: true } }));
+    await sleep(0);
+    const sessionId = (replies.get(1)?.result as { sessionId: string }).sessionId;
+    FILE_ROUTES.forEach(([method, params], i) => {
+      hub.message(conn, JSON.stringify({ id: 100 + i, sessionId, method, params }));
+    });
+    await sleep(0);
+    FILE_ROUTES.forEach((_r, i) => expect(replies.get(100 + i)?.error).toBeDefined());
+    const fileMethods = new Set(FILE_ROUTES.map(([m]) => m));
+    expect(forwarded.filter((m) => fileMethods.has(m))).toEqual([]);
+    hub.closeAll();
+  });
+});

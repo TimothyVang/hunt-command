@@ -21,6 +21,7 @@ import { resolveDaemonLaunch } from "./daemon/resolve-daemon.ts";
 import { renderHtmlToPdfViaChromium } from "./export/pdf-print.ts";
 import { recordOffscreenWorkbenchAndCutFilm } from "./film/offscreen-recorder.ts";
 import { createLogger } from "./logger.ts";
+import { applyNetworkQuietSwitches } from "./network-quiet.ts";
 import { SecretVault } from "./secret-vault.ts";
 import { hardenSession, hardenWindow, TrustedRenderers } from "./security.ts";
 import { createWatchScope } from "./watch/browser-policy.ts";
@@ -29,6 +30,9 @@ import { WorkbenchService } from "./workbench-service.ts";
 
 // Must be called before app.whenReady() so every renderer & utility process runs OS-sandboxed.
 app.enableSandbox();
+// Also before ready: no mDNS responder (UDP 0.0.0.0/[::]:5353), no Cast/DIAL discovery, and no
+// non-proxied WebRTC UDP in any webContents (Watch view, main window, film and PDF windows).
+applyNetworkQuietSwitches(app);
 
 const mainDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(mainDir, "../../../..");

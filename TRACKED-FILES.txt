@@ -27,6 +27,7 @@ apps/desktop/src/main/film/cfr-editor.ts
 apps/desktop/src/main/film/offscreen-recorder.ts
 apps/desktop/src/main/index.ts
 apps/desktop/src/main/logger.ts
+apps/desktop/src/main/network-quiet.ts
 apps/desktop/src/main/secret-vault.ts
 apps/desktop/src/main/security.ts
 apps/desktop/src/main/watch/browser-policy.ts
@@ -67,6 +68,7 @@ apps/desktop/test/daemon-sidecar.test.ts
 apps/desktop/test/defang-case.test.ts
 apps/desktop/test/film-cfr-live.test.ts
 apps/desktop/test/gate-and-store.test.ts
+apps/desktop/test/network-quiet.test.ts
 apps/desktop/test/preload-sandbox.test.ts
 apps/desktop/test/renderer-bridge.test.ts
 apps/desktop/test/report-exporter.test.ts

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import ts from "typescript";
 
@@ -74,11 +75,70 @@ describe("sandboxed preload", () => {
     expect(graph.files).toEqual(["src/preload/index.ts", "src/shared/ipc-channels.ts"]);
   });
 
-  test("built preload (when present) requires only electron", () => {
-    const built = path.join(desktopDir, "out/preload/index.cjs");
-    if (!fs.existsSync(built)) return;
-    const code = fs.readFileSync(built, "utf8");
-    const required = [...code.matchAll(/\brequire\(\s*["']([^"']+)["']\s*\)/g)].map((m) => m[1]);
-    expect([...new Set(required)]).toEqual(["electron"]);
+});
+
+/** Sources the built preload is produced from: everything under src/preload plus the channel module. */
+function preloadSourceFiles(): string[] {
+  const files: string[] = [path.join(desktopDir, "src/shared/ipc-channels.ts")];
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else files.push(full);
+    }
+  };
+  walk(path.join(desktopDir, "src/preload"));
+  return files;
+}
+
+export type BuiltArtifactStatus = "absent" | "stale" | "fresh";
+
+/** `stale` when the built file is older than any source it is built from. */
+export function builtArtifactStatus(builtPath: string, sources: readonly string[]): BuiltArtifactStatus {
+  if (!fs.existsSync(builtPath)) return "absent";
+  const builtMs = fs.statSync(builtPath).mtimeMs;
+  const newestSourceMs = Math.max(...sources.map((f) => fs.statSync(f).mtimeMs));
+  return builtMs < newestSourceMs ? "stale" : "fresh";
+}
+
+const BUILT_PRELOAD = path.join(desktopDir, "out/preload/index.cjs");
+const builtStatus = builtArtifactStatus(BUILT_PRELOAD, preloadSourceFiles());
+const SKIP_REASON =
+  builtStatus === "stale"
+    ? "stale build, run bun run --cwd apps/desktop build"
+    : "no build, run bun run --cwd apps/desktop build";
+if (builtStatus !== "fresh") {
+  console.warn(`[preload-sandbox] built-preload assertion skipped: ${SKIP_REASON} (out/preload/index.cjs is ${builtStatus})`);
+}
+
+describe("built preload artifact", () => {
+  test.skipIf(builtStatus !== "fresh")(
+    builtStatus === "fresh"
+      ? "out/preload/index.cjs requires only electron"
+      : `out/preload/index.cjs requires only electron [skipped: ${SKIP_REASON}]`,
+    () => {
+      const code = fs.readFileSync(BUILT_PRELOAD, "utf8");
+      const required = [...code.matchAll(/\brequire\(\s*["']([^"']+)["']\s*\)/g)].map((m) => m[1]);
+      expect([...new Set(required)]).toEqual(["electron"]);
+    },
+  );
+
+  test("staleness detection: older-than-source is stale, rebuilt is fresh, missing is absent", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hc-stale-"));
+    try {
+      const src = path.join(dir, "index.ts");
+      const built = path.join(dir, "index.cjs");
+      expect(builtArtifactStatus(built, [src])).toBe("absent");
+      fs.writeFileSync(src, "x");
+      fs.writeFileSync(built, "y");
+      const t = Date.now() / 1000;
+      fs.utimesSync(built, t - 100, t - 100);
+      fs.utimesSync(src, t, t);
+      expect(builtArtifactStatus(built, [src])).toBe("stale");
+      fs.utimesSync(built, t + 1, t + 1);
+      expect(builtArtifactStatus(built, [src])).toBe("fresh");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
