@@ -26,12 +26,16 @@ const B0 = PY_WORD_START;
 const B1 = PY_WORD_END;
 
 const EVENT_ID_SOURCE = `${PY_WORD_START}evt-${PY_DIGIT}{6,}${PY_WORD_END}`;
-const FRAME_ID_SOURCE = `${PY_WORD_START}frame-(${PY_DIGIT}+)${PY_WORD_END}`;
+// Python compiles this one with re.IGNORECASE, which folds the literal only;
+// its word boundary still sees U+0345 (a mark) as a non-word character. A JS `/iu` flag
+// would also case-fold the boundary class (U+0345 folds to a Greek letter), so
+// the literal spells out its case variants and the pattern runs without `i`.
+const FRAME_ID_SOURCE = `${PY_WORD_START}[fF][rR][aA][mM][eE]-(${PY_DIGIT}+)${PY_WORD_END}`;
 const INTEL_ID_SOURCE = `${PY_WORD_START}ioc-${PY_DIGIT}{5,}${PY_WORD_END}`;
 
 /** Fresh global matchers for the citation patterns (the sources need `PY_RE_FLAGS`). */
 export const eventIdMatcher = (): RegExp => new RegExp(EVENT_ID_SOURCE, `g${PY_RE_FLAGS}`);
-export const frameIdMatcher = (): RegExp => new RegExp(FRAME_ID_SOURCE, `gi${PY_RE_FLAGS}`);
+export const frameIdMatcher = (): RegExp => new RegExp(FRAME_ID_SOURCE, `g${PY_RE_FLAGS}`);
 export const intelIdMatcher = (): RegExp => new RegExp(INTEL_ID_SOURCE, `g${PY_RE_FLAGS}`);
 
 export const EVENT_ID_EXACT_RE = /^evt-\d{6,}$/;
@@ -708,26 +712,6 @@ function setIntersects(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean 
   return false;
 }
 
-/**
- * Deduplicate `evidence_intel_groups` per fact so an `ioc-*` record ID only
- * credits the first evidence group of a fact that lists it (HUNT-BOTS.md:54).
- */
-function deduplicateIntelGroups(
-  intelGroups: ReadonlyArray<readonly string[]>,
-): string[][] {
-  const seen = new Set<string>();
-  return intelGroups.map((group) => {
-    const filtered: string[] = [];
-    for (const id of group) {
-      if (!seen.has(id)) {
-        seen.add(id);
-        filtered.push(id);
-      }
-    }
-    return filtered;
-  });
-}
-
 export function scoreReport(truth: unknown, report: unknown): ScoreReportResult {
   validateTruth(truth);
   if (!isPlainRecord(report) || !Array.isArray(report.claims)) {
@@ -783,26 +767,18 @@ export function scoreReport(truth: unknown, report: unknown): ScoreReportResult 
     const groups = fact.evidence_event_groups;
 
     const alternatives = ALTERNATIVE_GROUPS.filter(([key]) => key in fact);
-    const normalizedAltGroups = new Map<string, ReadonlyArray<readonly string[]>>();
+    // The reference (`scenario.py` score_report) unions the truth's alternative
+    // groups into each event group verbatim: an id listed in two groups credits
+    // both, and truth spellings are not normalised.
+    const altGroups = new Map<string, ReadonlyArray<readonly string[]>>();
     for (const [key] of alternatives) {
-      const rawAlt = fact[key] as ReadonlyArray<readonly string[]>;
-      normalizedAltGroups.set(
-        key,
-        key === "evidence_intel_groups"
-          ? deduplicateIntelGroups(rawAlt)
-          : rawAlt.map((grp) =>
-              grp.map((item) => {
-                const fm = FRAME_ID_EXACT_RE.exec(item);
-                return fm && fm[1] !== undefined ? normalizeFrameCitation(fm[1]) : item;
-              }),
-            ),
-      );
+      altGroups.set(key, fact[key] as ReadonlyArray<readonly string[]>);
     }
 
     const accepted: Set<string>[] = groups.map((group, index) => {
       const groupSet = new Set<string>(group);
       for (const [key] of alternatives) {
-        const altForGroup = normalizedAltGroups.get(key)?.[index] ?? [];
+        const altForGroup = altGroups.get(key)?.[index] ?? [];
         for (const item of altForGroup) {
           groupSet.add(item);
         }
@@ -843,7 +819,7 @@ export function scoreReport(truth: unknown, report: unknown): ScoreReportResult 
 
     for (const [key, label] of alternatives) {
       const altPool = new Set<string>();
-      for (const grp of normalizedAltGroups.get(key) ?? []) {
+      for (const grp of altGroups.get(key) ?? []) {
         for (const item of grp) {
           altPool.add(item);
         }
