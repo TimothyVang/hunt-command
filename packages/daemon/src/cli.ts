@@ -101,16 +101,48 @@ function parseCliFlags(args: readonly string[]): Record<string, string | boolean
   return flags;
 }
 
+export interface HuntCliIo {
+  writeStdout: (text: string) => void;
+  writeStderr: (text: string) => void;
+}
+
+/** One stderr line for a refused or failed command; the stack only with `HUNT_DEBUG=1`. */
+export function formatCliError(err: unknown): string {
+  if (!(err instanceof Error)) {
+    return `hunt: ${String(err)}`;
+  }
+  const code = (err as { code?: unknown; errorCode?: unknown }).errorCode ?? (err as { code?: unknown }).code;
+  const firstLine = err.message.split(/\r?\n/, 1)[0] ?? "";
+  return `hunt: ${typeof code === "string" ? `${code}: ` : ""}${firstLine}`;
+}
+
+/**
+ * CLI entry point. Every refusal (unknown hunt, runtime dir inside a Git tree, rejected gate
+ * decision, ...) is reported as one stderr line and a non-zero exit code, never a stack trace.
+ */
 export async function runHuntCli(
   argv: readonly string[],
-  io: {
-    writeStdout: (text: string) => void;
-    writeStderr: (text: string) => void;
-  } = {
+  io: HuntCliIo = {
     writeStdout: (t) => process.stdout.write(t),
     writeStderr: (t) => process.stderr.write(t),
   },
   options: RunHuntCliOptions = {},
+): Promise<number> {
+  try {
+    return await runHuntCommand(argv, io, options);
+  } catch (err) {
+    io.writeStderr(`${formatCliError(err)}\n`);
+    if (process.env.HUNT_DEBUG === "1" && err instanceof Error && err.stack) {
+      io.writeStderr(`${err.stack}\n`);
+    }
+    return 1;
+  }
+}
+
+async function runHuntCommand(
+  argv: readonly string[],
+  io: HuntCliIo,
+  options: RunHuntCliOptions,
 ): Promise<number> {
   const subcommand = argv[0] ?? "help";
   const flags = parseCliFlags(argv.slice(1));
