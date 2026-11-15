@@ -96,7 +96,9 @@ describe("desktop renders the daemon's real citation_source_unavailable reconcil
         const [ctx] = await serve(runtimeDir, plane, rpc("g", "hunt.gateContext", { run_id: "hunt-dcsu" }));
         expect(ctx!.error).toBeUndefined();
 
-        const p = projectLiveGate(run.run_id, run.open_gate!, Object.values(run.reviewed_handoffs), ctx!.result);
+        // hunt.status types `gate` as string; the service narrows it with zod, here we assert it.
+        const openGate = { ...run.open_gate!, gate: run.open_gate!.gate as "reconcile" };
+        const p = projectLiveGate(run.run_id, openGate, Object.values(run.reviewed_handoffs), ctx!.result);
         expect(p.activeGate.contextError).toBeUndefined();
         const rc = p.activeGate.reconcileContext!;
         expect(rc.reasonCode).toBe("citation_source_unavailable");
