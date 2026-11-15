@@ -14,9 +14,21 @@ import {
   type ScenarioTruth,
 } from "../src/index.ts";
 
+/** Nearest ancestor directory that has a sibling `hermes-hunt-bots/` checkout (override: HUNT_WORKSPACE_ROOT). */
+function findWorkspaceRoot(start: string): string {
+  if (process.env.HUNT_WORKSPACE_ROOT) return process.env.HUNT_WORKSPACE_ROOT;
+  let dir = start;
+  for (;;) {
+    if (fs.existsSync(path.join(dir, "hermes-hunt-bots"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return start;
+    dir = parent;
+  }
+}
+
 const DEFAULT_REF_REPO =
   process.env.HUNT_PR4_REFERENCE_REPO ??
-  "C:/Users/newbi/Desktop/bot-framework/hermes-hunt-bots/repo";
+  path.join(findWorkspaceRoot(import.meta.dir), "hermes-hunt-bots", "repo");
 
 function loadPythonScenarioSource(): string | null {
   if (!fs.existsSync(path.join(DEFAULT_REF_REPO, ".git"))) {

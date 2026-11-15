@@ -71,7 +71,16 @@ apps/desktop/tsconfig.web.json
 bun.lock
 package.json
 packages/coach/package.json
+packages/coach/src/clean-room-coach.ts
+packages/coach/src/clean-room-worker.ts
+packages/coach/src/cost-arms.ts
 packages/coach/src/index.ts
+packages/coach/src/review-reports.ts
+packages/coach/src/scorer.ts
+packages/coach/test/clean-room-coach.test.ts
+packages/coach/test/cost-arms.test.ts
+packages/coach/test/differential-scorer.test.ts
+packages/coach/test/review-reports.test.ts
 packages/daemon/package.json
 packages/daemon/src/cli.ts
 packages/daemon/src/drive-gates.ts
