@@ -73,6 +73,7 @@ apps/desktop/test/preload-sandbox.test.ts
 apps/desktop/test/renderer-bridge.test.ts
 apps/desktop/test/report-exporter.test.ts
 apps/desktop/test/security-and-defang.test.ts
+apps/desktop/test/tokenize-linear.test.ts
 apps/desktop/test/watch-browser-policy.test.ts
 apps/desktop/test/watch-open.test.ts
 apps/desktop/tsconfig.json
