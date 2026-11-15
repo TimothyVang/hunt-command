@@ -423,7 +423,7 @@ export function checkArkimeBalancedExpression(rawExpression: string | undefined)
       } else if (ch === quote) {
         quote = null;
       }
-    } else if (ch === '"' || ch === "/") {
+    } else if (ch === '"') {
       quote = ch;
     } else if (ch === "(") {
       depth++;

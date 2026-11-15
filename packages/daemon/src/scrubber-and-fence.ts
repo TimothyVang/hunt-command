@@ -4,34 +4,14 @@ import {
   MAX_TOOL_RESULT_BYTES,
   assertReadOnlyOperation,
   assertRoleOwnsTool,
+  scrubSecretText,
+  scrubSecretValue,
   type HuntToolName,
   type ProfileId,
 } from "@hunt-command/shared";
 import type { RoleCapabilityToken } from "./ports.ts";
 
 const NONCE_HEX_RE = /^[0-9a-f]{32}$/;
-
-/**
- * Credential scrubber patterns (built with character classes so policy scanners
- * never confuse defensive regexes with literal vendor tokens).
- */
-const SECRET_REPLACEMENTS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/((?:authorization|cookie|set-cookie)\s*[:=]\s*)[^\r\n"',}]+/gi, "$1[REDACTED]"],
-  [/(\b(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]"],
-  [
-    /((?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|session[_-]?token|private[_-]?key)\s*[:=]\s*["']?)[^\s"',}&]+/gi,
-    "$1[REDACTED]",
-  ],
-  [/(https?:\/\/[^/\s:@]+:)[^@\s/]+(@)/gi, "$1[REDACTED]$2"],
-  [/\b(?:s|p|r)k-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]"],
-  [/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, "[REDACTED]"],
-  [/\bxapp-[A-Za-z0-9-]{8,}\b/g, "[REDACTED]"],
-  [/\bgh[pousr]_[A-Za-z0-9_]{8,}\b/g, "[REDACTED]"],
-  [/\bgithub_pat_[A-Za-z0-9_]{12,}\b/g, "[REDACTED]"],
-  [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED]"],
-  [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[REDACTED]"],
-  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]"],
-];
 
 // ANSI CSI & OSC escape sequences
 const ANSI_ESCAPE_RE =
@@ -49,12 +29,9 @@ const C0_C1_CONTROL_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g;
 // Any attempted literal or malformed untrusted_tool_result XML tag smuggling inside tool data
 const FENCE_TAG_SMUGGLE_RE = /<\/?\s*untrusted_tool_result[^>]*>/gi;
 
+/** Credential scrubbing is the single shared implementation in `@hunt-command/shared`. */
 export function scrubCredentials(input: string): string {
-  let current = input;
-  for (const [pattern, replacement] of SECRET_REPLACEMENTS) {
-    current = current.replace(pattern, replacement);
-  }
-  return current;
+  return scrubSecretText(input);
 }
 
 export function stripControlAndInvisibleChars(input: string): string {
@@ -173,7 +150,9 @@ export function fenceToolOutput(
     );
   }
 
-  const serialized = serializeRawToolValue(rawOutput);
+  // Scrub structurally first (credential-named keys, strings nested inside strings), then the
+  // serialized text, so JSON embedded in a string value is caught before quotes get escaped.
+  const serialized = serializeRawToolValue(scrubSecretValue(rawOutput));
   const scrubbed = scrubCredentials(serialized);
   const cleaned = stripControlAndInvisibleChars(scrubbed);
 
@@ -245,27 +224,27 @@ export function detectMutatingToolParams(params: Record<string, unknown>): boole
  * so tool execution NEVER trusts an LLM-supplied `profile` argument.
  */
 export class RoleCapabilityAuthority {
-  private readonly masterSecret: Buffer;
+  readonly #masterSecret: Buffer;
 
   constructor(masterSecret?: Buffer | string) {
     if (masterSecret === undefined) {
-      this.masterSecret = crypto.randomBytes(32);
+      this.#masterSecret = crypto.randomBytes(32);
     } else if (typeof masterSecret === "string") {
       if (Buffer.byteLength(masterSecret, "utf8") < 16) {
         throw new Error("RoleCapabilityAuthority masterSecret string must be >= 16 bytes");
       }
-      this.masterSecret = Buffer.from(masterSecret, "utf8");
+      this.#masterSecret = Buffer.from(masterSecret, "utf8");
     } else {
       if (masterSecret.byteLength < 16) {
         throw new Error("RoleCapabilityAuthority masterSecret buffer must be >= 16 bytes");
       }
-      this.masterSecret = Buffer.from(masterSecret);
+      this.#masterSecret = Buffer.from(masterSecret);
     }
   }
 
   private computeMacHex(runId: string, stepId: string, profile: ProfileId): string {
     return crypto
-      .createHmac("sha256", this.masterSecret)
+      .createHmac("sha256", this.#masterSecret)
       .update(`${runId}\0${stepId}\0${profile}`, "utf8")
       .digest("hex");
   }

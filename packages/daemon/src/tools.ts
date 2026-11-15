@@ -16,6 +16,7 @@ import {
   type HuntWave,
   type ProfileId,
 } from "@hunt-command/shared";
+import { extractDataPlaneError } from "@hunt-command/data-plane";
 import type {
   DelegateTaskContext,
   HuntDataPlanePort,
@@ -298,8 +299,8 @@ export function buildSessionCustomTools(options: BuildSessionCustomToolsOptions)
             };
           } catch (err) {
             const errorCode =
-              err instanceof DataPlaneAccessError ? err.errorCode : "tool_execution_error";
-            const statusCode = err instanceof DataPlaneAccessError ? err.statusCode : 400;
+              extractDataPlaneError(err)?.errorCode ?? "tool_execution_error";
+            const statusCode = extractDataPlaneError(err)?.statusCode ?? 400;
             const fenced = fenceToolOutput({
               ok: false,
               status: statusCode,
@@ -509,8 +510,8 @@ export function buildSessionCustomTools(options: BuildSessionCustomToolsOptions)
             };
           } catch (err) {
             const errorCode =
-              err instanceof DataPlaneAccessError ? err.errorCode : "batch_execution_error";
-            const statusCode = err instanceof DataPlaneAccessError ? err.statusCode : 400;
+              extractDataPlaneError(err)?.errorCode ?? "batch_execution_error";
+            const statusCode = extractDataPlaneError(err)?.statusCode ?? 400;
             const fenced = fenceToolOutput({
               ok: false,
               status: statusCode,

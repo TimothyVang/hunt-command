@@ -82,6 +82,7 @@ packages/coach/test/cost-arms.test.ts
 packages/coach/test/differential-scorer.test.ts
 packages/coach/test/review-reports.test.ts
 packages/daemon/package.json
+packages/daemon/src/case-data-plane.ts
 packages/daemon/src/cli.ts
 packages/daemon/src/drive-gates.ts
 packages/daemon/src/gates.ts
@@ -96,6 +97,8 @@ packages/daemon/src/slack-bridge.ts
 packages/daemon/src/state-store.ts
 packages/daemon/src/tools.ts
 packages/daemon/src/wave-engine.ts
+packages/daemon/test/case-data-plane.test.ts
+packages/daemon/test/cli-errors.test.ts
 packages/daemon/test/gates-slack-rpc.test.ts
 packages/daemon/test/omp-pool-live.test.ts
 packages/daemon/test/ontology-validator.test.ts
@@ -124,7 +127,9 @@ packages/shared/src/fields.ts
 packages/shared/src/index.ts
 packages/shared/src/prices.ts
 packages/shared/src/runtime-paths.ts
+packages/shared/src/secret-scrubber.ts
 packages/shared/test/check-gate.test.ts
+packages/shared/test/secret-scrubber.test.ts
 packages/shared/test/shared.test.ts
 packages/telemetry/package.json
 packages/telemetry/src/blob-store.ts
