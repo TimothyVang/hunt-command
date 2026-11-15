@@ -1166,6 +1166,34 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
     }
   });
 
+  test("accepts hyphenated trailing wildcards and Arkime CIDR values while refusing real leading wildcards", async () => {
+    const dp = await EmbeddedHuntDataPlane.open(caseDir, { cacheDir });
+    try {
+      const ws01 = dp.elasticSearch({ q: "host.name:WS-01" }).total;
+      expect(ws01).toBeGreaterThan(0);
+      expect(dp.elasticSearch({ q: "host.name:WS-*" }).total).toBe(ws01);
+      expect(dp.elasticSearch({ q: "host.name:DC-*" }).total).toBe(dp.elasticSearch({ q: "host.name:DC-01" }).total);
+
+      const single = dp.arkimeSessions({ expression: "ip.src == 10.20.1.5" });
+      expect(single.returned).toBeGreaterThan(0);
+      const cidr = dp.arkimeSessions({ expression: "ip.src == 10.20.1.0/24" });
+      expect(cidr.returned).toBe(single.returned);
+      expect(dp.arkimeSessions({ expression: "ip.src == 203.0.113.0/24" }).returned).toBe(0);
+
+      for (const badQ of ["*x", "host.name:*x", "-*x", "host.name:-*x", "(a OR *b)", "+?x"]) {
+        let code: string | undefined;
+        try {
+          dp.elasticSearch({ q: badQ });
+        } catch (err) {
+          code = (err as { errorCode?: string }).errorCode;
+        }
+        expect(code).toBe("leading_wildcard_not_supported");
+      }
+    } finally {
+      await dp.close();
+    }
+  });
+
   test("serves local loopback HTTP server with DNS-rebinding Host check (403), secret check (401), 405 read_only, HTML Watch views & decideWatchRequest", async () => {
     const dp = await EmbeddedHuntDataPlane.open(caseDir, { cacheDir });
     try {
