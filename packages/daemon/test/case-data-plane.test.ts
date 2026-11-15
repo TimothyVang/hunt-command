@@ -91,6 +91,69 @@ class SearchOnceRunner implements ModelRunnerPort {
 }
 
 describe("default serve data plane", () => {
+  test("case.metadata returns the resolved case metadata and propagates missing cases", async () => {
+    const runtimeDir = makeTmpDir("hunt-port-rt-");
+    const c = captureIo();
+    const code = await runHuntCli(["serve", "--runtime-dir", runtimeDir, "--cases-dir", casesDir], c.io, {
+      stdin: linesOf(
+        JSON.stringify({ jsonrpc: "2.0", id: "meta", method: "case.metadata", params: { case_id: CASE_ID } }),
+        JSON.stringify({ jsonrpc: "2.0", id: "missing", method: "case.metadata", params: { case_id: "missing-case" } }),
+      ),
+    });
+    expect(code).toBe(0);
+    const responses = c.out.join("").trim().split("\n").map((line) => JSON.parse(line));
+    expect(responses.find((r) => r.id === "meta").result).toMatchObject({
+      case_id: CASE_ID,
+      data_origin: "synthetic",
+      synthetic_only: true,
+      sources: ["events.jsonl"],
+    });
+    expect(responses.find((r) => r.id === "missing").error.error_code).toBe("not_found");
+  });
+
+  test("serve dispatches status and cancel while start is running and drains before shutdown", async () => {
+    const runtimeDir = makeTmpDir("hunt-port-rt-");
+    const running = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    class BlockingRunner extends SearchOnceRunner {
+      public override async runTurn(_request: ModelTurnRequest): Promise<StepTurnResult> {
+        running.resolve();
+        await released.promise;
+        return { status: "cancelled", reason_code: "global_stop", output_text: "" };
+      }
+    }
+    const out: string[] = [];
+    const io = {
+      writeStdout: (line: string) => {
+        out.push(line);
+        if (JSON.parse(line).id === "cancel") released.resolve();
+      },
+      writeStderr: (_line: string) => {},
+    };
+    async function* requests(): AsyncGenerator<string> {
+      yield JSON.stringify({ jsonrpc: "2.0", id: "start", method: "hunt.start", params: {
+        run_id: "hunt-concurrent", case_id: CASE_ID, scope: "Synthetic scope.",
+      } }) + "\n";
+      await running.promise;
+      yield [
+        { jsonrpc: "2.0", id: "status", method: "hunt.status", params: { run_id: "hunt-concurrent" } },
+        { jsonrpc: "2.0", id: "duplicate", method: "hunt.start", params: {
+          run_id: "hunt-concurrent", case_id: CASE_ID, scope: "Synthetic scope.",
+        } },
+        { jsonrpc: "2.0", id: "cancel", method: "hunt.cancel", params: { run_id: "hunt-concurrent" } },
+      ].map((request) => JSON.stringify(request)).join("\n") + "\n";
+    }
+    expect(await runHuntCli(["serve", "--runtime-dir", runtimeDir, "--cases-dir", casesDir], io, {
+      modelRunner: new BlockingRunner(),
+      stdin: requests(),
+    })).toBe(0);
+    const responses = out.map((line) => JSON.parse(line));
+    expect(responses.find((r) => r.id === "status").result.status).toBe("running");
+    expect(responses.find((r) => r.id === "cancel").result.status).toBe("cancelled");
+    expect(responses.find((r) => r.id === "duplicate").error.message).toContain("already exists");
+    expect(responses.find((r) => r.id === "start").result.status).toBe("cancelled");
+  });
+
   test("serve with no injected factory resolves <cases-dir>/<caseId> and runs hunt.start against it", async () => {
     const runtimeDir = makeTmpDir("hunt-port-rt-");
     const runner = new SearchOnceRunner();

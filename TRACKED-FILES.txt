@@ -44,12 +44,14 @@ apps/desktop/src/renderer/src/components/DefangedPill.tsx
 apps/desktop/src/renderer/src/components/SafeForensicText.tsx
 apps/desktop/src/renderer/src/env.d.ts
 apps/desktop/src/renderer/src/lib/bridge.ts
+apps/desktop/src/renderer/src/lib/run-actions.ts
 apps/desktop/src/renderer/src/lib/watch-open.ts
 apps/desktop/src/renderer/src/main.tsx
 apps/desktop/src/renderer/src/panes/AttackGraphLineagePane.tsx
 apps/desktop/src/renderer/src/panes/AuthorityGateCard.tsx
 apps/desktop/src/renderer/src/panes/ClaimsAndGatesPane.tsx
 apps/desktop/src/renderer/src/panes/FlightRecorderHeader.tsx
+apps/desktop/src/renderer/src/panes/RunControls.tsx
 apps/desktop/src/renderer/src/panes/TimelineDissectorPane.tsx
 apps/desktop/src/renderer/src/state/workbench-store.ts
 apps/desktop/src/renderer/src/styles.css
@@ -67,6 +69,7 @@ apps/desktop/test/daemon-sidecar.test.ts
 apps/desktop/test/defang-case.test.ts
 apps/desktop/test/film-cfr-live.test.ts
 apps/desktop/test/gate-and-store.test.ts
+apps/desktop/test/live-run-controls.test.tsx
 apps/desktop/test/preload-sandbox.test.ts
 apps/desktop/test/renderer-bridge.test.ts
 apps/desktop/test/report-exporter.test.ts

@@ -3,13 +3,16 @@ import type {
   DaemonEventBatchPayload,
   FilmExportResult,
   ReportExportResult,
+  StartRunInput,
 } from "../../shared/ipc.ts";
 import type { WatchBrowserState, WorkbenchSnapshot } from "../../shared/workbench-types.ts";
+import { listRuns, selectRun, startRun } from "./lib/run-actions.ts";
 import { invokeDesktop, subscribeDesktopEvent } from "./lib/bridge.ts";
 import { scopeWatchSnapshot } from "./lib/watch-open.ts";
 import { AttackGraphLineagePane } from "./panes/AttackGraphLineagePane.tsx";
 import { ClaimsAndGatesPane } from "./panes/ClaimsAndGatesPane.tsx";
 import { FlightRecorderHeader } from "./panes/FlightRecorderHeader.tsx";
+import { RunControls, type RunOption } from "./panes/RunControls.tsx";
 import { TimelineDissectorPane } from "./panes/TimelineDissectorPane.tsx";
 import { type WorkbenchConnection, workbenchStore } from "./state/workbench-store.ts";
 
@@ -44,6 +47,9 @@ export function App() {
   const selectedHunt = useRef<string | null>(null);
   const selectionVersion = useRef(0);
   const [switchingHunt, setSwitchingHunt] = useState(false);
+  const [runs, setRuns] = useState<RunOption[]>([]);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
   const watchEvents = useRef(new Map<string, { version: number; state: WatchBrowserState }>());
   const watchVersion = useRef(0);
 
@@ -55,12 +61,24 @@ export function App() {
     ));
   };
 
+  const refreshRuns = (preserveError = false) => {
+    void listRuns().then((res) => {
+      if (res.ok && res.data) {
+        setRuns(res.data);
+        if (!preserveError) setRunError(null);
+      } else if (!preserveError) {
+        setRunError(res.error?.message ?? "Could not list hunts.");
+      }
+    });
+  };
+
   const isFilmMode = useMemo(() => {
     if (typeof window === "undefined") return false;
     return new URLSearchParams(window.location.search).get("film") === "1";
   }, []);
 
   useEffect(() => {
+    refreshRuns();
     const initialHuntId =
       typeof window !== "undefined"
         ? new URLSearchParams(window.location.search).get("huntId") ?? undefined
@@ -120,20 +138,42 @@ export function App() {
     const selection = ++selectionVersion.current;
     selectedHunt.current = huntId;
     setSwitchingHunt(true);
-    void invokeDesktop("watch:setBounds", { runId: ui.workbench.huntId, bounds: null });
+    if (ui.connection.kind === "ready") {
+      void invokeDesktop("watch:setBounds", { runId: ui.workbench.huntId, bounds: null });
+    }
     const requestVersion = watchVersion.current;
-    void invokeDesktop<WorkbenchSnapshot>("hunt:getWorkbenchState", { huntId }).then((res) => {
+    void selectRun(huntId).then((res) => {
       if (selection !== selectionVersion.current) return;
       setSwitchingHunt(false);
       if (res.ok && res.data && selectedHunt.current === huntId) {
         applySnapshot(res.data, requestVersion);
+        setRunError(null);
         workbenchStore.setStatusBanner(null);
       } else {
-        selectedHunt.current = workbenchStore.getState().workbench.huntId;
-        workbenchStore.setStatusBanner({
-          kind: "error",
-          message: res.error?.message ?? "Could not switch hunts.",
-        });
+        selectedHunt.current = ui.connection.kind === "ready" ? workbenchStore.getState().workbench.huntId : null;
+        setRunError(res.error?.message ?? "Could not switch hunts.");
+      }
+    });
+  };
+
+  const handleStartRun = (input: StartRunInput) => {
+    const selection = ++selectionVersion.current;
+    const requestVersion = watchVersion.current;
+    setStarting(true);
+    setRunError(null);
+    void startRun(input).then((res) => {
+      setStarting(false);
+      if (selection !== selectionVersion.current) return;
+      if (res.ok && res.data) {
+        if (ui.connection.kind === "ready") {
+          void invokeDesktop("watch:setBounds", { runId: ui.workbench.huntId, bounds: null });
+        }
+        selectedHunt.current = res.data.huntId;
+        applySnapshot(res.data, requestVersion);
+        refreshRuns();
+      } else {
+        setRunError(res.error?.message ?? "Could not start hunt.");
+        refreshRuns(true);
       }
     });
   };
@@ -151,11 +191,16 @@ export function App() {
           kind: "info",
           message: `Global Stop executed on ${res.data.huntId}: all in-flight bot steps halted.`,
         });
+      } else if ((!res.ok || !res.data) && selection === selectionVersion.current) {
+        workbenchStore.setStatusBanner({
+          kind: "error",
+          message: res.error?.message ?? "Global Stop failed; the hunt may still be running.",
+        });
       }
     });
   };
 
-  const handleSubmitGateDecision = (action: "approve" | "reject") => {
+  const handleSubmitGateDecision = (action: "approve" | "reject", operatorToken?: string) => {
     const gate = ui.workbench.activeGate;
     if (!gate) return;
     const draft = workbenchStore.getActiveGateDraft();
@@ -169,6 +214,7 @@ export function App() {
       operatorName: draft.operatorName,
       rbacRole: draft.rbacRole,
       checkNote: draft.checkNote,
+      ...(operatorToken ? { operatorToken } : {}),
       payloadSha256: gate.payloadSha256,
     }).then((res) => {
       if (res.ok && res.data && selection === selectionVersion.current && selectedHunt.current === res.data.huntId) {
@@ -233,12 +279,18 @@ export function App() {
     });
   };
 
+  const controls = !isFilmMode && (
+    <RunControls runs={runs} selectedHuntId={ui.connection.kind === "ready" ? ui.workbench.huntId : null}
+      busy={starting || switchingHunt} error={runError} onStart={handleStartRun}
+      onSelect={handleSwitchPresetRun} onRefresh={() => refreshRuns()} />
+  );
   if (ui.connection.kind !== "ready") {
-    return <WorkbenchUnavailable connection={ui.connection} />;
+    return <div className="flex h-screen flex-col bg-[#090d16] text-slate-100">{controls}<WorkbenchUnavailable connection={ui.connection} /></div>;
   }
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#090d16] text-slate-100">
+      {controls}
       {ui.workbench.provenanceMode === "fixture_preview" && (
         <div
           role="status"
@@ -264,7 +316,6 @@ export function App() {
             workbenchStore.selectProvenanceBadge(firstCite);
           }
         }}
-        onSwitchPresetRun={handleSwitchPresetRun}
         onGlobalStop={handleGlobalStop}
         onExportReport={handleExportReport}
         onRecordFilm={handleRecordFilm}

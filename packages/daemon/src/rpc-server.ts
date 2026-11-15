@@ -1,5 +1,6 @@
 import { StringDecoder } from "node:string_decoder";
 import {
+  CaseMetadataSchema,
   RpcEventNotificationSchema,
   RpcRequestSchema,
   RpcResponseSchema,
@@ -130,9 +131,9 @@ export class HuntDaemonRpcServer {
       return;
     }
 
-    for (const line of lines) {
-      await this.handleLine(line);
-    }
+    const results = await Promise.allSettled(lines.map((line) => this.handleLine(line)));
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
   }
 
   public async handleLine(line: string): Promise<RpcResponse> {
@@ -197,6 +198,22 @@ export class HuntDaemonRpcServer {
               max_concurrent_hunts: this.engine.maxConcurrentHunts,
             },
           };
+        }
+
+        case "case.metadata": {
+          const caseId = typeof params.case_id === "string" ? params.case_id : "";
+          if (!caseId) {
+            throw new Error("case.metadata requires non-empty 'case_id'");
+          }
+          if (!this.resolveDataPlane) {
+            throw new Error("No resolveDataPlane factory configured on HuntDaemonRpcServer");
+          }
+          const dataPlane = await this.resolveDataPlane(caseId);
+          const metadata = CaseMetadataSchema.parse(dataPlane.caseMetadata);
+          if (metadata.case_id !== caseId) {
+            throw new Error(`Resolved case '${metadata.case_id}' does not match requested case '${caseId}'`);
+          }
+          return { jsonrpc: "2.0", id: req.id, result: metadata };
         }
 
         case "hunt.start": {

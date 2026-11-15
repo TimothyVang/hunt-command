@@ -112,6 +112,7 @@ export interface ActiveGatePrompt {
   openedAtIso: string;
   expiresAtIso: string;
   payloadSha256: string;
+  scopeText?: string;
   scopeSummary?: {
     hostsInScope: string[];
     allowedRoleTools: Record<ProfileId, readonly HuntToolName[]>;

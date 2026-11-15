@@ -45,6 +45,16 @@ export function isFixturePreviewRequested(): boolean {
 }
 
 function previewFixture<T>(channel: InvokeChannel, payload?: unknown): IpcResult<T> | null {
+  if (channel === "hunt:listRuns") {
+    return {
+      ok: true,
+      data: [
+        { huntId: "hunt-20261115-nv01", caseId: "nv01", runStatus: "awaiting_human_gate" },
+        { huntId: "hunt-20261115-scope-work", caseId: "nv01", runStatus: "awaiting_human_gate" },
+        { huntId: "hunt-20261115-reconcile", caseId: "nv01", runStatus: "awaiting_human_gate" },
+      ] as unknown as T,
+    };
+  }
   if (channel === "hunt:getWorkbenchState") {
     const huntId =
       typeof payload === "object" && payload !== null && "huntId" in payload

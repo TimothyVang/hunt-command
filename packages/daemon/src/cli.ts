@@ -357,10 +357,21 @@ async function serveDaemon(
       writeLine: (line) => io.writeStdout(line),
     });
     const unsub = ctx.telemetry.subscribe((ev) => rpc.emitTelemetryEvent(ev));
+    const pending = new Set<Promise<void>>();
+    let dispatchError: unknown;
     try {
-      for await (const chunk of options.stdin ?? process.stdin) {
-        await rpc.handleChunk(chunk as Buffer);
+      try {
+        for await (const chunk of options.stdin ?? process.stdin) {
+          const task = rpc.handleChunk(chunk as Buffer).catch((err: unknown) => {
+            dispatchError ??= err;
+          });
+          pending.add(task);
+          void task.then(() => pending.delete(task));
+        }
+      } finally {
+        await Promise.all(pending);
       }
+      if (dispatchError) throw dispatchError;
     } finally {
       unsub();
       ctx.stateStore.close();

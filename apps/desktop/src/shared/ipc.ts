@@ -54,6 +54,7 @@ export const SubmitGateDecisionInputSchema = z
       .max(1000, '"What did you check?" note cannot exceed 1000 chars')
       .refine((s) => s.trim().length >= 1, '"What did you check?" note cannot be blank'),
     payloadSha256: z.string().regex(/^[a-f0-9]{64}$/i, "Expected 64-hex SHA-256 payload digest"),
+    operatorToken: z.string().min(1).max(8192).optional(),
   })
   .strict();
 

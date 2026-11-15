@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { AlertOctagon, CheckCircle2, FileCheck2, Lock, ShieldAlert, XCircle } from "lucide-react";
 import {
   formatRealDataOriginText,
@@ -6,26 +7,34 @@ import {
   type CaseMetadata,
 } from "@hunt-command/shared";
 import { validateGateSubmission } from "../../../shared/gate-validation.ts";
+import { SafeForensicText } from "../components/SafeForensicText.tsx";
 import type { ActiveGatePrompt } from "../../../shared/workbench-types.ts";
 import type { GateDraftFields } from "../state/workbench-store.ts";
 
 export interface AuthorityGateCardProps {
   activeGate: ActiveGatePrompt;
   caseMetadata: CaseMetadata;
+  requiresToken: boolean;
   draft: GateDraftFields;
   onUpdateDraft: (patch: Partial<GateDraftFields>) => void;
-  onSubmitDecision: (action: "approve" | "reject") => void;
+  onSubmitDecision: (action: "approve" | "reject", operatorToken?: string) => void;
   onSelectCitation: (citationId: string) => void;
 }
 
 export function AuthorityGateCard({
   activeGate,
   caseMetadata,
+  requiresToken,
   draft,
   onUpdateDraft,
   onSubmitDecision,
   onSelectCitation,
 }: AuthorityGateCardProps) {
+  const [operatorToken, setOperatorToken] = useState("");
+  const submit = (action: "approve" | "reject") => {
+    onSubmitDecision(action, requiresToken ? operatorToken : undefined);
+    setOperatorToken("");
+  };
   const approveValidation = validateGateSubmission(activeGate, {
     operatorName: draft.operatorName,
     rbacRole: draft.rbacRole,
@@ -94,6 +103,13 @@ export function AuthorityGateCard({
             <code className="font-mono">hunt_id + status</code> only; offscreen film export is blocked
             unless explicit local operator watermark override is enabled.
           </p>
+        </div>
+      )}
+
+      {activeGate.gate === "scope" && activeGate.scopeText && (
+        <div className="rounded border border-slate-800 bg-slate-950/80 p-2 text-xs">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">Hunt scope</div>
+          <SafeForensicText text={activeGate.scopeText} className="whitespace-pre-wrap break-words text-slate-100" />
         </div>
       )}
 
@@ -286,6 +302,15 @@ export function AuthorityGateCard({
         </label>
       </div>
 
+      {requiresToken && (
+        <label className="block space-y-1 text-xs">
+          <span className="text-slate-300">Signed operator token</span>
+          <input type="password" autoComplete="off" value={operatorToken}
+            onChange={(e) => setOperatorToken(e.target.value)}
+            className="w-full rounded border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-slate-100 focus:border-cyan-500 focus:outline-none" />
+        </label>
+      )}
+
       <label className="block space-y-1">
         <div className="flex items-center justify-between text-[11px]">
           <span className="font-semibold text-slate-200">
@@ -318,8 +343,8 @@ export function AuthorityGateCard({
         <button
           type="button"
           data-testid="gate-reject-button"
-          disabled={!rejectValidation.valid}
-          onClick={() => onSubmitDecision("reject")}
+          disabled={!rejectValidation.valid || (requiresToken && !operatorToken.trim())}
+          onClick={() => submit("reject")}
           className="inline-flex items-center gap-1.5 rounded border border-rose-500/70 bg-rose-950/70 px-3 py-1.5 text-xs font-semibold text-rose-100 hover:bg-rose-900 disabled:opacity-40 cursor-pointer"
         >
           <XCircle className="h-3.5 w-3.5" />
@@ -328,8 +353,8 @@ export function AuthorityGateCard({
         <button
           type="button"
           data-testid="gate-approve-button"
-          disabled={!approveValidation.valid}
-          onClick={() => onSubmitDecision("approve")}
+          disabled={!approveValidation.valid || (requiresToken && !operatorToken.trim())}
+          onClick={() => submit("approve")}
           className="inline-flex items-center gap-1.5 rounded border border-emerald-400/70 bg-emerald-700 px-3.5 py-1.5 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-40 cursor-pointer"
         >
           <CheckCircle2 className="h-3.5 w-3.5" />

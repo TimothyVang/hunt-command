@@ -26,7 +26,7 @@ export interface ClaimsAndGatesPaneProps {
   onSelectCitation: (citationId: string) => void;
   onSelectStep: (stepId: string) => void;
   onUpdateGateDraft: (patch: Partial<GateDraftFields>) => void;
-  onSubmitGateDecision: (action: "approve" | "reject") => void;
+  onSubmitGateDecision: (action: "approve" | "reject", operatorToken?: string) => void;
 }
 
 const CLAIM_KIND_BADGE: Record<ClaimKind, string> = {
@@ -225,6 +225,8 @@ export function ClaimsAndGatesPane({
           <>
             {workbench.activeGate ? (
               <AuthorityGateCard
+                key={`${workbench.activeGate.huntId}:${workbench.activeGate.gate}:${workbench.activeGate.payloadSha256}`}
+                requiresToken={workbench.provenanceMode === "live_daemon"}
                 activeGate={workbench.activeGate}
                 caseMetadata={workbench.caseMetadata}
                 draft={gateDraft}

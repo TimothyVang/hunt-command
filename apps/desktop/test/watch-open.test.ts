@@ -171,55 +171,128 @@ function makeService(isLiveReady: boolean, request: (method: string, params: unk
   });
 }
 
-describe("WorkbenchService startRun", () => {
-  test("an older workbench response cannot switch the active hunt back", async () => {
-    const firstResponse = Promise.withResolvers<unknown>();
-    const first = buildFixtureWorkbenchSnapshot({ huntId: "hunt-20261115-nv01" });
-    const second = buildFixtureWorkbenchSnapshot({ huntId: "hunt-20261115-scope-work" });
-    let calls = 0;
-    const service = makeService(true, async () => {
-      calls++;
-      if (calls === 1) return await firstResponse.promise;
-      if (calls === 2) return second;
-      throw new Error("unavailable");
-    });
-    const older = service.getWorkbenchState({ huntId: first.huntId });
-    await service.getWorkbenchState({ huntId: second.huntId });
-    firstResponse.resolve(first);
-    await older;
-    expect((await service.getWorkbenchState()).huntId).toBe(second.huntId);
+describe("WorkbenchService live runs", () => {
+  const metadata = {
+    case_id: input.caseId, title: "Actual case", data_origin: "synthetic", synthetic_only: true,
+    time_window: { start_iso: "2026-01-01T00:00:00Z", end_iso: "2026-01-02T00:00:00Z" }, sources: [],
+  };
+  const run = (runId: string) => ({
+    run_id: runId, case_id: input.caseId, data_origin: "synthetic", synthetic_only: true,
+    wave: "scope", wave_index: 0, status: "awaiting_gate", reason_code: null,
+    step_states: {}, results: {}, reviewed_handoffs: {}, decisions: [],
+    token_ledger: { max_total_tokens: 100_000, consumed_total_tokens: 300, rejections_tokens: 0,
+      actual_billed_usd: 0, shadow_api_usd: 0, cache_savings_usd: 0 },
+    open_gate: { gate: "scope", payload_sha256: "a".repeat(64),
+      opened_at: "2026-01-01T00:00:00Z", expires_at: "2099-01-01T00:00:00Z" },
+    citation_receipt: null, snapshot: null,
+    config: { scopeText: input.scope, followUps: input.followUps, maxTotalTokens: input.maxTotalTokens },
   });
 
-  test("sends the daemon start contract and returns a live run acknowledgement", async () => {
+  test("returns real metadata and empty evidence, and refreshes status", async () => {
+    let id = "";
+    const calls: string[] = [];
+    const service = makeService(true, async (method, params) => {
+      calls.push(method);
+      if (method === "hunt.start") {
+        id = (params as { run_id: string }).run_id;
+        return run(id);
+      }
+      if (method === "case.metadata") return metadata;
+      if (method === "hunt.status") return run(id);
+      if (method === "hunt.list") return { runs: [run(id)] };
+      throw new Error(method);
+    });
+    const snapshot = await service.startRun(input);
+    expect(snapshot).toMatchObject({ huntId: id, provenanceMode: "live_daemon", caseMetadata: metadata,
+      runStatus: "awaiting_human_gate", activeGate: { payloadSha256: "a".repeat(64) },
+      events: [], handoffs: [], claims: [], snapshot: { entities: [], relations: [] } });
+    expect((await service.getWorkbenchState({ huntId: id })).huntId).toBe(id);
+    expect((await service.listRuns()).some((item) => item.huntId === id && item.title === metadata.title)).toBe(true);
+    expect(calls.filter((call) => call === "hunt.start")).toHaveLength(1);
+  });
+
+  test("recovers a timed out start using the same ID without another start", async () => {
+    let id = "";
+    const calls: string[] = [];
+    const service = makeService(true, async (method, params) => {
+      calls.push(method);
+      if (method === "hunt.start") {
+        id = (params as { run_id: string }).run_id;
+        throw new Error("RPC request 'hunt.start' timed out");
+      }
+      if (method === "hunt.status") {
+        expect(params).toEqual({ run_id: id });
+        return run(id);
+      }
+      return metadata;
+    });
+    expect((await service.startRun(input)).huntId).toBe(id);
+    expect(calls).toEqual(["case.metadata", "hunt.start", "hunt.status", "case.metadata"]);
+  });
+
+  test("reports an indeterminate start with its ID when recovery cannot yet find it", async () => {
+    let id = "";
+    const service = makeService(true, async (method, params) => {
+      if (method === "case.metadata") return metadata;
+      if (method === "hunt.start") {
+        id = (params as { run_id: string }).run_id;
+        throw new Error("timed out");
+      }
+      throw new Error("hunt_not_found");
+    });
+    let message = "";
+    try { await service.startRun(input); } catch (error) { message = String(error); }
+    expect(message).toContain("Start outcome is unknown");
+    expect(id).toBeTruthy();
+    expect(message).toContain(id);
+  });
+
+  test("forwards authenticated gate decisions and cancel, propagating failures", async () => {
+    let id = "";
+    let fail = false;
     const calls: Array<{ method: string; params: unknown }> = [];
     const service = makeService(true, async (method, params) => {
       calls.push({ method, params });
-      return {
-        run_id: "hunt-live-001", case_id: "case-001", data_origin: "synthetic",
-        synthetic_only: true, wave: "scope", wave_index: 0, status: "awaiting_gate",
-        reason_code: null, step_states: {}, results: {}, handoff_rejections: [],
-        reviewed_handoffs: {}, delegated_ledger: [], open_gate: { gate: "scope" },
-        decisions: [], token_ledger: { max_total_tokens: 100_000, consumed_total_tokens: 300 },
-        citation_receipt: null, snapshot: null,
-        config: { scopeText: input.scope, followUps: 2, maxTotalTokens: 100_000 },
-        created_at: "2026-11-15T00:00:00.000Z", updated_at: "2026-11-15T00:00:01.000Z",
-      };
+      if (method === "hunt.start") { id = (params as { run_id: string }).run_id; return run(id); }
+      if (method === "case.metadata") return metadata;
+      if (method === "hunt.status") return run(id);
+      if (fail) throw new Error("daemon denied");
+      return run(id);
     });
-
-    expect(await service.startRun(input)).toEqual({
-      provenanceMode: "live_daemon", huntId: "hunt-live-001", runStatus: "awaiting_human_gate",
+    await service.startRun(input);
+    const decision = { huntId: id, gate: "scope", action: "approve", operatorName: "self asserted",
+      rbacRole: "lead_hunter", checkNote: "Checked scope", payloadSha256: "a".repeat(64), operatorToken: "signed-token" };
+    await service.submitGateDecision(decision);
+    expect(calls.find((call) => call.method === "hunt.decideGate")?.params).toEqual({
+      hunt_id: id, gate: "scope", action: "approve", via: "desktop", operator_token: "signed-token",
+      payload_sha256: "a".repeat(64), check_note: "Checked scope",
     });
-    expect(calls).toEqual([{ method: "hunt.start", params: {
-      case_id: input.caseId, scope: input.scope, follow_ups: 2, max_total_tokens: 100_000,
-    } }]);
-    await expect(service.getWorkbenchState({ huntId: "hunt-live-001" })).rejects.toThrow("Live workbench state is not available");
+    await service.globalStop({ huntId: id, reason: "stop" });
+    expect(calls.find((call) => call.method === "hunt.cancel")?.params).toEqual({ run_id: id, reason: "stop" });
+    fail = true;
+    await expect(service.submitGateDecision(decision)).rejects.toThrow("daemon denied");
+    await expect(service.globalStop({ huntId: id, reason: "stop" })).rejects.toThrow("daemon denied");
+    await expect(service.submitGateDecision({ ...decision, operatorToken: "" })).rejects.toThrow();
   });
 
-  test("propagates live RPC failures and rejects malformed responses rather than using a fixture", async () => {
-    const failed = makeService(true, async () => { throw new Error("case not found"); });
+  test("propagates live failures and rejects malformed responses", async () => {
+    const failed = makeService(true, async (method) => {
+      if (method === "case.metadata") return metadata;
+      throw new Error("case not found");
+    });
     await expect(failed.startRun(input)).rejects.toThrow("case not found");
     const malformed = makeService(true, async () => ({ huntId: "fixture-like" }));
     await expect(malformed.startRun(input)).rejects.toThrow();
+  });
+
+  test("rejects a data origin that does not match the actual case before starting", async () => {
+    const calls: string[] = [];
+    const service = makeService(true, async (method) => {
+      calls.push(method);
+      return metadata;
+    });
+    await expect(service.startRun({ ...input, dataOrigin: "work-export" })).rejects.toThrow("data origin");
+    expect(calls).toEqual(["case.metadata"]);
   });
 
   test("requires an operator scope and keeps explicit standby fixture behavior", async () => {
