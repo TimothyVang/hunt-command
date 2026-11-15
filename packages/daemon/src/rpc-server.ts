@@ -13,7 +13,7 @@ import { extractDataPlaneError } from "@hunt-command/data-plane";
 import { executeDriveGates, type DriveGatesCommandInput } from "./drive-gates.ts";
 import { GateDecisionError } from "./gates.ts";
 import type { DaemonTelemetryEvent, HuntDataPlanePort } from "./ports.ts";
-import { GateContextError, buildGateContext } from "./gate-context.ts";
+import { GateContextError, buildGateContext, buildRunEvidence } from "./gate-context.ts";
 import {
   TRANSCRIPT_PAGE_DEFAULT_BYTES,
   TRANSCRIPT_PAGE_MAX_BYTES,
@@ -318,6 +318,21 @@ export class HuntDaemonRpcServer {
               throw new RpcRequestError(err.errorCode === "no_open_gate" ? -32009 : -32010, err.errorCode, err.message);
             }
             throw new RpcRequestError(-32010, "gate_context_unavailable", err instanceof Error ? err.message : String(err));
+          }
+        }
+
+        case "hunt.evidence": {
+          const parsed = GateContextParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            throw new RpcRequestError(-32602, "invalid_arguments", "hunt.evidence requires exactly { run_id: string }");
+          }
+          const run = this.engine.stateStore.getRun(parsed.data.run_id);
+          if (!run) throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${parsed.data.run_id}'`);
+          try {
+            const evidence = await buildRunEvidence({ run, resolveDataPlane: this.resolveDataPlane });
+            return { jsonrpc: "2.0", id: req.id, result: evidence };
+          } catch (err) {
+            throw new RpcRequestError(-32010, "evidence_unavailable", err instanceof Error ? err.message : String(err));
           }
         }
 

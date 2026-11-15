@@ -208,6 +208,41 @@ function unavailable(run: PersistedHuntRun, what: string, err?: unknown): GateCo
   return new GateContextError("gate_context_unavailable", `${what} for hunt '${run.run_id}' is unavailable${why}`);
 }
 
+/** Reloadable, case-bound evidence for the incident and reviewed handoffs of a run. */
+export async function buildRunEvidence(params: {
+  readonly run: PersistedHuntRun;
+  readonly resolveDataPlane?: Resolver;
+}): Promise<{
+  run_id: string;
+  case_id: string;
+  citation_receipt: CitationVerificationReceipt;
+  evidence: GateContextEvidence[];
+  evidence_truncated: boolean;
+}> {
+  const { run } = params;
+  const receipt = run.citation_receipt;
+  if (!receipt || !run.results["incident"]?.handoff) throw unavailable(run, "The incident handoff and citation receipt");
+  if (receipt.case_id !== run.case_id || receipt.source_status !== "ok") {
+    throw unavailable(run, "The incident citation verification");
+  }
+  const handoffs = [run.results["incident"].handoff, ...Object.values(run.reviewed_handoffs)];
+  const allIds = citedIds(handoffs);
+  const ids = allIds.slice(0, GATE_CONTEXT_MAX_EVIDENCE);
+  let records: CitedEvidenceRecord[];
+  try {
+    records = await readRecords(run, ids, params.resolveDataPlane);
+  } catch (err) {
+    throw unavailable(run, "Cited evidence", err);
+  }
+  return {
+    run_id: run.run_id,
+    case_id: run.case_id,
+    citation_receipt: scrubSecretValue(receipt),
+    evidence: toEvidence(ids, records, receipt),
+    evidence_truncated: allIds.length > ids.length,
+  };
+}
+
 /**
  * Read-only decision context for a run's open gate. Never mutates run or gate state; reads the
  * run's own durable state and, for incident and citation reconcile gates, its own case's records.
@@ -288,27 +323,6 @@ export async function buildGateContext(params: {
   if (gate.gate !== "incident") {
     throw new GateContextError("gate_context_unavailable", `Gate '${gate.gate}' has no decision context`);
   }
-  const receipt = run.citation_receipt;
-  if (!receipt) throw unavailable(run, "The incident citation receipt");
-  const handoffs = [
-    ...(run.results["incident"]?.handoff ? [run.results["incident"].handoff] : []),
-    ...Object.values(run.reviewed_handoffs),
-  ];
-  const allIds = citedIds(handoffs);
-  const ids = allIds.slice(0, GATE_CONTEXT_MAX_EVIDENCE);
-  let records: CitedEvidenceRecord[];
-  try {
-    records = await readRecords(run, ids, params.resolveDataPlane);
-  } catch (err) {
-    throw unavailable(run, "Cited evidence", err);
-  }
-  return {
-    ...base,
-    gate: "incident",
-    incident: {
-      citation_receipt: scrubSecretValue(receipt),
-      evidence: toEvidence(ids, records, receipt),
-      evidence_truncated: allIds.length > ids.length,
-    },
-  };
+  const { citation_receipt, evidence, evidence_truncated } = await buildRunEvidence(params);
+  return { ...base, gate: "incident", incident: { citation_receipt, evidence, evidence_truncated } };
 }

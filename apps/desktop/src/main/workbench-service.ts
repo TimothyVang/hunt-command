@@ -25,7 +25,7 @@ import {
 } from "@hunt-command/shared";
 import { buildFixtureWorkbenchSnapshot } from "../shared/fixture-workbench.ts";
 import { missingGateContextReason, validateGateSubmission } from "../shared/gate-validation.ts";
-import { projectLiveGate, projectTranscriptPage } from "./live-gate-context.ts";
+import { projectLiveEvidence, projectLiveGate, projectTranscriptPage, type LiveEvidenceProjection } from "./live-gate-context.ts";
 import {
   ExportReportInputSchema,
   FilmCutInputSchema,
@@ -693,7 +693,8 @@ export class WorkbenchService {
     const reconcileHandoff = unverified.success && unverified.data.step_id === unknownStepId &&
       unverified.data.case_id === run.case_id ? unverified.data : undefined;
     const incidentHandoff = HandoffSchema.safeParse(run.results["incident"]?.handoff);
-    if (checked.open_gate?.gate === "incident" && incidentHandoff.success && incidentHandoff.data.step_id === "incident") {
+    if ((checked.open_gate?.gate === "incident" || !checked.open_gate) && incidentHandoff.success &&
+        incidentHandoff.data.step_id === "incident" && incidentHandoff.data.case_id === run.case_id) {
       const index = handoffs.findIndex((h) => h.step_id === incidentHandoff.data.step_id);
       if (index === -1) handoffs.push(incidentHandoff.data);
       else handoffs[index] = incidentHandoff.data;
@@ -701,18 +702,7 @@ export class WorkbenchService {
     const reviews = handoffs.flatMap((handoff) => handoff.reviews);
     const waveNumber = (wave: string): 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 =>
       Math.max(1, Math.min(8, HUNT_WAVES.indexOf(wave as typeof HUNT_WAVES[number]) + 1)) as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
-    const receipt = run.citation_receipt;
-    const missingCount = receipt
-      ? receipt.missing_event_ids.length + receipt.missing_frame_ids.length + receipt.missing_ioc_ids.length + receipt.ambiguous_ids.length
-      : 0;
-    const citationReceipt = {
-      totalCited: receipt?.total_checked ?? 0,
-      verifiedCount: receipt ? Math.max(0, receipt.total_checked - missingCount - receipt.out_of_scope_ids.length) : 0,
-      unresolvedCount: missingCount,
-      outOfScopeCount: receipt?.out_of_scope_ids.length ?? 0,
-      allVerified: receipt?.verified ?? false,
-      entries: [],
-    };
+    const emptyReceipt = { totalCited: 0, verifiedCount: 0, unresolvedCount: 0, outOfScopeCount: 0, allVerified: false, entries: [] };
     let gate: ReturnType<typeof projectLiveGate> | null = null;
     if (checked.open_gate) {
       // Incident and reconcile context comes from hunt.gateContext.
@@ -728,6 +718,15 @@ export class WorkbenchService {
         rawContext = new Error("The incident handoff is unavailable or invalid.");
       }
       gate = projectLiveGate(run.run_id, checked.open_gate, handoffs, rawContext, run.config.scopeText, reconcileHandoff);
+    }
+    let evidence: LiveEvidenceProjection | null = null;
+    if (!checked.open_gate && incidentHandoff.success && incidentHandoff.data.step_id === "incident") {
+      try {
+        const rawEvidence = await this.#deps.sidecar.request("hunt.evidence", { run_id: run.run_id });
+        evidence = projectLiveEvidence(run.run_id, run.case_id, handoffs, rawEvidence);
+      } catch {
+        // A failed read must not retain stale evidence or claim verified citations.
+      }
     }
     const snapshot: WorkbenchSnapshot = {
       provenanceMode: "live_daemon",
@@ -780,7 +779,7 @@ export class WorkbenchService {
             ...ex.event_ids.map((id) => ({ id, kind: "evt" as const })),
             ...ex.frame_ids.map((id) => ({ id, kind: "frame" as const })),
             ...ex.ioc_ids.map((id) => ({ id, kind: "ioc" as const })),
-          ].map((c) => ({ ...c, status: gate?.citationStatus.get(c.id) ?? ("unresolved" as const) }));
+          ].map((c) => ({ ...c, status: gate?.citationStatus.get(c.id) ?? evidence?.citationStatus.get(c.id) ?? ("unresolved" as const) }));
         })(),
         reviews: reviews.filter((review) => review.claim_ids.includes(claim.claim_id)),
       }))),
@@ -789,9 +788,9 @@ export class WorkbenchService {
       }))),
       handoffs,
       snapshot: run.snapshot ?? { schema_version: 1, case_id: run.case_id, entities: [], relations: [] },
-      citationReceipt: gate ? gate.citationReceipt ?? { totalCited: 0, verifiedCount: 0, unresolvedCount: 0, outOfScopeCount: 0, allVerified: false, entries: [] } : citationReceipt,
+      citationReceipt: gate?.citationReceipt ?? evidence?.citationReceipt ?? emptyReceipt,
       histogram: { bucketTimestampsSec: [], ecsEventCounts: [], networkFlowCounts: [], intervalSec: 60 },
-      events: gate?.events ?? [], arkimeFlows: [], packets: [], evidenceCatalog: gate?.evidenceCatalog ?? {},
+      events: gate?.events ?? evidence?.events ?? [], arkimeFlows: [], packets: [], evidenceCatalog: gate?.evidenceCatalog ?? evidence?.evidenceCatalog ?? {},
       watchState: this.#standbyWatchState(run.run_id),
     };
     this.#liveRunIds.add(run.run_id);
