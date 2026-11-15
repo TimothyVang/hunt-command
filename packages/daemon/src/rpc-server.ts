@@ -13,6 +13,7 @@ import { extractDataPlaneError } from "@hunt-command/data-plane";
 import { executeDriveGates, type DriveGatesCommandInput } from "./drive-gates.ts";
 import { GateDecisionError } from "./gates.ts";
 import type { DaemonTelemetryEvent, HuntDataPlanePort } from "./ports.ts";
+import { GateContextError, buildGateContext } from "./gate-context.ts";
 import {
   TRANSCRIPT_PAGE_DEFAULT_BYTES,
   TRANSCRIPT_PAGE_MAX_BYTES,
@@ -35,12 +36,14 @@ export class RpcRequestError extends Error {
   }
 }
 
+const GateContextParamsSchema = z.object({ run_id: z.string().min(1).max(128) }).strict();
+
 const InspectTranscriptPageParamsSchema = z
   .object({
-    huntId: z.string().min(1).max(128),
-    stepId: z.string().min(1).max(64),
-    byteOffset: z.number().int().min(0).default(0),
-    byteLimit: z
+    run_id: z.string().min(1).max(128),
+    step_id: z.string().min(1).max(64),
+    byte_offset: z.number().int().min(0).default(0),
+    byte_limit: z
       .number()
       .int()
       .min(TRANSCRIPT_PAGE_MIN_BYTES)
@@ -293,6 +296,31 @@ export class HuntDaemonRpcServer {
           return { jsonrpc: "2.0", id: req.id, result: run };
         }
 
+        case "hunt.gateContext": {
+          // Read-only decision context for the run's open gate.
+          const parsed = GateContextParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            throw new RpcRequestError(-32602, "invalid_arguments", "hunt.gateContext requires exactly { run_id: string }");
+          }
+          const run = this.engine.stateStore.getRun(parsed.data.run_id);
+          if (!run) {
+            throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${parsed.data.run_id}'`);
+          }
+          try {
+            const context = await buildGateContext({
+              run,
+              receipts: this.engine.stateStore.listReceiptsForRun(run.run_id),
+              resolveDataPlane: this.resolveDataPlane,
+            });
+            return { jsonrpc: "2.0", id: req.id, result: context };
+          } catch (err) {
+            if (err instanceof GateContextError) {
+              throw new RpcRequestError(err.errorCode === "no_open_gate" ? -32009 : -32010, err.errorCode, err.message);
+            }
+            throw new RpcRequestError(-32010, "gate_context_unavailable", err instanceof Error ? err.message : String(err));
+          }
+        }
+
         case "hunt.inspectTranscriptPage": {
           // Read-only: reads durable state for exactly one run; never touches gates or run state.
           const parsed = InspectTranscriptPageParamsSchema.safeParse(params);
@@ -300,18 +328,18 @@ export class HuntDaemonRpcServer {
             const issue = parsed.error.issues[0];
             throw new RpcRequestError(
               -32602,
-              "invalid_params",
+              "invalid_arguments",
               `hunt.inspectTranscriptPage: ${issue?.path.join(".") || "params"}: ${issue?.message ?? "invalid"}`,
             );
           }
-          const { huntId, stepId, byteOffset, byteLimit } = parsed.data;
-          const run = this.engine.stateStore.getRun(huntId);
+          const { run_id: runId, step_id: stepId, byte_offset: byteOffset, byte_limit: byteLimit } = parsed.data;
+          const run = this.engine.stateStore.getRun(runId);
           if (!run) {
-            throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${huntId}'`);
+            throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${runId}'`);
           }
           const profile = profileForRunStep(run, stepId);
           if (!profile) {
-            throw new RpcRequestError(-32004, "step_not_found", `Hunt '${huntId}' has no step '${stepId}'`);
+            throw new RpcRequestError(-32004, "step_not_found", `Hunt '${runId}' has no step '${stepId}'`);
           }
           const transcript = renderStepTranscript(
             run,
@@ -322,7 +350,7 @@ export class HuntDaemonRpcServer {
           return {
             jsonrpc: "2.0",
             id: req.id,
-            result: pageTranscript({ huntId: run.run_id, stepId, profile, transcript, byteOffset, byteLimit }),
+            result: pageTranscript({ runId: run.run_id, stepId, profile, transcript, byteOffset, byteLimit }),
           };
         }
 

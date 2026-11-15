@@ -3,23 +3,23 @@ import { sanitizeUntrustedText, wrapSanitizedInFence } from "./scrubber-and-fenc
 import type { DispatchReceiptRow, PersistedHuntRun } from "./state-store.ts";
 import { buildEightWaveGraph } from "./wave-engine.ts";
 
-export const TRANSCRIPT_PAGE_MIN_BYTES = 512;
-export const TRANSCRIPT_PAGE_MAX_BYTES = 32_768;
+export const TRANSCRIPT_PAGE_MIN_BYTES = 1;
+export const TRANSCRIPT_PAGE_MAX_BYTES = 65_536;
 export const TRANSCRIPT_PAGE_DEFAULT_BYTES = 16_384;
 
 export interface TranscriptPage {
-  readonly huntId: string;
-  readonly stepId: string;
+  readonly run_id: string;
+  readonly step_id: string;
   readonly profile: ProfileId;
   /** Offsets and sizes are UTF-8 bytes of the sanitized transcript, excluding the fence tags. */
-  readonly byteOffset: number;
-  readonly byteLength: number;
-  readonly totalBytes: number;
-  readonly nextByteOffset: number;
-  readonly hasMore: boolean;
-  /** The page wrapped in `<untrusted_tool_result_${fenceNonce}>` ... `</...>`. */
+  readonly byte_offset: number;
+  readonly byte_length: number;
+  readonly total_bytes: number;
+  readonly next_byte_offset: number;
+  readonly has_more: boolean;
+  /** The page wrapped in `<untrusted_tool_result_${fence_nonce}>` ... `</...>`. */
   readonly content: string;
-  readonly fenceNonce: string;
+  readonly fence_nonce: string;
 }
 
 
@@ -111,7 +111,7 @@ function utf8Boundary(buf: Buffer, offset: number): number {
 
 /** Slices the sanitized transcript on UTF-8 boundaries and fences the page. */
 export function pageTranscript(params: {
-  readonly huntId: string;
+  readonly runId: string;
   readonly stepId: string;
   readonly profile: ProfileId;
   readonly transcript: string;
@@ -128,15 +128,15 @@ export function pageTranscript(params: {
   const page = buf.subarray(start, end).toString("utf8");
   const fenced = wrapSanitizedInFence(page);
   return {
-    huntId: params.huntId,
-    stepId: params.stepId,
+    run_id: params.runId,
+    step_id: params.stepId,
     profile: params.profile,
-    byteOffset: start,
-    byteLength: end - start,
-    totalBytes: buf.byteLength,
-    nextByteOffset: end,
-    hasMore: end < buf.byteLength,
+    byte_offset: start,
+    byte_length: end - start,
+    total_bytes: buf.byteLength,
+    next_byte_offset: end,
+    has_more: end < buf.byteLength,
     content: fenced.wrappedText,
-    fenceNonce: fenced.nonce128,
+    fence_nonce: fenced.nonce128,
   };
 }

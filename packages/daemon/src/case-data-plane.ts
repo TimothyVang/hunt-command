@@ -15,6 +15,7 @@ import type {
   CaseCapabilities,
   CitationVerificationReceipt,
   CitationVerificationRequest,
+  CitedEvidenceRecord,
   HuntDataPlanePort,
   RoleCapabilityToken,
 } from "./ports.ts";
@@ -117,6 +118,14 @@ export class CaseDataPlanePort implements HuntDataPlanePort {
       out_of_scope_ids: [],
       source_status: "ok",
     };
+  }
+
+  public async readCitedRecords(ids: readonly string[], signal?: AbortSignal): Promise<CitedEvidenceRecord[]> {
+    signal?.throwIfAborted();
+    if (!this.#dataPlane.readCitedRecords) {
+      throw new Error(`Data plane for case '${this.#dataPlane.caseId}' cannot read cited records`);
+    }
+    return this.#dataPlane.readCitedRecords(ids);
   }
 
   public async close(): Promise<void> {

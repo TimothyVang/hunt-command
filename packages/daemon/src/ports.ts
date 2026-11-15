@@ -65,7 +65,17 @@ export interface HuntDataPlanePort {
     request: CitationVerificationRequest,
     signal?: AbortSignal,
   ): Promise<CitationVerificationReceipt>;
+  /** Optional: the case-scoped records behind cited ids, for operator review (raw; caller scrubs). */
+  readCitedRecords?(ids: readonly string[], signal?: AbortSignal): Promise<CitedEvidenceRecord[]>;
   close?(): Promise<void> | void;
+}
+
+export interface CitedEvidenceRecord {
+  readonly id: string;
+  readonly kind: "evt" | "frame" | "ioc";
+  readonly timestamp_iso: string | null;
+  readonly title: string;
+  readonly record: Record<string, unknown>;
 }
 
 export interface StepTokenUsage {
