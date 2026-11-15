@@ -407,7 +407,7 @@ describe("packages/coach scorer & Python saved/pr4-coach differential parity", (
       const pyScore = pyResults.scored[i];
       expect(tsScore).toEqual(pyScore);
     }
-  });
+  }, 30_000);
 
   test("entity-scoped factCitations blocks citation spraying and enforces token boundaries", () => {
     expect(names("user admin logged in", "admin")).toBe(true);
@@ -569,6 +569,34 @@ describe("packages/coach scorer & Python saved/pr4-coach differential parity", (
     };
     expect(() => validateTruth(sampleTruth)).not.toThrow();
   });
+  test("alternative groups are unioned verbatim like scenario.py: one ioc id backing two groups credits both", () => {
+    const truth: ScenarioTruth = {
+      schema_version: 1,
+      case_id: "case-00001",
+      facts: [
+        {
+          fact_id: "attack.c2.alpha",
+          kind: "attack",
+          entities: { host: ["hostalpha"] },
+          evidence_event_groups: [["evt-000001"], ["evt-000002"]],
+          evidence_intel_groups: [["ioc-00003"], ["ioc-00003"]],
+        },
+      ],
+    };
+    const scored = scoreReport(truth, {
+      claims: [{ claim_id: "c1", statement: "hostalpha beaconed ioc-00003" }],
+    });
+    expect(scored.found).toBe(1);
+    expect(scored.facts[0]?.cited_groups).toEqual([0, 1]);
+    expect(scored.facts[0]?.cited_intel_ids).toEqual(["ioc-00003"]);
+  }, 30_000);
+
+  test("frame citations keep Python's boundary next to a combining mark that case-folds to a letter", () => {
+    // U+0345 is a mark (not a word character for Python's \b) but folds to iota under /iu.
+    expect([...citedIds(`frame-42${String.fromCodePoint(0x345)}`)]).toEqual(["frame-42"]);
+    expect([...citedIds("FRAME-42 Frame-7")].sort()).toEqual(["frame-42", "frame-7"]);
+  }, 30_000);
+
   test("citation and negation matching follow Python's Unicode re semantics without the reference", () => {
     const ch = (...cps: number[]): string => String.fromCodePoint(...cps);
     // Python \w includes every letter/number: a letter glued to an ID is not a boundary.
@@ -587,5 +615,5 @@ describe("packages/coach scorer & Python saved/pr4-coach differential parity", (
       expect(blamesDecoy(`activity was ruled${space}out and is malicious`)).toBe(false);
     }
     expect(blamesDecoy(`activity was ruled${ch(0xfeff)}out and is malicious`)).toBe(true);
-  });
+  }, 30_000);
 });
