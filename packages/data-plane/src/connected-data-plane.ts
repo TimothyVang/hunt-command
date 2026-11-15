@@ -24,7 +24,6 @@ import {
   type ArkimeUniqueParams,
   type ArkimeUniqueResult,
   type CitationVerificationResult,
-  budgetElasticSearchResult,
   coerceBoundedInt,
   type DetectionTestParams,
   type DetectionTestResult,
@@ -1891,14 +1890,14 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
     const nextAfter =
       lastHit && Array.isArray(lastHit.sort) ? this.encodeAfterToken(lastHit.sort) : null;
 
-    return budgetElasticSearchResult({
+    return {
       case_id: this.caseId,
       total: totalObj.value,
       total_relation: totalObj.relation ?? "eq",
       returned: hits.length,
       hits,
       next_after: nextAfter,
-    }, (count) => this.encodeAfterToken(rawHits[count - 1]!.sort));
+    };
   }
 
   public async elasticAggregate(params: ElasticAggregateParams): Promise<ElasticAggregateResult> {

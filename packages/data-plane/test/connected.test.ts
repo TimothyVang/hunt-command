@@ -1158,7 +1158,7 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
   }
 
   for (const order of ["asc", "desc"] as const) {
-    test(`budgets role-scoped multibyte search pages without losing adjacent nanosecond events in ${order} order`, async () => {
+    test(`reassembles complete role-scoped multibyte search pages without losing adjacent nanosecond events in ${order} order`, async () => {
       const rows = Array.from({ length: 5 }, (_, index) => {
         const timestamp = `2026-11-14T14:00:00.12345678${index}Z`;
         return {
@@ -1168,7 +1168,11 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
           _source: {
             "@timestamp": timestamp,
             host: { name: "wkstn-01" },
-            process: { command_line: index === 2 ? "🧪".repeat(20_000) : "界".repeat(3_000) },
+            process: {
+              command_line: index === 2
+                ? `${"🧪".repeat(20_000)} oversized-message-tail-${index}`
+                : `${"界".repeat(3_000)} message-tail-${index}`,
+            },
           },
         };
       });
@@ -1201,30 +1205,66 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
       try {
         const mint = createRoleCapabilityMint();
         const scoped = mint.bindDataPlane(dp, mint.issueCapability({
-          huntId: "hunt-connected-budget",
+          huntId: "hunt-connected-lossless",
           caseId: dp.caseId,
           profile: "framework-researcher",
           stepId: "evidence",
         }));
+        type SearchPage = {
+          case_id: string; total: number; total_relation: string; returned: number;
+          hits: Array<Record<string, unknown>>; next_after: string | null;
+        };
+        const readPage = async (after?: string): Promise<SearchPage> => {
+          const searchesBefore = calls.filter((call) => call.url.includes("/_search?")).length;
+          let wire = await scoped.executeTool("elastic_search", {
+            size: 3, sort: order, fields: "process.command_line", ...(after ? { after } : {}),
+          });
+          const data: string[] = [];
+          let chunkCount = 0;
+          while (true) {
+            expect(Buffer.byteLength(wire, "utf8")).toBeLessThanOrEqual(24 * 1024);
+            const fenced = /^<untrusted_tool_result_([0-9a-f]{32})>\n([\s\S]*)\n<\/untrusted_tool_result_\1>$/.exec(wire);
+            expect(fenced).not.toBeNull();
+            const envelope = JSON.parse(fenced![2]!) as SearchPage | {
+              result_chunk: { encoding: string; data: string; next_after: string | null };
+            };
+            expect(calls.filter((call) => call.url.includes("/_search?"))).toHaveLength(searchesBefore + 1);
+            if (!("result_chunk" in envelope)) {
+              expect(chunkCount).toBe(0);
+              return envelope;
+            }
+            expect(envelope.result_chunk.encoding).toBe("json");
+            data.push(envelope.result_chunk.data);
+            chunkCount += 1;
+            const token = envelope.result_chunk.next_after;
+            if (token === null) {
+              expect(chunkCount).toBeGreaterThan(1);
+              return JSON.parse(data.join("")) as SearchPage;
+            }
+            expect(typeof token).toBe("string");
+            expect(token.length).toBeGreaterThan(0);
+            wire = await scoped.executeTool("elastic_search", { result_after: token });
+          }
+        };
         let after: string | undefined;
         let seenCount = 0;
         const seen: string[] = [];
-        for (const [pageIndex, expectedCount] of [2, 1, 2].entries()) {
-          const wire = await scoped.executeTool("elastic_search", {
-            size: 5, sort: order, fields: "process.command_line", ...(after ? { after } : {}),
+        for (const [pageIndex, expectedCount] of [3, 2].entries()) {
+          const page = await readPage(after);
+          const expectedRows = rows.slice(seenCount, seenCount + expectedCount);
+          expect(page).toEqual({
+            case_id: dp.caseId,
+            total: rows.length,
+            total_relation: "eq",
+            returned: expectedCount,
+            hits: expectedRows.map((row) => ({
+              "@timestamp": row._source["@timestamp"],
+              "event.id": formatConnectedCitation(row._index, row._id),
+              "host.name": row._source.host.name,
+              "process.command_line": row._source.process.command_line,
+            })),
+            next_after: pageIndex === 0 ? expect.any(String) : null,
           });
-          expect(Buffer.byteLength(wire, "utf8")).toBeLessThanOrEqual(24 * 1024);
-          const fenced = /^<untrusted_tool_result_([0-9a-f]{32})>\n([\s\S]*)\n<\/untrusted_tool_result_\1>$/.exec(wire);
-          expect(fenced).not.toBeNull();
-          const page = JSON.parse(fenced![2]!) as {
-            total: number; total_relation: string; returned: number;
-            hits: Array<Record<string, unknown>>; next_after: string | null; truncated?: boolean;
-          };
-          expect(page.total).toBe(rows.length);
-          expect(page.total_relation).toBe("eq");
-          expect(page.returned).toBe(expectedCount);
-          expect(page.hits).toHaveLength(expectedCount);
-          expect(page.truncated).toBe(pageIndex < 2 ? true : undefined);
           for (const hit of page.hits) {
             const row = rows[seenCount++]!;
             const citation = formatConnectedCitation(row._index, row._id);
@@ -1232,18 +1272,11 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
             expect(hit["event.id"]).toBe(citation);
             expect(dp.verifyCitations([citation]).allValid).toBe(true);
             expect(dp.resolveCitationsInLucene(`event.id:${citation}`)).toContain(row._id);
-            const commandLine = String(hit["process.command_line"]);
-            expect(commandLine).not.toContain("\ufffd");
-            if (row._id === "budget-nano-2") {
-              expect(Buffer.byteLength(commandLine, "utf8")).toBeLessThan(
-                Buffer.byteLength(row._source.process.command_line, "utf8"),
-              );
-            } else {
-              expect(commandLine).toBe(row._source.process.command_line);
-            }
+            expect(hit["process.command_line"]).toBe(row._source.process.command_line);
+            expect(String(hit["process.command_line"])).not.toContain("\ufffd");
             seen.push(citation);
           }
-          if (pageIndex < 2) {
+          if (pageIndex === 0) {
             expect(page.next_after).toBeTruthy();
             const tuple = JSON.parse(Buffer.from(page.next_after!, "base64url").toString("utf8"));
             expect(tuple.slice(0, 2)).toEqual(rows[seenCount - 1]!.sort);
@@ -1257,7 +1290,7 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
         expect(new Set(seen).size).toBe(rows.length);
         const searches = calls.filter((call) => call.url.includes("/_search?"));
         expect(searches.map((call) => call.body!.search_after)).toEqual([
-          undefined, rows[1]!.sort, rows[2]!.sort,
+          undefined, rows[2]!.sort,
         ]);
       } finally {
         await dp.close();

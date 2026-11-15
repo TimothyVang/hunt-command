@@ -49,8 +49,9 @@ import {
   type ElasticAggregateResult,
   type ElasticSearchParams,
   type ElasticSearchResult,
-  budgetElasticSearchResult,
-  fenceToolResult,
+  createToolResultPager,
+  type ToolResultPage,
+  type ToolResultPager,
   type HuntDataPlane,
   type HuntLabQueryParams,
   type HuntLabQueryResult,
@@ -868,6 +869,39 @@ const KIBANA_SEARCH_KEYS: ReadonlySet<string> = new Set([
   "terminate_after",
 ]);
 
+const KIBANA_SCOPED_AGGREGATIONS: Record<string, true> = {
+  avg: true, min: true, max: true, sum: true, value_count: true, cardinality: true,
+  stats: true, extended_stats: true, percentiles: true, percentile_ranks: true, top_hits: true,
+  terms: true, multi_terms: true, date_histogram: true, auto_date_histogram: true,
+  histogram: true, range: true, date_range: true, ip_range: true, filter: true, filters: true,
+  missing: true, sampler: true, diversified_sampler: true, avg_bucket: true, min_bucket: true,
+  max_bucket: true, sum_bucket: true, stats_bucket: true, extended_stats_bucket: true,
+  percentiles_bucket: true, derivative: true, cumulative_sum: true, bucket_script: true, bucket_selector: true,
+};
+
+function kibanaAggregationsPreserveScope(aggregations: unknown): boolean {
+  const pending: unknown[] = [aggregations];
+  while (pending.length > 0) {
+    const group = pending.pop();
+    if (group === null || typeof group !== "object" || Array.isArray(group)) return false;
+    for (const definition of Object.values(group)) {
+      if (definition === null || typeof definition !== "object" || Array.isArray(definition)) return false;
+      let types = 0;
+      let children = 0;
+      for (const [key, value] of Object.entries(definition)) {
+        if (key === "aggs" || key === "aggregations") {
+          if (++children > 1) return false;
+          pending.push(value);
+        } else if (key !== "meta") {
+          if (KIBANA_SCOPED_AGGREGATIONS[key] !== true || ++types > 1) return false;
+        }
+      }
+      if (types !== 1) return false;
+    }
+  }
+  return true;
+}
+
 function parseKibanaJsonBody(
   body: string | null,
 ): Record<string, unknown> | { block: string } {
@@ -962,6 +996,11 @@ function decideKibanaWatchRequest(
       const searchRec = search as Record<string, unknown>;
       for (const k of Object.keys(searchRec)) {
         if (!KIBANA_SEARCH_KEYS.has(k)) {
+          return { block: "kibana_search_denied" };
+        }
+      }
+      for (const key of ["aggs", "aggregations"]) {
+        if (searchRec[key] !== undefined && !kibanaAggregationsPreserveScope(searchRec[key])) {
           return { block: "kibana_search_denied" };
         }
       }
@@ -1120,6 +1159,28 @@ const WATCH_PAGES = {
   arkime_spiview: { path: "/watch/arkime_spiview", tool: "arkime_unique" },
 } as const satisfies Record<WatchPageId, { path: string; tool: DataPlaneToolName }>;
 
+function renderWatchResultPage(
+  page: WatchPageId,
+  title: string,
+  summary: string,
+  fragment: ToolResultPage,
+  consoleKey?: string,
+  form = "",
+  originBanner = "",
+): string {
+  const query = new URLSearchParams();
+  if (consoleKey) query.set("key", consoleKey);
+  if (fragment.next_after) query.set("result_after", fragment.next_after);
+  const continuation = fragment.next_after
+    ? `<p><a rel="next" href="${escapeHtml(`${WATCH_PAGES[page].path}?${query}`)}">Next result fragment</a></p>`
+    : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
+    `<style>body{font:15px system-ui;margin:24px}pre{white-space:pre-wrap;overflow-wrap:anywhere}form{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{max-width:100%;box-sizing:border-box}</style></head><body>` +
+    `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(originBanner)} Read-only.</p>` + form +
+    `<p role="status"><strong>${escapeHtml(summary)}</strong></p>` +
+    `<pre>${escapeHtml(fragment.wire)}</pre>${continuation}</body></html>`;
+}
+
 export class EmbeddedHuntDataPlane implements HuntDataPlane {
   public readonly caseId: string;
   public readonly dataOrigin: DataOrigin;
@@ -1135,9 +1196,13 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
   private readonly startMs: number;
   private readonly endMs: number;
   private localServer: LocalDataPlaneHttpHandle | null = null;
+  private readonly operatorWatchPager = createToolResultPager();
   private readonly watchGrants = new Map<string, {
     page: WatchPageId;
     authorizeTool?: AuthorizeWatchTool;
+    pager: ToolResultPager;
+    initialQuery: string;
+    initialHtml?: string;
   }>();
   private closed = false;
 
@@ -1526,17 +1591,14 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
       ? encodeEmbeddedCursor(BigInt(lastRow.ts_ns_str), lastRow.event_id)
       : null;
 
-    return budgetElasticSearchResult({
+    return {
       case_id: this.caseId,
       total,
       total_relation: "eq",
       returned: hits.length,
       hits,
       next_after: nextAfter,
-    }, (count) => {
-      const last = rows[count - 1]!;
-      return encodeEmbeddedCursor(BigInt(last.ts_ns_str), last.event_id);
-    });
+    };
   }
 
   public elasticAggregate(params: ElasticAggregateParams): ElasticAggregateResult {
@@ -1755,8 +1817,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
         `SELECT indicator_value_lower, flat_json
          FROM intel_items
          WHERE indicator_value_lower IN (${placeholders})
-         ORDER BY indicator_value ASC, feed_name ASC
-         LIMIT 500`,
+         ORDER BY indicator_value ASC, feed_name ASC`,
       )
       .all(...lowers) as Array<{ indicator_value_lower: string; flat_json: string }>;
 
@@ -2017,6 +2078,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
   public renderWatchHtml(
     page: WatchPageId,
     params: { q?: string; host?: string; expression?: string; field?: string },
+    pager: ToolResultPager,
     consoleKey?: string,
     authorizeTool?: AuthorizeWatchTool,
   ): { status: 200 | 400; title: string; summary: string; returned: number; html: string } {
@@ -2061,13 +2123,8 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
           `<label for="host">Host</label><input id="host" name="host" value="${escapeHtml(String(sanitizeToolResult(params.host ?? "")))}">` +
           `<button>Search logs</button></form>`
         : "";
-      const html =
-        `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
-        `<style>body{font:15px system-ui;margin:24px}pre{white-space:pre-wrap;overflow-wrap:anywhere}form{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{max-width:100%;box-sizing:border-box}</style></head><body>` +
-        `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(originBanner)} Read-only.</p>` +
-        form +
-        `<p role="status"><strong>${escapeHtml(summary)}</strong></p>` +
-        `<pre>${escapeHtml(fenceToolResult(result))}</pre></body></html>`;
+      const fragment = pager.first(WATCH_PAGES[page].tool, result);
+      const html = renderWatchResultPage(page, title, summary, fragment, consoleKey, form, originBanner);
       return { status: 200, title, summary, returned, html };
     } catch (err) {
       const code = extractDataPlaneError(err)?.errorCode ?? "invalid_query";
@@ -2091,15 +2148,15 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
       throwDataPlaneError(400, "invalid_arguments", `Invalid Watch page '${String(params.page)}'`);
     }
 
-    const rendered = this.renderWatchHtml(params.page, params, undefined, authorizeTool);
+    const key = crypto.randomBytes(32).toString("hex");
+    const pager = createToolResultPager();
+    const rendered = this.renderWatchHtml(params.page, params, pager, key, authorizeTool);
     if (rendered.status !== 200) {
       const code = rendered.summary.replace(/^Query refused:\s*/, "");
       throwDataPlaneError(400, (code as "invalid_query") || "invalid_query", rendered.summary);
     }
 
     const srv = await this.ensureLocalHttpServer();
-    const key = crypto.randomBytes(32).toString("hex");
-    this.watchGrants.set(key, { page: params.page, authorizeTool });
     const url = new URL(WATCH_PAGES[params.page].path, srv.baseUrl);
     url.searchParams.set("key", key);
     for (const name of ["q", "host", "expression", "field"] as const) {
@@ -2107,6 +2164,9 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
         url.searchParams.set(name, params[name]);
       }
     }
+    this.watchGrants.set(key, {
+      page: params.page, authorizeTool, pager, initialQuery: url.search, initialHtml: rendered.html,
+    });
 
     return {
       case_id: this.caseId,
@@ -2392,6 +2452,25 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
                 : pathname === "/watch/arkime_spiview"
                   ? "arkime_spiview"
                   : "lab_console";
+          const pager = operatorAuthorized ? this.operatorWatchPager : grant!.pager;
+          const authorize = operatorAuthorized ? undefined : grant!.authorizeTool;
+          authorize?.(WATCH_PAGES[page].tool);
+          const continuations = parsedUrl.searchParams.getAll("result_after");
+          if (continuations.length > 1) {
+            throwDataPlaneError(400, "invalid_query", "Duplicate result continuation");
+          }
+          if (continuations.length === 1) {
+            const fragment = pager.next(WATCH_PAGES[page].tool, continuations[0]!);
+            const html = renderWatchResultPage(page, "Watch result continuation", "Continued result fragment", fragment, consoleKey);
+            sendResponse(res, 200, html, "text/html");
+            return;
+          }
+          if (!operatorAuthorized && grant!.initialHtml !== undefined && parsedUrl.search === grant!.initialQuery) {
+            const html = grant!.initialHtml;
+            delete grant!.initialHtml;
+            sendResponse(res, 200, html, "text/html");
+            return;
+          }
           const rendered = this.renderWatchHtml(
             page,
             {
@@ -2400,8 +2479,9 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
               expression: parsedUrl.searchParams.get("expression") ?? undefined,
               field: parsedUrl.searchParams.get("field") ?? undefined,
             },
+            pager,
             consoleKey,
-            operatorAuthorized ? undefined : grant!.authorizeTool,
+            authorize,
           );
           sendResponse(res, rendered.status, rendered.html, "text/html");
           return;
@@ -2601,6 +2681,8 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
 
   public async close(): Promise<void> {
     if (this.closed) return;
+    this.operatorWatchPager.clear();
+    for (const grant of this.watchGrants.values()) grant.pager.clear();
     this.watchGrants.clear();
     this.closed = true;
     if (this.localServer) {

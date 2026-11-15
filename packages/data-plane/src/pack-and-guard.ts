@@ -6,6 +6,7 @@ import {
   assertReadOnlyOperation,
   assertRoleOwnsTool,
   DATA_ORIGINS,
+  DATA_PLANE_TOOLS,
   type DataOrigin,
   type DataPlaneToolName,
   type HistogramInterval,
@@ -59,161 +60,101 @@ function serializeToolResult(result: unknown): string {
   return serialized.replace(/</g, "\\u003c");
 }
 
-function fitsToolResult(result: unknown): boolean {
-  return Buffer.byteLength(serializeToolResult(result), "utf8") <= TOOL_RESULT_CONTENT_BYTES;
+export interface ToolResultPage {
+  wire: string;
+  next_after: string | null;
 }
 
-const RESULT_METADATA_KEYS: Record<string, true> = {
-  case_id: true,
-  total: true,
-  total_relation: true,
-  other: true,
-  name: true,
-  returned: true,
-  next_after: true,
-  start: true,
-  offset: true,
-  limit: true,
-  more: true,
-  read_only: true,
-  recordsFiltered: true,
-  dataset: true,
-  field: true,
-  fields: true,
-  page: true,
-  url: true,
-  title: true,
-  blocked_requests: true,
-  first: true,
-  last: true,
-  truncated: true,
-};
-const RESULT_ROWS_KEYS = ["hits", "records", "sessions", "rows", "values"] as const;
-const RESULT_ARRAY_KEYS = [...RESULT_ROWS_KEYS, "buckets", "hosts", "sample", "matches", "unmatched"];
-
-function stringPrefix(value: string, limit: number): string {
-  let end = Math.min(value.length, limit);
-  // Do not turn an intact surrogate pair into a lone surrogate at the budget boundary.
-  if (end > 0 && end < value.length
-    && /[\ud800-\udbff]/.test(value[end - 1]!) && /[\udc00-\udfff]/.test(value[end]!)) {
-    end--;
-  }
-  return value.slice(0, end);
+export interface ToolResultPager {
+  first(tool: DataPlaneToolName, result: unknown): ToolResultPage;
+  next(tool: DataPlaneToolName, token: string): ToolResultPage;
+  clear(): void;
 }
 
-/**
- * One deterministic limit for payload string lengths, list lengths and object field counts.
- * Keep citation identities and top-level pagination intact; never cut serialized JSON bytes.
- */
-function limitToolPayload(value: unknown, limit: number, root = false): unknown {
-  if (typeof value === "string") return stringPrefix(value, limit);
-  if (Array.isArray(value)) return value.slice(0, limit).map((item) => limitToolPayload(item, limit));
-  if (value === null || typeof value !== "object" || value instanceof Date) return value;
-
-  const result: Record<string, unknown> = {};
-  let payloadFields = 0;
-  for (const [key, item] of Object.entries(value)) {
-    const citation = key === "@timestamp" || key === "event" || key === "id"
-      || key.endsWith(".id") || key.endsWith("_id");
-    const rootArray = root && RESULT_ARRAY_KEYS.includes(key) && Array.isArray(item);
-    if (root && RESULT_METADATA_KEYS[key] === true) {
-      result[key] = item;
-    } else if (!citation && !rootArray && payloadFields++ >= limit) {
-      continue;
-    } else if (citation && key !== "event") {
-      result[key] = item;
-    } else if (root && key === "hits" && Array.isArray(item)) {
-      // A generic fence cannot regenerate Elastic cursors. Only the search-specific
-      // helper may drop hits; here retain their identities and trim their payloads.
-      result[key] = item.map((hit) => limitToolPayload(hit, limit));
-    } else {
-      result[key] = limitToolPayload(item, limit);
-    }
-  }
-  const rowsKey = RESULT_ROWS_KEYS.find((key) => Array.isArray(result[key]));
-  if (rowsKey && typeof result.returned === "number") {
-    const rows = result[rowsKey] as unknown[];
-    const originalRows = (value as Record<string, unknown>)[rowsKey] as unknown[];
-    result.returned = rows.length;
-    if (rows.length < originalRows.length && "more" in result) result.more = true;
-  }
-  return result;
+interface ToolResultSnapshot {
+  readonly tool: DataPlaneToolName;
+  readonly json: string;
+  readonly offset: number;
 }
 
-function budgetStructuredResult(resultForLimit: (limit: number) => unknown): unknown {
-  let low = 0;
-  let high = TOOL_RESULT_CONTENT_BYTES;
-  let best = resultForLimit(0);
-  if (!fitsToolResult(best)) {
-    // Identifiers/cursors cannot be shortened without corrupting citations or pagination.
-    throw new RangeError("Tool result metadata exceeds the wire budget");
+function assertPagerTool(tool: DataPlaneToolName): void {
+  if (!(DATA_PLANE_TOOLS as readonly unknown[]).includes(tool)) {
+    throwDataPlaneError(403, "tool_not_owned", "Unknown data-plane tool");
   }
-  while (low <= high) {
-    const limit = Math.floor((low + high) / 2);
-    const candidate = resultForLimit(limit);
-    if (fitsToolResult(candidate)) {
-      best = candidate;
-      low = limit + 1;
-    } else {
-      high = limit - 1;
-    }
-  }
-  return best;
 }
 
-/**
- * Budget a search before returning it, while its backend still owns cursor generation.
- * Prefer a complete nonempty hit prefix to trimming any hit's payload.
- */
-export function budgetElasticSearchResult(
-  result: ElasticSearchResult,
-  cursorForCount: (count: number) => string,
-): ElasticSearchResult {
-  const clean = sanitizeToolResult(result) as ElasticSearchResult;
-  if (fitsToolResult(clean)) return clean;
-  const pageMetadata = (count: number): ElasticSearchResult => ({
-    ...clean,
-    hits: [],
-    returned: count,
-    next_after: count < clean.hits.length ? cursorForCount(count) : clean.next_after,
-    truncated: true,
-  });
-  let hitBytes = 0;
-  let best: ElasticSearchResult | undefined;
-  // Cursor lengths can vary, so total page size is not necessarily monotone.
-  // Measure every feasible prefix, serializing each hit just once.
-  for (let count = 1; count <= clean.hits.length; count++) {
-    hitBytes += Buffer.byteLength(serializeToolResult(clean.hits[count - 1]), "utf8")
-      + (count === 1 ? 0 : 1);
-    if (hitBytes > TOOL_RESULT_CONTENT_BYTES) break;
-    const candidate = pageMetadata(count);
-    if (Buffer.byteLength(serializeToolResult(candidate), "utf8") + hitBytes <= TOOL_RESULT_CONTENT_BYTES) {
-      best = candidate;
-    }
-  }
-  if (best) return { ...best, hits: clean.hits.slice(0, best.returned) };
-  const count = Math.min(1, clean.hits.length);
-  const single = { ...pageMetadata(count), hits: clean.hits.slice(0, count) };
-  return budgetStructuredResult((limit) => ({
-    ...single,
-    hits: single.hits.map((hit) => limitToolPayload(hit, limit)),
-  })) as ElasticSearchResult;
-}
-
-/** Return sanitized, parseable JSON inside a complete independent 128-bit nonce fence. */
-export function fenceToolResult(rawResult: unknown): string {
-  let result = sanitizeToolResult(rawResult);
-  if (!fitsToolResult(result)) {
-    const object = result !== null && typeof result === "object" && !Array.isArray(result)
-      ? result as Record<string, unknown>
-      : { value: result };
-    result = budgetStructuredResult((limit) => ({
-      ...limitToolPayload(object, limit, true) as Record<string, unknown>,
-      truncated: true,
-    }));
-  }
+function fenceSerializedToolResult(json: string): string {
   const nonce = crypto.randomBytes(16).toString("hex");
-  return `<untrusted_tool_result_${nonce}>\n${serializeToolResult(result)}\n</untrusted_tool_result_${nonce}>`;
+  return `<untrusted_tool_result_${nonce}>\n${json}\n</untrusted_tool_result_${nonce}>`;
+}
+
+/**
+ * Each outstanding token owns one immutable, already-sanitized JSON snapshot.
+ * Transport continuations never requery a backend or reinterpret its own cursor.
+ * Consuming the final page releases the snapshot; abandoned pages remain available
+ * for the lifetime of this pager rather than silently expiring or losing data.
+ */
+export function createToolResultPager(): ToolResultPager {
+  const pending = new Map<string, ToolResultSnapshot>();
+
+  const chunk = (snapshot: ToolResultSnapshot): ToolResultPage => {
+    const token = crypto.randomBytes(32).toString("hex");
+    const envelope = (data: string, next_after: string | null): string =>
+      serializeToolResult({ result_chunk: { encoding: "json", data, next_after } });
+    const continuedBudget = TOOL_RESULT_CONTENT_BYTES - Buffer.byteLength(envelope("", token), "utf8");
+    const finalBudget = TOOL_RESULT_CONTENT_BYTES - Buffer.byteLength(envelope("", null), "utf8");
+    let end = snapshot.offset;
+    let continuedEnd = end;
+    let bytes = 0;
+    // Count the JSON-string-escaped UTF-8 cost, advancing only whole code points.
+    // The snapshot is JSON text, so malformed source surrogates are already escaped.
+    while (end < snapshot.json.length) {
+      const point = snapshot.json.codePointAt(end)!;
+      const width = point > 0xffff ? 2 : 1;
+      const cost = point === 0x22 || point === 0x5c ? 2
+        : point < 0x20 ? (point === 8 || point === 9 || point === 10 || point === 12 || point === 13 ? 2 : 6)
+        : point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4;
+      if (bytes + cost > finalBudget) break;
+      bytes += cost;
+      end += width;
+      if (bytes <= continuedBudget) continuedEnd = end;
+    }
+    const complete = end === snapshot.json.length;
+    if (!complete) end = continuedEnd;
+    const next_after = complete ? null : token;
+    const wire = fenceSerializedToolResult(envelope(snapshot.json.slice(snapshot.offset, end), next_after));
+    if (next_after !== null) {
+      pending.set(next_after, Object.freeze({ ...snapshot, offset: end }));
+    }
+    return { wire, next_after };
+  };
+
+  return Object.freeze({
+    first(tool: DataPlaneToolName, result: unknown): ToolResultPage {
+      assertPagerTool(tool);
+      const json = serializeToolResult(sanitizeToolResult(result));
+      if (Buffer.byteLength(json, "utf8") <= TOOL_RESULT_CONTENT_BYTES) {
+        return { wire: fenceSerializedToolResult(json), next_after: null };
+      }
+      return chunk(Object.freeze({ tool, json, offset: 0 }));
+    },
+    next(tool: DataPlaneToolName, token: string): ToolResultPage {
+      assertPagerTool(tool);
+      if (typeof token !== "string" || !/^[0-9a-f]{64}$/.test(token)) {
+        throwDataPlaneError(400, "invalid_pagination", "Invalid result continuation");
+      }
+      const snapshot = pending.get(token);
+      if (!snapshot || snapshot.tool !== tool) {
+        throwDataPlaneError(400, "invalid_pagination", "Invalid result continuation");
+      }
+      const page = chunk(snapshot);
+      pending.delete(token);
+      return page;
+    },
+    clear(): void {
+      pending.clear();
+    },
+  });
 }
 
 export interface ValidatedCaseSource {
@@ -575,7 +516,6 @@ export interface ElasticSearchResult {
   returned: number;
   hits: Array<Record<string, unknown>>;
   next_after: string | null;
-  truncated?: boolean;
 }
 
 export interface ElasticAggregateParams {
@@ -880,6 +820,7 @@ export function createRoleCapabilityMint(explicitSecret?: Uint8Array): RoleCapab
     token: RoleCapabilityToken,
   ): RoleScopedDataPlane => {
     verifyCapability(token, dataPlane.caseId);
+    const pager = createToolResultPager();
 
     const executeTool = async (
       tool: DataPlaneToolName,
@@ -889,15 +830,27 @@ export function createRoleCapabilityMint(explicitSecret?: Uint8Array): RoleCapab
       // Re-verify closure HMAC on every invocation in case token object was mutated/swapped.
       verifyCapability(token, dataPlane.caseId);
 
-      const method = (options?.method ?? "GET").toUpperCase();
-      assertReadOnlyOperation(method !== "GET");
+      const rawMethod = options?.method ?? "GET";
+      assertReadOnlyOperation(typeof rawMethod !== "string" || rawMethod.toUpperCase() !== "GET");
       assertRoleOwnsTool(token.profile, tool, token.stepId);
+
+      if (args === null || typeof args !== "object" || Array.isArray(args)) {
+        throwDataPlaneError(400, "invalid_query", "Tool arguments must be an object");
+      }
 
       if (args.case_id !== undefined && args.case_id !== dataPlane.caseId) {
         if (typeof args.case_id !== "string" || !CASE_ID_RE.test(args.case_id)) {
           throwDataPlaneError(400, "explicit_case_id_required", "Invalid or missing case_id");
         }
         throwDataPlaneError(400, "case_mismatch", `Case mismatch: expected '${dataPlane.caseId}'`);
+      }
+
+      if (Object.prototype.hasOwnProperty.call(args, "result_after")) {
+        if (typeof args.result_after !== "string"
+          || Object.keys(args).some((key) => key !== "result_after" && key !== "case_id")) {
+          throwDataPlaneError(400, "invalid_pagination", "Result continuation cannot include query arguments");
+        }
+        return pager.next(tool, args.result_after).wire;
       }
 
       let rawResult: unknown;
@@ -939,7 +892,7 @@ export function createRoleCapabilityMint(explicitSecret?: Uint8Array): RoleCapab
           throwDataPlaneError(403, "tool_not_owned", `Unknown data-plane tool '${String(tool)}'`);
       }
 
-      return fenceToolResult(rawResult);
+      return pager.first(tool, rawResult).wire;
     };
 
     return Object.freeze({

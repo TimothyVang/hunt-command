@@ -1598,6 +1598,117 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
     }
   });
 
+  test("Kibana aggregation trees cannot reset or expand the enforced case scope", () => {
+    const scope = {
+      caseId: "synth-case-001",
+      labOrigin: "http://127.0.0.1:8080",
+      arkimeOrigin: "http://127.0.0.1:8005",
+      kibanaOrigin: "http://127.0.0.1:5601",
+      startSec: 1_763_114_400,
+      stopSec: 1_763_118_000,
+    };
+    const decide = (search: Record<string, unknown>) => decideWatchRequest(
+      scope, "POST", `${scope.kibanaOrigin}/internal/bsearch`, JSON.stringify({
+        batch: [{ options: { strategy: "ese" }, request: { params: { index: "hunt-lab-case-events", body: search } } }],
+      }),
+    );
+    for (const alias of ["aggs", "aggregations"]) {
+      for (const escaping of ["global", "children", "parent", "nested", "reverse_nested", "significant_terms", "unknown_future_type"]) {
+        const unsafe = { escape: { [escaping]: {}, aggs: { exposed: { terms: { field: "host.name" } } } } };
+        expect(decide({ [alias]: unsafe }).block).toBe("kibana_search_denied");
+        expect(decide({ [alias]: { within: { filter: { match_all: {} }, aggregations: unsafe } } }).block)
+          .toBe("kibana_search_denied");
+      }
+      for (const malformed of [null, [], { broken: null }, { broken: {} }]) {
+        expect(decide({ [alias]: malformed }).block).toBe("kibana_search_denied");
+      }
+      const allowed = decide({ query: { match_all: {} }, [alias]: {
+        global: { terms: { field: "host.name" }, aggs: {
+          timeline: { date_histogram: { field: "@timestamp", fixed_interval: "1m" },
+            aggregations: { count: { value_count: { field: "event.id" } } } },
+        } },
+      } });
+      expect(allowed.block).toBeNull();
+      expect(allowed.body).toContain(`"gte":${scope.startSec * 1000}`);
+      expect(allowed.body).toContain(`"lt":${scope.stopSec * 1000}`);
+    }
+  });
+
+  test("returns every intel feed match without falsely classifying later indicators as unmatched", async () => {
+    const dir = path.join(tmpRoot, "many-intel-feeds");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "case.json"), JSON.stringify({
+      case_id: "many-intel-feeds", data_origin: "synthetic",
+      time_range_utc: { start_inclusive: "2026-11-14T10:00:00Z", end_exclusive: "2026-11-14T11:00:00Z" },
+    }));
+    const message = "漢😀".repeat(20_000) + "TAIL_WATCH_EVIDENCE";
+    fs.writeFileSync(path.join(dir, "events.jsonl"), JSON.stringify({
+      "@timestamp": "2026-11-14T10:01:00Z", event: { id: "evt-complete-message" }, message,
+    }) + "\n");
+    const intel = Array.from({ length: 505 }, (_, index) => ({
+      id: `ioc-bulk-${index}`,
+      indicator: { type: "domain-name", value: "a.example.test" },
+      threat: { feed: { name: `Feed-${String(index).padStart(3, "0")}` } },
+    }));
+    intel.push({ id: "ioc-late", indicator: { type: "domain-name", value: "z.example.test" }, threat: { feed: { name: "LateFeed" } } });
+    fs.writeFileSync(path.join(dir, "intel.jsonl"), intel.map((item) => JSON.stringify(item)).join("\n") + "\n");
+    const plane = await EmbeddedHuntDataPlane.open(dir, { cacheDir });
+    const parseWire = (wire: string) => {
+      expect(Buffer.byteLength(wire, "utf8")).toBeLessThanOrEqual(24 * 1024);
+      const match = /^<untrusted_tool_result_([0-9a-f]{32})>\n([\s\S]*)\n<\/untrusted_tool_result_\1>$/.exec(wire);
+      expect(match).not.toBeNull();
+      return JSON.parse(match![2]!) as { result_chunk: { data: string; next_after: string | null } };
+    };
+    const decodeHtml = (text: string) => text.replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+    try {
+      const values = "A.EXAMPLE.TEST,Z.EXAMPLE.TEST,Missing.MixedCase";
+      const raw = plane.intelLookup({ values });
+      expect(raw.matches).toHaveLength(506);
+      expect(raw.matches.filter((item) => item["indicator.value"] === "a.example.test")).toHaveLength(505);
+      expect(raw.matches[505]!["indicator.value"]).toBe("z.example.test");
+      expect(raw.unmatched).toEqual(["Missing.MixedCase"]);
+      const mint = createRoleCapabilityMint();
+      const librarian = mint.bindDataPlane(plane, mint.issueCapability({
+        huntId: "hunt-many-feeds", caseId: plane.caseId, profile: "framework-librarian",
+      }));
+      let wire = await librarian.executeTool("intel_lookup", { values });
+      const parts: string[] = [];
+      for (let index = 0; index < 100; index++) {
+        const chunk = parseWire(wire).result_chunk;
+        parts.push(chunk.data);
+        if (chunk.next_after === null) break;
+        wire = await librarian.executeTool("intel_lookup", { result_after: chunk.next_after });
+      }
+      expect(JSON.parse(parts.join(""))).toEqual(raw);
+
+      const watch = await plane.labBrowser({ page: "kibana_discover" });
+      let url = watch.url;
+      const eventParts: string[] = [];
+      for (let index = 0; index < 100; index++) {
+        const response = await fetch(url, { proxy: "", redirect: "error" });
+        expect(response.status).toBe(200);
+        const html = await response.text();
+        const pre = /<pre>([\s\S]*?)<\/pre>/.exec(html);
+        expect(pre).not.toBeNull();
+        const chunk = parseWire(decodeHtml(pre![1]!)).result_chunk;
+        eventParts.push(chunk.data);
+        const link = /<a rel="next" href="([^"]+)">/.exec(html);
+        if (chunk.next_after === null) {
+          expect(link).toBeNull();
+          break;
+        }
+        expect(link).not.toBeNull();
+        url = new URL(decodeHtml(link![1]!), url).toString();
+        expect(new URL(url).searchParams.get("result_after") === chunk.next_after).toBe(true);
+      }
+      const eventResult = JSON.parse(eventParts.join("")) as { hits: Array<Record<string, unknown>> };
+      expect(eventResult.hits[0]!.message).toBe(message);
+    } finally {
+      await plane.close();
+    }
+  });
+
   test("regression (pr1-v2 BLOCK 1 & BLOCK 2): enforces FTS5 adjacent phrases, fts5vocab ?/* wildcards, quoted leading-wildcard 400, MAX_UNIQUE_VALUES=1000, and LIKE ESCAPE", async () => {
     const luceneCaseDir = path.join(tmpRoot, "lucene-edge-case");
     fs.mkdirSync(luceneCaseDir, { recursive: true });
