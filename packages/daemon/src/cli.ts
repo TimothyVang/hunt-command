@@ -10,7 +10,8 @@ import {
   type RbacRole,
 } from "./gates.ts";
 import { OmpHunterPool } from "./omp-pool.ts";
-import { InMemoryTelemetrySink } from "./ports.ts";
+import { createCaseDirDataPlaneResolver } from "./case-data-plane.ts";
+import { InMemoryTelemetrySink, type ModelRunnerPort } from "./ports.ts";
 import { HuntDaemonRpcServer } from "./rpc-server.ts";
 import { acquireRuntimeLock, RuntimeLockHeldError, type RuntimeLockHandle } from "./runtime-lock.ts";
 import { DurableStateStore } from "./state-store.ts";
@@ -21,6 +22,8 @@ export interface CreateDaemonContextOptions {
   readonly subscriptionOnly?: boolean;
   readonly productionMode?: boolean;
   readonly resolveDataPlane?: DataPlaneResolver;
+  /** Model runner for hunt steps (defaults to the subscription-only `OmpHunterPool`). */
+  readonly modelRunner?: ModelRunnerPort;
   /**
    * Reconcile interrupted in-flight runs from a prior daemon crash. ONLY the single-instance
    * `serve` process (holding the runtime lock) may set this; read-only commands never do.
@@ -49,9 +52,11 @@ export function createHuntDaemonRuntime(options?: CreateDaemonContextOptions) {
     ),
   });
   const telemetry = new InMemoryTelemetrySink();
-  const modelRunner = new OmpHunterPool({
-    subscriptionOnly: options?.subscriptionOnly ?? true,
-  });
+  const modelRunner =
+    options?.modelRunner ??
+    new OmpHunterPool({
+      subscriptionOnly: options?.subscriptionOnly ?? true,
+    });
   const engine = new HuntWaveEngine({
     stateStore,
     gateAuthority,
@@ -76,10 +81,12 @@ export function createHuntDaemonRuntime(options?: CreateDaemonContextOptions) {
 export interface RunHuntCliOptions {
   /**
    * Case data-plane factory for `serve` (`hunt.start`, `hunt.resume`, gate resumption).
-   * No default exists yet: `@hunt-command/data-plane` exposes `HuntDataPlane`, not the
-   * daemon's `HuntDataPlanePort`, so `serve` fails fast without one.
+   * Defaults to the embedded data plane over `--cases-dir` (default `<runtimeDir>/cases`),
+   * opening `<casesDir>/<caseId>`.
    */
   readonly resolveDataPlane?: DataPlaneResolver;
+  /** Model runner for `serve` (defaults to the subscription-only `OmpHunterPool`). */
+  readonly modelRunner?: ModelRunnerPort;
   /** Input stream for `serve` (defaults to `process.stdin`). */
   readonly stdin?: AsyncIterable<Uint8Array | Buffer | string>;
 }
@@ -153,7 +160,7 @@ async function runHuntCommand(
       [
         "Hunt Command Daemon CLI (@hunt-command/daemon)",
         "Usage:",
-        "  hunt-daemon serve [--runtime-dir <dir>]",
+        "  hunt-daemon serve [--runtime-dir <dir>] [--cases-dir <dir>]",
         "  hunt status --hunt-id <id> [--runtime-dir <dir>]",
         "  hunt cancel --hunt-id <id> [--reason <text>] [--runtime-dir <dir>]",
         "  hunt token --principal <id> --role <admin|analyst|reviewer|viewer> [--ttl-hours <n>] [--runtime-dir <dir>]",
@@ -301,18 +308,15 @@ async function serveDaemon(
   io: { writeStdout: (text: string) => void; writeStderr: (text: string) => void },
   options: RunHuntCliOptions,
 ): Promise<number> {
-  if (!options.resolveDataPlane) {
-    io.writeStderr(
-      "hunt-daemon serve: no case data-plane factory is configured, so hunt.start/hunt.resume " +
-        "and gate resumption cannot work. Embed runHuntCli(argv, io, { resolveDataPlane }) with a " +
-        "HuntDataPlanePort factory; @hunt-command/data-plane has no HuntDataPlanePort adapter yet.\n",
-    );
+  if (flags["cases-dir"] === true) {
+    io.writeStderr("hunt-daemon serve: --cases-dir requires a directory\n");
     return 2;
   }
+  const paths = resolveRuntimeDir(runtimeDir);
 
   let lock: RuntimeLockHandle;
   try {
-    lock = acquireRuntimeLock(runtimeLockPath(resolveRuntimeDir(runtimeDir).stateDir));
+    lock = acquireRuntimeLock(runtimeLockPath(paths.stateDir));
   } catch (err) {
     if (err instanceof RuntimeLockHeldError) {
       io.writeStderr(`hunt-daemon serve: ${err.message}\n`);
@@ -323,12 +327,21 @@ async function serveDaemon(
   const releaseOnExit = () => lock.release();
   process.once("exit", releaseOnExit);
 
+  const defaultResolver = options.resolveDataPlane
+    ? null
+    : createCaseDirDataPlaneResolver({
+        casesDir: typeof flags["cases-dir"] === "string" ? flags["cases-dir"] : paths.casesDir,
+        cacheDir: path.join(paths.rootDir, "case-cache"),
+      });
+  const resolveDataPlane = options.resolveDataPlane ?? defaultResolver!.resolve;
+
   try {
     // Only the lock-holding serve process reconciles interrupted in-flight runs.
     const ctx = createHuntDaemonRuntime({
       runtimeDir,
       productionMode: flags["non-prod"] !== true,
-      resolveDataPlane: options.resolveDataPlane,
+      resolveDataPlane,
+      modelRunner: options.modelRunner,
       recoverOnStartup: true,
     });
     const resumable = ctx.engine.listResumableRuns();
@@ -340,7 +353,7 @@ async function serveDaemon(
     }
     const rpc = new HuntDaemonRpcServer({
       engine: ctx.engine,
-      resolveDataPlane: options.resolveDataPlane,
+      resolveDataPlane,
       writeLine: (line) => io.writeStdout(line),
     });
     const unsub = ctx.telemetry.subscribe((ev) => rpc.emitTelemetryEvent(ev));
@@ -354,6 +367,7 @@ async function serveDaemon(
     }
     return 0;
   } finally {
+    await defaultResolver?.close();
     process.removeListener("exit", releaseOnExit);
     lock.release();
   }

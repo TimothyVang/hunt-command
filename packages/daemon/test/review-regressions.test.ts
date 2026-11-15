@@ -376,13 +376,8 @@ describe("Review regressions (slice 2)", () => {
   });
 
   // Finding 3
-  test("serve fails fast without a data-plane factory and wires the factory into hunt.start", async () => {
+  test("serve wires an injected data-plane factory into hunt.start", async () => {
     const runtimeDir = makeTmpDir();
-    const c1 = captureIo();
-    expect(await runHuntCli(["serve", "--runtime-dir", runtimeDir], c1.io, { stdin: linesOf() })).toBe(2);
-    expect(c1.err.join("")).toContain("no case data-plane factory is configured");
-    expect(fs.existsSync(runtimeLockPath(resolveRuntimeDir(runtimeDir).stateDir))).toBe(false);
-
     const requested: string[] = [];
     const c2 = captureIo();
     const code = await runHuntCli(["serve", "--runtime-dir", runtimeDir], c2.io, {

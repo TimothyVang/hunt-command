@@ -1,6 +1,5 @@
 import { StringDecoder } from "node:string_decoder";
 import {
-  DataPlaneAccessError,
   RpcEventNotificationSchema,
   RpcRequestSchema,
   RpcResponseSchema,
@@ -8,6 +7,7 @@ import {
   type RpcRequest,
   type RpcResponse,
 } from "@hunt-command/shared";
+import { extractDataPlaneError } from "@hunt-command/data-plane";
 import { executeDriveGates, type DriveGatesCommandInput } from "./drive-gates.ts";
 import { GateDecisionError } from "./gates.ts";
 import type { DaemonTelemetryEvent, HuntDataPlanePort } from "./ports.ts";
@@ -328,9 +328,7 @@ export class HuntDaemonRpcServer {
       const errorCode =
         err instanceof GateDecisionError
           ? err.errorCode
-          : err instanceof DataPlaneAccessError
-            ? err.errorCode
-            : "rpc_execution_error";
+          : (extractDataPlaneError(err)?.errorCode ?? "rpc_execution_error");
       return {
         jsonrpc: "2.0",
         id: req.id,

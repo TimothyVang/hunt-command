@@ -8,6 +8,7 @@ import {
   ARKIME_DEFAULT_FIELDS,
   ARKIME_SESSION_FIELDS,
   ARKIME_UNIQUE_FIELDS,
+  type CaseMetadata,
   type DataOrigin,
   type DataPlaneToolName,
   DEFAULT_FIELDS,
@@ -1463,6 +1464,38 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
   public getCaseInfo(): Record<string, unknown> {
     this.assertOpen();
     return structuredClone(this.pack.rawCaseObject);
+  }
+
+  /**
+   * The validated case as the shared `CaseMetadata` contract. `sources` lists the evidence
+   * artifacts this data plane actually serves (the source ids a handoff may cite).
+   */
+  public describeCase(): CaseMetadata {
+    this.assertOpen();
+    const relArtifact = (absPath: string): string =>
+      path.relative(this.pack.caseDir, absPath).split(path.sep).join("/");
+    const sources = [this.pack.eventsPath, this.pack.intelPath, this.pack.pcapPath]
+      .filter((p): p is string => p !== null)
+      .map(relArtifact);
+    const rawTitle = this.pack.rawCaseObject.title;
+    const title =
+      typeof rawTitle === "string" && rawTitle.trim().length > 0
+        ? rawTitle.trim()
+        : this.pack.question.trim() || this.caseId;
+    return {
+      case_id: this.caseId,
+      title,
+      data_origin: this.dataOrigin,
+      synthetic_only: this.syntheticOnly,
+      time_window: {
+        start_iso: this.pack.startInclusiveIso,
+        end_iso: this.pack.endExclusiveIso,
+      },
+      sources,
+      ...(this.pack.pcapPath !== null && this.hasNetworkCapture
+        ? { pcap_relpath: relArtifact(this.pack.pcapPath) }
+        : {}),
+    };
   }
 
   public elasticSearch(params: ElasticSearchParams): ElasticSearchResult {
