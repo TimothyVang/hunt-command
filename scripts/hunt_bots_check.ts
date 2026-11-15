@@ -506,17 +506,31 @@ export function runAllChecks(repoRoot: string): {
     return { trackedCount: trackedFiles.length, testCount: 0, violations };
   }
 
-  const tscRun = spawnSync(process.execPath, [tscEntry, "--noEmit"], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    windowsHide: true,
-  });
-  if (tscRun.status !== 0) {
-    const output = `${tscRun.stdout ?? ""}\n${tscRun.stderr ?? ""}`.trim();
-    violations.push({
-      rule: "TYPECHECK_FAILED",
-      message: `tsc --noEmit failed (exit ${tscRun.status}):\n${output}`,
+  // The root project covers packages/ and scripts/. Each app under apps/ owns
+  // its compiler settings (JSX, DOM libs, Electron node types), so it is
+  // checked against its own tsconfig.node.json / tsconfig.web.json instead.
+  const tscProjects: string[] = ["tsconfig.json"];
+  const appsDir = path.join(repoRoot, "apps");
+  if (fs.existsSync(appsDir)) {
+    for (const app of fs.readdirSync(appsDir).sort()) {
+      for (const cfg of ["tsconfig.node.json", "tsconfig.web.json"]) {
+        if (fs.existsSync(path.join(appsDir, app, cfg))) tscProjects.push(`apps/${app}/${cfg}`);
+      }
+    }
+  }
+  for (const project of tscProjects) {
+    const tscRun = spawnSync(process.execPath, [tscEntry, "--noEmit", "-p", project], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      windowsHide: true,
     });
+    if (tscRun.status !== 0) {
+      const output = `${tscRun.stdout ?? ""}\n${tscRun.stderr ?? ""}`.trim();
+      violations.push({
+        rule: "TYPECHECK_FAILED",
+        message: `tsc --noEmit -p ${project} failed (exit ${tscRun.status}):\n${output}`,
+      });
+    }
   }
 
   const testRun = spawnSync(process.execPath, ["test"], {
