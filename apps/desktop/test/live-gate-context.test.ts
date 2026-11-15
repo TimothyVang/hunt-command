@@ -33,6 +33,24 @@ const HANDOFFS = [
   },
 ] as unknown as Parameters<typeof projectLiveGate>[2];
 
+type Rec = { id: string; kind: string; status: string; timestamp_iso: string | null; title: string; fields: Record<string, unknown> };
+
+/** F18 wire shape: `cited` lists every id with its status; `evidence` is the first page of records. */
+function paged(records: Rec[], extra: Partial<{ cited: unknown[]; evidence: Rec[]; evidence_total: number; evidence_next_cursor: string | null }> = {}) {
+  return {
+    cited: records.map((r) => ({ id: r.id, kind: r.kind, status: r.status })),
+    evidence: records,
+    evidence_total: records.length,
+    evidence_next_cursor: null,
+    ...extra,
+  };
+}
+
+const AFFECTED_OPTIONAL = {
+  step_id: "incident", profile: "framework-coordinator", wave: "incident", optional: true,
+  approve_transition: "reconcile_drop", reject_reason_code: "reconcile_rejected",
+};
+
 function incidentContext(overrides: Record<string, unknown> = {}) {
   return {
     run_id: "run-1", case_id: "c1", gate: "incident", payload_sha256: DIGEST,
@@ -42,11 +60,10 @@ function incidentContext(overrides: Record<string, unknown> = {}) {
         missing_event_ids: [], missing_frame_ids: [], missing_ioc_ids: [], ambiguous_ids: [], out_of_scope_ids: [],
         source_status: "ok",
       },
-      evidence: [{
+      ...paged([{
         id: EVT, kind: "evt", status: "verified", timestamp_iso: "2026-11-14T10:01:00Z",
         title: "Process executed.", fields: { "host.name": "wks-01", "process.name": "beacon.exe", message: "Process executed." },
-      }],
-      evidence_truncated: false,
+      }]),
     },
     ...overrides,
   };
@@ -89,28 +106,33 @@ describe("F4: gate approval requires the gate's decision context", () => {
     expect(missingGateContextReason(p.activeGate)).toBeNull();
   });
 
-  test("truncated incident evidence is never presented as complete or approvable", () => {
-    const ctx = incidentContext();
-    ctx.incident.evidence_truncated = true;
-    const p = projectLiveGate("run-1", OPEN, HANDOFFS, ctx);
-    expect(p.activeGate.contextError).toContain("truncated");
-    expect(p.activeGate.incidentSummary).toBeUndefined();
-    expect(p.citationReceipt).toBeNull();
-    expect(p.activeGate.incidentHandoff?.claims[0]?.statement).toContain("Beacon seen");
-    expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
-    expect(validateGateSubmission(p.activeGate, draft("reject")).valid).toBe(true);
+  test("an incomplete or inconsistent cited list is never presented as complete or approvable", () => {
+    const inc = incidentContext().incident;
+    const bad: Array<[string, unknown]> = [
+      ["cited omits a cited id", { ...inc, cited: [], evidence: [], evidence_total: 0 }],
+      ["total disagrees", { ...inc, evidence_total: 2 }],
+      ["record status differs from cited", { ...inc, evidence: [{ ...inc.evidence[0]!, status: "unresolved" }] }],
+      ["pages end early", { ...inc, evidence: [], evidence_next_cursor: null }],
+      ["repeated id", { ...inc, cited: [...inc.cited, ...inc.cited], evidence_total: 2 }],
+      ["legacy truncated shape", { citation_receipt: inc.citation_receipt, evidence: inc.evidence, evidence_truncated: true }],
+    ];
+    for (const [label, incident] of bad) {
+      const p = projectLiveGate("run-1", OPEN, HANDOFFS, incidentContext({ incident }));
+      expect([label, typeof p.activeGate.contextError]).toEqual([label, "string"]);
+      expect(p.activeGate.incidentSummary).toBeUndefined();
+      expect(p.citationReceipt).toBeNull();
+      expect(p.activeGate.incidentHandoff?.claims[0]?.statement).toContain("Beacon seen");
+      expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
+      expect(validateGateSubmission(p.activeGate, draft("reject")).valid).toBe(true);
+    }
   });
 
-  test("truncated reconcile evidence also blocks approval", () => {
+  test("unchecked statuses on an incident gate fail closed (only a citation reconcile may carry them)", () => {
     const inc = incidentContext().incident;
-    const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, {
-      run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
-      reconcile: { reason_code: "citation_source_unavailable", citation_receipt: inc.citation_receipt,
-        unavailable_sources: [], evidence: inc.evidence, evidence_truncated: true },
-    });
-    expect(p.activeGate.contextError).toContain("truncated");
+    const unchecked = { ...inc.evidence[0]!, status: "unchecked", timestamp_iso: null, title: "", fields: {} };
+    const p = projectLiveGate("run-1", OPEN, HANDOFFS, incidentContext({ incident: { ...inc, ...paged([unchecked]) } }));
+    expect(p.activeGate.contextError).toContain("unchecked");
     expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
-    expect(validateGateSubmission(p.activeGate, draft("reject")).valid).toBe(true);
   });
 
   test("an absent incident handoff cannot be approved", () => {
@@ -122,6 +144,7 @@ describe("F4: gate approval requires the gate's decision context", () => {
   test("unresolved citations keep approve blocked by the citation rule", () => {
     const ctx = incidentContext();
     (ctx.incident as { evidence: Array<{ status: string }> }).evidence[0]!.status = "unresolved";
+    (ctx.incident as { cited: Array<{ status: string }> }).cited[0]!.status = "unresolved";
     (ctx.incident as { citation_receipt: { verified: boolean } }).citation_receipt.verified = false;
     const p = projectLiveGate("run-1", OPEN, HANDOFFS, ctx);
     expect(p.activeGate.incidentSummary!.citationReceipt.allVerified).toBe(false);
@@ -136,7 +159,7 @@ describe("F4: gate approval requires the gate's decision context", () => {
       ["other run", incidentContext({ run_id: "run-2" })],
       ["other gate", { ...incidentContext(), gate: "reconcile", incident: undefined, reconcile: { reason_code: "previous_dispatch_unknown", receipts: [{ execution_id: "e", session_id: "s", input_id: "i", step_id: "x", profile: "framework-coordinator", reserved_at: "t", reason_code: "previous_dispatch_unknown" }] } }],
       ["no incident block", { run_id: "run-1", case_id: "c1", gate: "incident", payload_sha256: DIGEST }],
-      ["uncovered citation", incidentContext({ incident: { ...incidentContext().incident, evidence: [] } })],
+      ["uncovered citation", incidentContext({ incident: { ...incidentContext().incident, ...paged([]) } })],
       ["backend unavailable", incidentContext({ incident: { ...incidentContext().incident, citation_receipt: { ...incidentContext().incident.citation_receipt, source_status: "unavailable" } } })],
     ];
     for (const [label, raw] of cases) {
@@ -151,11 +174,14 @@ describe("F4: gate approval requires the gate's decision context", () => {
     const open = { ...OPEN, gate: "reconcile" as const };
     const p = projectLiveGate("run-1", open, HANDOFFS, {
       run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
-      reconcile: { reason_code: "previous_dispatch_unknown", receipts: [{ execution_id: "exec-1", session_id: "sess-1", input_id: "in-1", step_id: "analysis", profile: "framework-coordinator", reserved_at: "2026-11-14T10:00:05Z", reason_code: "previous_dispatch_unknown" }] },
+      reconcile: { reason_code: "previous_dispatch_unknown",
+        affected_step: { step_id: "analysis", profile: "framework-coordinator", wave: "analysis", optional: false, approve_transition: "reconcile_halt", reject_reason_code: "reconcile_rejected" },
+        receipts: [{ execution_id: "exec-1", session_id: "sess-1", input_id: "in-1", step_id: "analysis", profile: "framework-coordinator", reserved_at: "2026-11-14T10:00:05Z", reason_code: "previous_dispatch_unknown" }] },
     });
     expect(p.activeGate.reconcileContext).toEqual({
       executionId: "exec-1", sessionId: "sess-1", inputId: "in-1", stepId: "analysis",
       profile: "framework-coordinator", reservedAtIso: "2026-11-14T10:00:05Z", reasonCode: "previous_dispatch_unknown",
+      affectedStep: { stepId: "analysis", profile: "framework-coordinator", wave: "analysis", optional: false, approveTransition: "reconcile_halt" },
     });
     expect(missingGateContextReason(p.activeGate)).toBeNull();
   });
@@ -169,8 +195,8 @@ describe("F4: gate approval requires the gate's decision context", () => {
         reason_code: "citation_source_unavailable",
         citation_receipt: { ...inc.citation_receipt, verified: false, source_status: "unavailable" },
         unavailable_sources: ["events"],
-        evidence: [{ ...inc.evidence[0]!, status: "unresolved", timestamp_iso: null, title: "", fields: {} }],
-        evidence_truncated: false,
+        ...paged([{ ...inc.evidence[0]!, status: "unchecked", timestamp_iso: null, title: "", fields: {} }]),
+        affected_step: AFFECTED_OPTIONAL,
       },
     }, undefined, HANDOFFS[0]);
     expect(p.activeGate.contextError).toBeUndefined();
@@ -179,8 +205,36 @@ describe("F4: gate approval requires the gate's decision context", () => {
     if (rc.reasonCode !== "citation_source_unavailable") throw new Error("narrowing");
     expect(rc.unavailableSources).toEqual(["events"]);
     expect(rc.citationReceipt.entries.map((e) => [e.citationId, e.status])).toEqual([[EVT, "unresolved"]]);
+    expect(rc.affectedStep).toEqual({ stepId: "incident", profile: "framework-coordinator", wave: "incident", optional: true, approveTransition: "reconcile_drop" });
     expect(missingGateContextReason(p.activeGate)).toBeNull();
     expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(true);
+  });
+
+  test("F17: a citation reconcile without an identifiable affected step cannot be approved", () => {
+    const inc = incidentContext().incident;
+    const ctx = (affected_step?: unknown) => ({
+      run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
+      reconcile: {
+        reason_code: "citation_source_unavailable",
+        citation_receipt: { ...inc.citation_receipt, verified: false, source_status: "unavailable" },
+        unavailable_sources: ["events"],
+        ...paged([{ ...inc.evidence[0]!, status: "unchecked", timestamp_iso: null, title: "", fields: {} }]),
+        ...(affected_step ? { affected_step } : {}),
+      },
+    });
+    // Missing affected_step: the context itself is invalid (fail closed).
+    const missing = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, ctx(undefined), undefined, HANDOFFS[0]);
+    expect(missing.activeGate.contextError).toBeDefined();
+    expect(validateGateSubmission(missing.activeGate, draft("approve")).valid).toBe(false);
+    expect(validateGateSubmission(missing.activeGate, draft("reject")).valid).toBe(true);
+    // Present but for another step, or inconsistent (optional with a halt transition): step not identified.
+    for (const affected of [{ ...AFFECTED_OPTIONAL, step_id: "other-step" }, { ...AFFECTED_OPTIONAL, approve_transition: "reconcile_halt" }]) {
+      const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, ctx(affected), undefined, HANDOFFS[0]);
+      expect(p.activeGate.contextError).toBeUndefined();
+      expect(String(missingGateContextReason(p.activeGate))).toContain("could not be identified");
+      expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
+      expect(validateGateSubmission(p.activeGate, draft("reject")).valid).toBe(true);
+    }
   });
 
   test("an outage projects only affected cited IDs as unresolved without inventing evidence", () => {
@@ -196,7 +250,12 @@ describe("F4: gate approval requires the gate's decision context", () => {
         reason_code: "citation_source_unavailable",
         citation_receipt: { ...inc.citation_receipt, verified: false, source_status: "unavailable" },
         unavailable_sources: ["events", "packets", "intel"],
-        evidence: [], evidence_truncated: false,
+        ...paged([
+          { id: EVT, kind: "evt", status: "unchecked", timestamp_iso: null, title: "", fields: {} },
+          { id: "frame-42", kind: "frame", status: "unchecked", timestamp_iso: null, title: "", fields: {} },
+          { id: "ioc-00123", kind: "ioc", status: "unchecked", timestamp_iso: null, title: "", fields: {} },
+        ]),
+        affected_step: AFFECTED_OPTIONAL,
       },
     };
     const open = { ...OPEN, gate: "reconcile" as const };
@@ -209,28 +268,35 @@ describe("F4: gate approval requires the gate's decision context", () => {
       { citationId: "ioc-00123", kind: "ioc", status: "unresolved", referencedIn: [{ sourceKind: "limitation", sourceId: "incident:limitation-1", stepId: "incident" }] },
     ]);
     expect([...p.citationStatus.values()]).toEqual(["unresolved", "unresolved", "unresolved"]);
-    expect(p.evidenceCatalog).toEqual({});
+    expect(Object.values(p.evidenceCatalog).every((r) => !r.verified && Object.keys(r.fields).length === 0)).toBe(true);
     expect(p.events).toEqual([]);
     expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(true);
 
     const partial = projectLiveGate("run-1", open, [], {
       ...context,
-      reconcile: { ...context.reconcile, unavailable_sources: ["packets", "intel"], evidence: inc.evidence },
+      reconcile: {
+        ...context.reconcile,
+        unavailable_sources: ["packets", "intel"],
+        ...paged([
+          inc.evidence[0]!,
+          { id: "frame-42", kind: "frame", status: "unchecked", timestamp_iso: null, title: "", fields: {} },
+          { id: "ioc-00123", kind: "ioc", status: "unchecked", timestamp_iso: null, title: "", fields: {} },
+        ]),
+      },
     }, undefined, failed);
     expect(partial.activeGate.contextError).toBeUndefined();
     expect(partial.citationReceipt).toMatchObject({ verifiedCount: 1, unresolvedCount: 2, allVerified: false });
     expect(partial.evidenceCatalog[EVT]?.fields["host.name"]).toBe("wks-01");
-    expect(Object.keys(partial.evidenceCatalog)).toEqual([EVT]);
+    expect(Object.values(partial.evidenceCatalog).filter((r) => r.verified).map((r) => r.id)).toEqual([EVT]);
     expect(partial.events.map((event) => event.eventId)).toEqual([EVT]);
 
     const cases = [
-      { ...context.reconcile, unavailable_sources: ["events", "packets"] },
-      { ...context.reconcile, unavailable_sources: [] },
       { ...context.reconcile, unavailable_sources: ["unrelated"] },
       { ...context.reconcile, evidence_truncated: true },
-      { ...context.reconcile, evidence_truncated: undefined },
+      { ...context.reconcile, cited: context.reconcile.cited.slice(1), evidence: context.reconcile.evidence.slice(1), evidence_total: 2 },
+      { ...context.reconcile, evidence_total: 4 },
       { ...context.reconcile, citation_receipt: { ...context.reconcile.citation_receipt, case_id: "other-case" } },
-      { ...context.reconcile, evidence: [{ ...inc.evidence[0]!, kind: "ioc" }] },
+      { ...context.reconcile, ...paged([{ ...inc.evidence[0]!, kind: "ioc" }, ...context.reconcile.evidence.slice(1)]) },
     ];
     for (const reconcile of cases) {
       const rejected = projectLiveGate("run-1", open, [], { ...context, reconcile }, undefined, failed);
@@ -251,7 +317,7 @@ describe("F4: gate approval requires the gate's decision context", () => {
     const inc = incidentContext().incident;
     const ctx = { run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
       reconcile: { reason_code: "citation_source_unavailable", citation_receipt: inc.citation_receipt,
-        unavailable_sources: [], evidence: inc.evidence, evidence_truncated: false } };
+        unavailable_sources: [], ...paged(inc.evidence as Rec[]), affected_step: AFFECTED_OPTIONAL } };
     const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, [earlier], ctx, undefined, failed);
     expect(p.activeGate.contextError).toBeUndefined();
     expect(p.citationReceipt?.entries.map((entry) => entry.citationId)).toEqual([EVT]);
@@ -312,6 +378,7 @@ async function liveHarness(
   gateContext: (params: Record<string, unknown>, store: DurableStateStore) => unknown,
   citedRecordsUnavailable = false,
   incidentCitation = false,
+  extraEventIds: readonly string[] = [],
 ) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "hc-live-gate-"));
   const caseId = "gate-case";
@@ -321,9 +388,13 @@ async function liveHarness(
     case_id: caseId, question: "Which host ran the process?", data_origin: "synthetic",
     time_range_utc: { start_inclusive: "2026-11-14T10:00:00Z", end_exclusive: "2026-11-14T11:00:00Z" },
   }));
-  fs.writeFileSync(path.join(caseDir, "events.jsonl"), `${JSON.stringify({
-    "@timestamp": "2026-11-14T10:01:00Z", event: { id: "evt-1", code: "1" }, host: { name: "gate-host" }, message: "Process executed.",
-  })}\n`);
+  fs.writeFileSync(path.join(caseDir, "events.jsonl"), [
+    { "@timestamp": "2026-11-14T10:01:00Z", event: { id: "evt-1", code: "1" }, host: { name: "gate-host" }, message: "Process executed." },
+    ...extraEventIds.map((id, i) => ({
+      "@timestamp": `2026-11-14T10:${String(2 + Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}Z`,
+      event: { id, code: "1" }, host: { name: `bulk-host-${i % 7}` }, message: `Bulk record ${i}.`,
+    })),
+  ].map((e) => JSON.stringify(e)).join("\n") + "\n");
   const resolver = createCaseDirDataPlaneResolver({ casesDir: path.join(root, "cases"), cacheDir: path.join(root, "cache") });
   const store = new DurableStateStore(path.join(root, "state.sqlite"));
   const gates = new GateAuthority({ stateStore: store, decisionsDir: path.join(root, "decisions") });
@@ -341,12 +412,22 @@ async function liveHarness(
     }),
   };
   const engine = new HuntWaveEngine({ stateStore: store, gateAuthority: gates, modelRunner: runner, telemetry: new InMemoryTelemetrySink(), resolveDataPlane: resolver.resolve });
+  const outage = { on: false };
   const rpcResolver = citedRecordsUnavailable
     ? async (caseId: string) => {
         const plane = await resolver.resolve(caseId);
         return new Proxy(plane, {
           get(target, key) {
+            // Source down, as the daemon detects it: verification reports the source unavailable and
+            // record reads fail.
             if (key === "readCitedRecords") return async () => { throw new Error("citation source unavailable"); };
+            if (key === "verifyCitations" && outage.on) {
+              return async (r: { case_id: string }) => ({
+                verified: false, checked_at: new Date().toISOString(), case_id: r.case_id, total_checked: 0,
+                missing_event_ids: [], missing_frame_ids: [], missing_ioc_ids: [], ambiguous_ids: [], out_of_scope_ids: [],
+                source_status: "unavailable", diagnostic: "citation source unavailable",
+              });
+            }
             const value = Reflect.get(target, key, target);
             return typeof value === "function" ? value.bind(target) : value;
           },
@@ -389,7 +470,7 @@ async function liveHarness(
     await resolver.close();
     fs.rmSync(root, { recursive: true, force: true });
   };
-  return { service, runtimePaths, sidecar, store, gates, calls, recorded, caseId, close };
+  return { service, runtimePaths, sidecar, store, gates, calls, recorded, outage, caseId, close };
 }
 
 async function toIncidentGate(h: Awaited<ReturnType<typeof liveHarness>>) {
@@ -423,12 +504,13 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
         citation_receipt: { ...incidentContext().incident.citation_receipt, case_id: run.case_id, verified: false, source_status: "unavailable" } };
       run.open_gate = { ...run.open_gate!, gate: "reconcile", reason_code: "citation_source_unavailable", unknown_step_id: "analysis" };
       h.store.saveRun(run);
+      h.outage.on = true;
       const context = await h.sidecar.request("hunt.gateContext", { run_id: run.run_id }) as {
-        reconcile: { unavailable_sources: string[]; evidence: unknown[]; evidence_truncated: boolean };
+        reconcile: { unavailable_sources: string[]; cited: Array<{ id: string; status: string }>; evidence: Array<{ id: string; status: string }>; affected_step?: unknown };
       };
       expect(context.reconcile.unavailable_sources).toEqual(["events"]);
-      expect(context.reconcile.evidence).toEqual([]);
-      expect(context.reconcile.evidence_truncated).toBe(false);
+      expect(context.reconcile.cited.map((c) => [c.id, c.status])).toEqual([[EVT, "unchecked"]]);
+      expect(context.reconcile.evidence.map((c) => [c.id, c.status])).toEqual([[EVT, "unchecked"]]);
       const snapshot = await h.service.getWorkbenchState({ huntId: run.run_id });
       expect(snapshot.activeGate?.contextError).toBeUndefined();
       expect(snapshot.activeGate?.reconcileContext?.reasonCode).toBe("citation_source_unavailable");
@@ -437,12 +519,17 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
       expect(snapshot.citationReceipt.allVerified).toBe(false);
       expect(snapshot.activeGate?.reconcileContext?.reasonCode === "citation_source_unavailable" &&
         snapshot.activeGate.reconcileContext.unavailableSources).toEqual(["events"]);
-      expect(missingGateContextReason(snapshot.activeGate!)).toBeNull();
-      await h.service.submitGateDecision({
-        huntId: run.run_id, gate: "reconcile", action: "approve", operatorName: "x", rbacRole: "incident_commander",
+      const decide = (action: "approve" | "reject") => h.service.submitGateDecision({
+        huntId: run.run_id, gate: "reconcile", action, operatorName: "x", rbacRole: "incident_commander",
         checkNote: "Reviewed the unavailable source.", payloadSha256: snapshot.activeGate!.payloadSha256,
         operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
       });
+      const rc = snapshot.activeGate?.reconcileContext;
+      if (rc?.reasonCode !== "citation_source_unavailable") throw new Error("expected a citation reconcile");
+      // The daemon names the affected step (F17): analysis is required, so approval halts the run.
+      expect(rc.affectedStep).toEqual({ stepId: "analysis", profile: rc.affectedStep!.profile, wave: rc.affectedStep!.wave, optional: false, approveTransition: "reconcile_halt" });
+      expect(missingGateContextReason(snapshot.activeGate!)).toBeNull();
+      await decide("approve");
       const reconciled = h.store.getRun(run.run_id)!;
       expect(reconciled.decisions.at(-1)?.action).toBe("approve");
       expect(reconciled.status).toBe("failed");
@@ -531,26 +618,114 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
     }
   });
 
-  test("direct desktop RPC cannot bypass the truncated evidence gate", async () => {
-    const h = await liveHarness(() => undefined);
+  /** A real-daemon incident gate whose handoff cites 1,200 ids that all exist in the case. */
+  async function bulkIncidentGate() {
+    const ids = Array.from({ length: 1_200 }, (_, i) => `evt-b${String(i).padStart(4, "0")}`);
+    const h = await liveHarness(() => undefined, false, false, ids);
+    const snap = await toIncidentGate(h);
+    const run = h.store.getRun(snap.huntId)!;
+    const result = run.results["incident"]!;
+    // 6 claims of 200 ids (each statement <= 2,048 bytes, the handoff <= 16 KiB), written to the store
+    // because a stub model turn is not needed to prove paging.
+    const base = result.handoff!.claims[0]!;
+    const claims = Array.from({ length: 6 }, (_, c) => ({
+      ...base, claim_id: `incident:bulk${c}`, statement: ids.slice(c * 200, c * 200 + 200).join(" "),
+    }));
+    run.results["incident"] = { ...result, handoff: { ...result.handoff!, claims } };
+    h.store.saveRun(run);
+    return { h, ids, huntId: snap.huntId };
+  }
+
+  test("F18: 1,200 cited ids are approvable from complete statuses with a partial record list; a stale cursor is an error", async () => {
+    const { h, huntId } = await bulkIncidentGate();
     try {
-      const snap = await toIncidentGate(h);
-      const run = h.store.getRun(snap.huntId)!;
-      const result = run.results["incident"]!;
-      const ids = Array.from({ length: 501 }, (_, i) => `evt-${i.toString(16).padStart(16, "0")}`);
-      run.results["incident"] = { ...result, handoff: { ...result.handoff!, limitations: [ids.join(" ")] } };
-      h.store.saveRun(run);
-      const input = { hunt_id: snap.huntId, gate: "incident", via: "desktop", payload_sha256: snap.activeGate!.payloadSha256,
-        check_note: "Reviewed evidence.", operator_token: h.gates.sessionAuthority.issueToken("real-analyst", "analyst") };
-      await expect(h.sidecar.request("hunt.decideGate", { ...input, action: "approve" })).rejects.toThrow(/truncated/);
-      expect(h.store.getRun(snap.huntId)!.decisions.map((d) => d.gate)).toEqual(["scope"]);
-      await h.sidecar.request("hunt.decideGate", { ...input, action: "reject" });
-      expect(h.store.getRun(snap.huntId)!.decisions.at(-1)?.action).toBe("reject");
+      const atGate = await h.service.getWorkbenchState({ huntId });
+      const gate = atGate.activeGate!;
+      expect(gate.contextError).toBeUndefined();
+      const receipt = gate.incidentSummary!.citationReceipt;
+      expect([receipt.totalCited, receipt.verifiedCount, receipt.allVerified]).toEqual([1_200, 1_200, true]);
+      expect(gate.evidencePaging).toEqual({ loaded: 200, total: 1_200, hasMore: true });
+      expect(Object.keys(atGate.evidenceCatalog)).toHaveLength(200);
+      // Approval coverage comes from the complete statuses, not from how many records are loaded.
+      expect(missingGateContextReason(gate)).toBeNull();
+      expect(validateGateSubmission(gate, { ...draft("approve"), payloadSha256: gate.payloadSha256 }).valid).toBe(true);
+
+      const once = await h.service.loadMoreGateEvidence({ huntId });
+      expect(once.activeGate!.evidencePaging).toEqual({ loaded: 400, total: 1_200, hasMore: true });
+      // A refresh with the same gate keeps the pages already loaded.
+      const refreshed = await h.service.getWorkbenchState({ huntId });
+      expect(refreshed.activeGate!.evidencePaging!.loaded).toBe(400);
+      expect(Object.keys(refreshed.evidenceCatalog)).toHaveLength(400);
+
+      // Stale cursor: the gate digest changes in the daemon while the desktop holds a cursor. Loading more fails
+      // with an explanation and merges nothing.
+      const real = h.store.getRun(huntId)!.open_gate!.payload_sha256;
+      const moved = h.store.getRun(huntId)!;
+      moved.open_gate = { ...moved.open_gate!, payload_sha256: "d".repeat(64) };
+      h.store.saveRun(moved);
+      await expect(h.service.loadMoreGateEvidence({ huntId })).rejects.toThrow(/changed since its evidence was loaded/);
+      const restored = h.store.getRun(huntId)!;
+      restored.open_gate = { ...restored.open_gate!, payload_sha256: real };
+      h.store.saveRun(restored);
+      const back = await h.service.getWorkbenchState({ huntId });
+      expect(back.activeGate!.evidencePaging).toEqual({ loaded: 400, total: 1_200, hasMore: true });
+
+      // Approve through the real daemon with 400 of 1,200 records loaded and every status complete.
+      const done = await h.service.submitGateDecision({
+        huntId, gate: "incident", action: "approve", operatorName: "x", rbacRole: "incident_commander",
+        checkNote: "Checked every cited status.", payloadSha256: back.activeGate!.payloadSha256,
+        operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
+      });
+      expect(done.gateHistory.map((d) => `${d.gate}:${d.action}`)).toEqual(["scope:approve", "incident:approve"]);
+      expect(h.store.getRun(huntId)!.status).toBe("completed");
+
+      // The completed run has no Load more: every one of its 1,200 records is read through hunt.evidencePage.
+      expect(Object.keys(done.evidenceCatalog)).toHaveLength(1_200);
+      expect(done.events).toHaveLength(1_200);
+      expect([done.citationReceipt.totalCited, done.citationReceipt.allVerified]).toEqual([1_200, true]);
+      expect(h.calls.filter((c) => c === "hunt.evidencePage")).toHaveLength(2);
+
+      // A page that fails, or that does not continue the cited list, leaves no evidence rather than a partial list.
+      const realRequest = h.sidecar.request.bind(h.sidecar);
+      for (const tamper of [
+        async () => { throw new Error("evidence_unavailable"); },
+        async (params: Record<string, unknown>) => {
+          const page = await realRequest("hunt.evidencePage", params) as { evidence: Array<{ id: string }> };
+          return { ...page, evidence: page.evidence.slice(1) };
+        },
+      ]) {
+        (h.sidecar as { request: unknown }).request = (method: string, params?: Record<string, unknown>) =>
+          method === "hunt.evidencePage" ? tamper(params ?? {}) : realRequest(method, params);
+        const broken = await h.service.getWorkbenchState({ huntId });
+        expect(broken.evidenceCatalog).toEqual({});
+        expect(broken.events).toEqual([]);
+        expect(broken.citationReceipt.allVerified).toBe(false);
+      }
     } finally {
       await h.close();
     }
-  });
+  }, 120_000);
 
+  test("F18: Load more pages every one of 1,200 records in cited order and a refresh keeps them", async () => {
+    const { h, ids, huntId } = await bulkIncidentGate();
+    try {
+      let view = await h.service.getWorkbenchState({ huntId });
+      const seen: number[] = [view.activeGate!.evidencePaging!.loaded];
+      for (let page = 0; page < 10 && view.activeGate!.evidencePaging!.hasMore; page++) {
+        view = await h.service.loadMoreGateEvidence({ huntId });
+        seen.push(view.activeGate!.evidencePaging!.loaded);
+      }
+      expect(seen).toEqual([200, 400, 600, 800, 1_000, 1_200]);
+      expect(view.activeGate!.evidencePaging).toEqual({ loaded: 1_200, total: 1_200, hasMore: false });
+      expect(Object.keys(view.evidenceCatalog).sort()).toEqual([...ids].sort());
+      expect(view.evidenceCatalog[ids[1_199]!]?.fields["host.name"]).toBe(`bulk-host-${1_199 % 7}`);
+      const kept = await h.service.getWorkbenchState({ huntId });
+      expect(kept.activeGate!.evidencePaging).toEqual({ loaded: 1_200, total: 1_200, hasMore: false });
+      expect(Object.keys(kept.evidenceCatalog)).toHaveLength(1_200);
+    } finally {
+      await h.close();
+    }
+  }, 120_000);
 
   test("when the gate context cannot be loaded, approve never reaches the daemon; reject still does", async () => {
     const h = await liveHarness(() => {

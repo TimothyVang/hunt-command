@@ -202,6 +202,8 @@ async function bootstrap(): Promise<void> {
         return await service.globalStop(payload);
       case "hunt:submitGateDecision":
         return await service.submitGateDecision(payload);
+      case "hunt:gateEvidencePage":
+        return await service.loadMoreGateEvidence(payload);
       case "hunt:inspectTranscriptPage":
         return await service.inspectTranscriptPage(payload);
       case "hunt:queryDissector":

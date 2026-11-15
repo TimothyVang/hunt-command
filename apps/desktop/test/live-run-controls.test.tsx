@@ -57,7 +57,7 @@ describe("live run controls", () => {
     expect(html).toContain("Rejection fails the run");
   });
 
-  test("incident handoff claims and limitations remain visible when evidence is truncated", () => {
+  test("incident handoff claims and limitations remain visible when the gate context fails to load", () => {
     const snapshot = buildFixtureWorkbenchSnapshot();
     const handoff = { ...snapshot.handoffs[0]!, step_id: "incident", limitations: ["Coverage excludes remote hosts."] };
     const claim = { ...handoff.claims[0]!, statement: "Incident finding for operator review." };
@@ -69,16 +69,50 @@ describe("live run controls", () => {
       incident: { citation_receipt: { verified: true, checked_at: "2026-11-14T10:00:00Z",
         case_id: snapshot.caseMetadata.case_id, total_checked: 0, missing_event_ids: [], missing_frame_ids: [],
         missing_ioc_ids: [], ambiguous_ids: [], out_of_scope_ids: [], source_status: "ok" },
-        evidence: [], evidence_truncated: true },
+        // Inconsistent F18 block (total disagrees with the cited list): the context fails closed.
+        cited: [], evidence: [], evidence_total: 3, evidence_next_cursor: null },
     }).activeGate;
     const html = renderToStaticMarkup(<AuthorityGateCard activeGate={gate}
       caseMetadata={snapshot.caseMetadata} requiresToken={false} draft={{ operatorName: "operator", rbacRole: "lead_hunter", checkNote: "checked" }}
       onUpdateDraft={() => {}} onSubmitDecision={() => {}} onSelectCitation={() => {}} />);
     expect(html).toContain("Incident finding for operator review.");
     expect(html).toContain("Coverage excludes remote hosts.");
-    expect(html).toContain("truncated");
+    expect(html).toContain("could not be loaded");
     expect(html).not.toContain("Automated Citation Verification Receipt:");
     expect(html).toContain('data-testid="gate-approve-button" disabled');
+  });
+
+  test("F18: a paged incident gate says how many records are loaded and offers Load more, never implying completeness", () => {
+    const snapshot = buildFixtureWorkbenchSnapshot();
+    const ids = Array.from({ length: 1_200 }, (_, i) => `evt-p${String(i).padStart(4, "0")}`);
+    const claims = Array.from({ length: 6 }, (_, c) => ({
+      ...snapshot.handoffs[0]!.claims[0]!, claim_id: `incident:p${c}`, statement: ids.slice(c * 200, c * 200 + 200).join(" "),
+    }));
+    const handoff = { ...snapshot.handoffs[0]!, step_id: "incident", claims, limitations: [] };
+    const cited = ids.map((id) => ({ id, kind: "evt", status: "verified" }));
+    const evidence = cited.slice(0, 200).map((c) => ({ ...c, timestamp_iso: "2026-11-14T10:01:00Z", title: `Record ${c.id}`, fields: { "host.name": "h" } }));
+    const projection = projectLiveGate(snapshot.huntId, {
+      gate: "incident", payload_sha256: "a".repeat(64), opened_at: "2026-11-14T10:00:00Z", expires_at: "2099-01-01T00:00:00Z",
+    }, [handoff], {
+      run_id: snapshot.huntId, case_id: snapshot.caseMetadata.case_id, gate: "incident", payload_sha256: "a".repeat(64),
+      incident: { citation_receipt: { verified: true, checked_at: "2026-11-14T10:00:00Z", case_id: snapshot.caseMetadata.case_id,
+        total_checked: 1_200, missing_event_ids: [], missing_frame_ids: [], missing_ioc_ids: [], ambiguous_ids: [], out_of_scope_ids: [],
+        source_status: "ok" }, cited, evidence, evidence_total: 1_200, evidence_next_cursor: "cursor-1" },
+    });
+    expect(projection.activeGate.contextError).toBeUndefined();
+    expect(projection.activeGate.incidentSummary!.citationReceipt.totalCited).toBe(1_200);
+    expect(projection.activeGate.incidentSummary!.citationReceipt.allVerified).toBe(true);
+    expect(projection.pagingState?.nextCursor).toBe("cursor-1");
+    const html = renderToStaticMarkup(<AuthorityGateCard activeGate={projection.activeGate}
+      caseMetadata={snapshot.caseMetadata} requiresToken={false} draft={{ operatorName: "operator", rbacRole: "lead_hunter", checkNote: "checked" }}
+      onUpdateDraft={() => {}} onSubmitDecision={() => {}} onSelectCitation={() => {}} onLoadMoreEvidence={async () => null} />);
+    const text = html.replace(/<[^>]+>/g, "").replace(/\s+/g, " ");
+    expect(text).toContain("1200/1200 resolved");
+    expect(text).toContain("200 of 1200 records loaded (partial record list; every citation status above is complete)");
+    expect(html).toContain('data-testid="evidence-load-more"');
+    expect(/<button[^>]*data-testid="gate-approve-button"[^>]*>/.exec(html)?.[0]).not.toContain('disabled=""');
+    // The cursor never reaches the renderer.
+    expect(JSON.stringify(projection.activeGate)).not.toContain("cursor-1");
   });
 
   test("routes start, list and selection to the desktop bridge and returns its snapshots", async () => {

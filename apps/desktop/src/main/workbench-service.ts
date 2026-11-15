@@ -25,10 +25,21 @@ import {
 } from "@hunt-command/shared";
 import { buildFixtureWorkbenchSnapshot } from "../shared/fixture-workbench.ts";
 import { missingGateContextReason, validateGateSubmission } from "../shared/gate-validation.ts";
-import { projectLiveEvidence, projectLiveGate, projectTranscriptPage, type LiveEvidenceProjection } from "./live-gate-context.ts";
+import {
+  EVIDENCE_PAGE_LIMIT,
+  RUN_EVIDENCE_PAGE_LIMIT,
+  type GateEvidencePaging,
+  projectEvidencePage,
+  projectEvidenceRecords,
+  projectLiveEvidence,
+  projectLiveGate,
+  projectTranscriptPage,
+  type LiveEvidenceProjection,
+} from "./live-gate-context.ts";
 import {
   ExportReportInputSchema,
   FilmCutInputSchema,
+  GateEvidencePageInputSchema,
   GlobalStopInputSchema,
   InspectTranscriptInputSchema,
   QueryDissectorInputSchema,
@@ -174,6 +185,8 @@ export class WorkbenchService {
   readonly #deps: WorkbenchServiceDeps;
   readonly #runs = new Map<string, WorkbenchSnapshot>();
   readonly #liveRunIds = new Set<string>();
+  /** Cited-record paging per run (F18); holds the opaque cursor, which never reaches the renderer. */
+  readonly #evidencePaging = new Map<string, GateEvidencePaging>();
   #selectionVersion = 0;
   #activeHuntId: string;
 
@@ -451,6 +464,52 @@ export class WorkbenchService {
     return this.#attachWatchState(nextSnap);
   }
 
+  /**
+   * Loads the next page of the open gate's cited records (F18) and merges it into the cached snapshot.
+   * The page must continue the complete `cited` list exactly; a stale cursor (the gate or its digest
+   * changed) or any mismatch is an error, and nothing is merged. Approval never depends on this.
+   */
+  async loadMoreGateEvidence(rawInput: unknown): Promise<WorkbenchSnapshot> {
+    const parsed = GateEvidencePageInputSchema.parse(rawInput);
+    const paging = this.#evidencePaging.get(parsed.huntId);
+    const current = this.#runs.get(parsed.huntId);
+    if (!paging || !current?.activeGate || current.activeGate.payloadSha256 !== paging.payloadSha256) {
+      throw new Error("No paged gate evidence is open for this hunt; refresh the gate.");
+    }
+    if (paging.nextCursor === null) return this.#attachWatchState(current);
+    let raw: unknown;
+    try {
+      raw = await this.#deps.sidecar.request("hunt.gateEvidencePage", {
+        run_id: parsed.huntId,
+        cursor: paging.nextCursor,
+        limit: EVIDENCE_PAGE_LIMIT,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        /stale_cursor/.test(message)
+          ? `The gate changed since its evidence was loaded (${message}). Refresh the gate before loading more records.`
+          : `Loading more evidence failed: ${message}`,
+      );
+    }
+    const page = projectEvidencePage(raw, paging);
+    const handoffs = current.activeGate.gate === "reconcile" ? [] : current.handoffs;
+    const added = projectEvidenceRecords(handoffs, page.records);
+    paging.loaded += page.records.length;
+    paging.nextCursor = page.nextCursor;
+    const next: WorkbenchSnapshot = {
+      ...current,
+      activeGate: {
+        ...current.activeGate,
+        evidencePaging: { loaded: paging.loaded, total: paging.cited.length, hasMore: paging.nextCursor !== null },
+      },
+      evidenceCatalog: { ...current.evidenceCatalog, ...added.evidenceCatalog },
+      events: [...current.events, ...added.events].sort((a, b) => a.timestampMs - b.timestampMs),
+    };
+    this.#runs.set(next.huntId, next);
+    return this.#attachWatchState(next);
+  }
+
   async inspectTranscriptPage(rawInput: unknown): Promise<TranscriptPageSlice> {
     const parsed = InspectTranscriptInputSchema.parse(rawInput);
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
@@ -723,7 +782,8 @@ export class WorkbenchService {
     if (!checked.open_gate && incidentHandoff.success && incidentHandoff.data.step_id === "incident") {
       try {
         const rawEvidence = await this.#deps.sidecar.request("hunt.evidence", { run_id: run.run_id });
-        evidence = projectLiveEvidence(run.run_id, run.case_id, handoffs, rawEvidence);
+        evidence = await projectLiveEvidence(run.run_id, run.case_id, handoffs, rawEvidence, (cursor) =>
+          this.#deps.sidecar.request("hunt.evidencePage", { run_id: run.run_id, cursor, limit: RUN_EVIDENCE_PAGE_LIMIT }));
       } catch {
         // A failed read must not retain stale evidence or claim verified citations.
       }
@@ -794,8 +854,48 @@ export class WorkbenchService {
       watchState: this.#standbyWatchState(run.run_id),
     };
     this.#liveRunIds.add(run.run_id);
-    this.#runs.set(run.run_id, snapshot);
-    return snapshot;
+    const merged = this.#carryLoadedEvidence(run.run_id, snapshot, gate?.pagingState);
+    this.#runs.set(run.run_id, merged);
+    return merged;
+  }
+
+  /**
+   * A refresh re-reads the gate's first record page. When the run, gate, digest and complete cited list are
+   * unchanged, records the operator already paged in are kept (and the cursor continues); any change, such
+   * as a status moving after a source came back, starts again from the daemon's first page.
+   */
+  #carryLoadedEvidence(runId: string, snapshot: WorkbenchSnapshot, fresh: GateEvidencePaging | undefined): WorkbenchSnapshot {
+    const prior = this.#evidencePaging.get(runId);
+    const previous = this.#runs.get(runId);
+    if (!fresh) {
+      this.#evidencePaging.delete(runId);
+      return snapshot;
+    }
+    const sameCited = (a: GateEvidencePaging, b: GateEvidencePaging) =>
+      a.cited.length === b.cited.length &&
+      a.cited.every((c, i) => c.id === b.cited[i]!.id && c.kind === b.cited[i]!.kind && c.status === b.cited[i]!.status);
+    if (
+      !prior || !previous || !snapshot.activeGate || prior.runId !== fresh.runId || prior.gate !== fresh.gate ||
+      prior.payloadSha256.toLowerCase() !== fresh.payloadSha256.toLowerCase() || prior.loaded <= fresh.loaded || !sameCited(prior, fresh)
+    ) {
+      this.#evidencePaging.set(runId, fresh);
+      return snapshot;
+    }
+    const keep = new Set(prior.cited.slice(0, prior.loaded).map((c) => c.id));
+    const carried = Object.fromEntries(Object.entries(previous.evidenceCatalog).filter(([id]) => keep.has(id)));
+    const eventIds = new Set(snapshot.events.map((e) => e.eventId));
+    const events = [...snapshot.events, ...previous.events.filter((e) => keep.has(e.eventId) && !eventIds.has(e.eventId))]
+      .sort((a, b) => a.timestampMs - b.timestampMs);
+    this.#evidencePaging.set(runId, prior);
+    return {
+      ...snapshot,
+      evidenceCatalog: { ...carried, ...snapshot.evidenceCatalog },
+      events,
+      activeGate: {
+        ...snapshot.activeGate,
+        evidencePaging: { loaded: prior.loaded, total: prior.cited.length, hasMore: prior.nextCursor !== null },
+      },
+    };
   }
 
   #selectHunt(huntId: string): void {

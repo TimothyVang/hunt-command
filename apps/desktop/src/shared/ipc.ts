@@ -127,6 +127,13 @@ export const WatchOpenInputSchema = z
 
 export type WatchOpenInput = z.infer<typeof WatchOpenInputSchema>;
 
+/** Load the next page of the open gate's cited records; the cursor stays in the main process. */
+export const GateEvidencePageInputSchema = z
+  .object({
+    huntId: z.string().min(1).max(128),
+  })
+  .strict();
+
 export const ExportReportInputSchema = z
   .object({
     huntId: z.string().min(1).max(128),

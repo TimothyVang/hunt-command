@@ -77,11 +77,13 @@ describe("desktop renders the daemon's real citation_source_unavailable reconcil
     test(`source ${readable ? "back" : "still down"}`, async () => {
       const resolver = createCaseDirDataPlaneResolver({ casesDir, cacheDir: tmp("desk-csu-cache-") });
       const real = await resolver.resolve(CASE_ID);
+      let sourceBack = false;
       const plane: HuntDataPlanePort = {
         caseMetadata: real.caseMetadata,
         capabilities: () => real.capabilities(),
         executeTool: (...a) => real.executeTool(...a),
-        verifyCitations: async (r) => ({
+        // The source is down while the gate opens; for the context it is back (real verification) or still down.
+        verifyCitations: async (r) => sourceBack ? real.verifyCitations(r) : ({
           verified: false, checked_at: new Date().toISOString(), case_id: r.case_id, total_checked: 0,
           missing_event_ids: [], missing_frame_ids: [], missing_ioc_ids: [], ambiguous_ids: [], out_of_scope_ids: [],
           source_status: "unavailable", diagnostic: "events index offline",
@@ -93,6 +95,7 @@ describe("desktop renders the daemon's real citation_source_unavailable reconcil
         const [started] = await serve(runtimeDir, plane, rpc("s", "hunt.start", { run_id: "hunt-dcsu", case_id: CASE_ID, scope: "Scope.", follow_ups: 0 }));
         const run = started!.result as PersistedHuntRun;
         expect(run.open_gate?.gate).toBe("reconcile");
+        sourceBack = readable;
         const [ctx] = await serve(runtimeDir, plane, rpc("g", "hunt.gateContext", { run_id: "hunt-dcsu" }));
         expect(ctx!.error).toBeUndefined();
 
@@ -123,10 +126,14 @@ describe("desktop renders the daemon's real citation_source_unavailable reconcil
         } else {
           expect(rc.unavailableSources).toEqual(["events"]);
         }
-        expect(missingGateContextReason(p.activeGate)).toBeNull();
-        expect(validateGateSubmission(p.activeGate, {
+        const approve = validateGateSubmission(p.activeGate, {
           operatorName: "a", rbacRole: "lead_hunter", checkNote: "Checked the source status.", payloadSha256: run.open_gate!.payload_sha256, action: "approve",
-        }).valid).toBe(true);
+        });
+        // F17: the daemon names the affected step and its engine outcome, so approval is allowed.
+        expect(rc.affectedStep?.stepId).toBe(String(unknownStepId));
+        expect(rc.affectedStep?.approveTransition).toBe(rc.affectedStep?.optional ? "reconcile_drop" : "reconcile_halt");
+        expect(missingGateContextReason(p.activeGate)).toBeNull();
+        expect(approve.valid).toBe(true);
       } finally {
         await resolver.close();
       }

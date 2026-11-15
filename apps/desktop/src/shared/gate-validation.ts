@@ -125,6 +125,27 @@ export interface GateValidationOutcome {
 }
 
 /**
+ * What Approve and Reject do on a reconcile gate, worded from the daemon engine's `planGateTransition`
+ * (packages/daemon/src/wave-engine.ts): approve on an optional step marks it `dropped` with reason
+ * `reconciled_drop` and resumes the run; approve on a required step fails the run with
+ * `reconciled_halt_required_step`; reject fails the run with `reconcile_rejected` and stops steps
+ * awaiting review or approval. Nothing is re-run in any case.
+ */
+export function reconcileOutcomeText(step: {
+  stepId: string;
+  approveTransition: "reconcile_drop" | "reconcile_halt";
+}): { approve: string; reject: string } {
+  return {
+    approve:
+      step.approveTransition === "reconcile_drop"
+        ? `Approve: step '${step.stepId}' is optional, so it is marked dropped (reason_code reconciled_drop) without being re-run, and the run resumes.`
+        : `Approve: step '${step.stepId}' is required and has no verified handoff, so the run fails (status failed, reason_code reconciled_halt_required_step). The step is not re-run.`,
+    reject:
+      "Reject: the run fails (status failed, reason_code reconcile_rejected); steps awaiting review or approval are stopped.",
+  };
+}
+
+/**
  * Why `approve` must be refused because the gate's decision context is not on screen, or `null`.
  * Fail closed: nobody may approve a gate whose context (scope text or summary, incident citation
  * summary, reconcile receipt) failed to load or was never provided. Rejecting stays possible.
@@ -141,6 +162,13 @@ export function missingGateContextReason(activeGate: ActiveGatePrompt): string |
   }
   if (activeGate.gate === "reconcile" && !activeGate.reconcileContext) {
     return "Reconcile dispatch receipt is not available, so approval is disabled.";
+  }
+  if (
+    activeGate.gate === "reconcile" &&
+    activeGate.reconcileContext?.reasonCode === "citation_source_unavailable" &&
+    !activeGate.reconcileContext.affectedStep
+  ) {
+    return "The step this reconcile gate decides could not be identified, so approval is disabled.";
   }
   return null;
 }

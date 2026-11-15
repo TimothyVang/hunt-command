@@ -6,7 +6,7 @@ import {
   PROFILE_DISPLAY_TITLES,
   type CaseMetadata,
 } from "@hunt-command/shared";
-import { missingGateContextReason, validateGateSubmission } from "../../../shared/gate-validation.ts";
+import { missingGateContextReason, reconcileOutcomeText, validateGateSubmission } from "../../../shared/gate-validation.ts";
 import { SafeForensicText } from "../components/SafeForensicText.tsx";
 import type { ActiveGatePrompt } from "../../../shared/workbench-types.ts";
 import type { GateDraftFields } from "../state/workbench-store.ts";
@@ -19,6 +19,57 @@ export interface AuthorityGateCardProps {
   onUpdateDraft: (patch: Partial<GateDraftFields>) => void;
   onSubmitDecision: (action: "approve" | "reject", operatorToken?: string) => void;
   onSelectCitation: (citationId: string) => void;
+  /** Loads the next page of cited records; resolves to an error message, or null on success. */
+  onLoadMoreEvidence?: () => Promise<string | null>;
+}
+
+/**
+ * "N of M records loaded" for paged gate evidence (F18). Citation statuses above are complete; only the
+ * record details below are paged, and a partial list is always labelled as partial.
+ */
+export function EvidencePagingBar({
+  paging,
+  onLoadMore,
+}: {
+  paging: { loaded: number; total: number; hasMore: boolean };
+  onLoadMore?: () => Promise<string | null>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const partial = paging.loaded < paging.total;
+  return (
+    <div data-testid="evidence-paging" className="rounded border border-slate-800 bg-slate-950/70 px-2 py-1 text-[11px] font-mono space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <span className={partial ? "text-amber-200" : "text-slate-300"}>
+          {paging.loaded} of {paging.total} records loaded
+          {partial ? " (partial record list; every citation status above is complete)" : " (all records loaded)"}
+        </span>
+        {paging.hasMore && onLoadMore && (
+          <button
+            type="button"
+            data-testid="evidence-load-more"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              setError(null);
+              void onLoadMore().then((err) => {
+                setBusy(false);
+                setError(err);
+              });
+            }}
+            className="rounded border border-cyan-500/50 bg-cyan-950/70 px-2 py-0.5 text-cyan-100 disabled:opacity-40 cursor-pointer"
+          >
+            {busy ? "Loading…" : "Load more"}
+          </button>
+        )}
+      </div>
+      {error && (
+        <div role="alert" data-testid="evidence-paging-error" className="text-rose-300">
+          {error}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function AuthorityGateCard({
@@ -29,6 +80,7 @@ export function AuthorityGateCard({
   onUpdateDraft,
   onSubmitDecision,
   onSelectCitation,
+  onLoadMoreEvidence,
 }: AuthorityGateCardProps) {
   const [operatorToken, setOperatorToken] = useState("");
   const submit = (action: "approve" | "reject") => {
@@ -292,6 +344,12 @@ export function AuthorityGateCard({
               ? ` ${activeGate.reconcileContext.additionalReceiptCount} more unknown dispatch(es) are covered by this gate.`
               : ""}
           </div>
+          {activeGate.reconcileContext.affectedStep && (
+            <ul data-testid="reconcile-outcomes" className="list-disc pl-4 text-slate-300 space-y-0.5">
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).approve}</li>
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).reject}</li>
+            </ul>
+          )}
         </div>
       )}
 
@@ -301,11 +359,26 @@ export function AuthorityGateCard({
           className="rounded border border-amber-500/50 bg-amber-950/30 p-2.5 font-mono text-[11px] space-y-1"
         >
           <div className="font-bold text-amber-200">
-            reason_code: citation_source_unavailable — the citation source could not be reached, so the
-            cited records below could not all be verified.
+            reason_code: citation_source_unavailable — the citation source could not be reached while
+            verifying this step&apos;s citations, so its handoff was not accepted.
           </div>
+          {activeGate.reconcileContext.affectedStep ? (
+            <div data-testid="reconcile-affected-step" className="text-slate-200">
+              affected step: {activeGate.reconcileContext.affectedStep.stepId} (
+              {activeGate.reconcileContext.affectedStep.profile}) · wave{" "}
+              {activeGate.reconcileContext.affectedStep.wave} ·{" "}
+              {activeGate.reconcileContext.affectedStep.optional ? "optional" : "required"}
+            </div>
+          ) : (
+            <div data-testid="reconcile-affected-step-missing" className="text-rose-300">
+              affected step: not identified by the daemon
+            </div>
+          )}
           <div className="text-slate-300">
-            unavailable sources: {activeGate.reconcileContext.unavailableSources.join(", ") || "(not named)"}
+            unavailable sources:{" "}
+            {activeGate.reconcileContext.unavailableSources.length > 0
+              ? activeGate.reconcileContext.unavailableSources.join(", ")
+              : "none now (the source is reachable again; statuses below are re-checked)"}
           </div>
           <div className="text-slate-300">
             citations: {activeGate.reconcileContext.citationReceipt.verifiedCount}/
@@ -325,7 +398,17 @@ export function AuthorityGateCard({
               </button>
             ))}
           </div>
+          {activeGate.reconcileContext.affectedStep && (
+            <ul data-testid="reconcile-outcomes" className="list-disc pl-4 text-slate-300 space-y-0.5">
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).approve}</li>
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).reject}</li>
+            </ul>
+          )}
         </div>
+      )}
+
+      {activeGate.evidencePaging && (
+        <EvidencePagingBar paging={activeGate.evidencePaging} onLoadMore={onLoadMoreEvidence} />
       )}
 
       {/* 64-Hex SHA-256 Tamper-Evident Payload Digest */}

@@ -13,7 +13,14 @@ import { extractDataPlaneError } from "@hunt-command/data-plane";
 import { executeDriveGates, type DriveGatesCommandInput } from "./drive-gates.ts";
 import { GateDecisionError } from "./gates.ts";
 import type { DaemonTelemetryEvent, HuntDataPlanePort } from "./ports.ts";
-import { GateContextError, buildGateContext, buildRunEvidence } from "./gate-context.ts";
+import {
+  GATE_EVIDENCE_PAGE_MAX,
+  GateContextError,
+  buildGateContext,
+  buildGateEvidencePage,
+  buildRunEvidence,
+  buildRunEvidencePage,
+} from "./gate-context.ts";
 import {
   TRANSCRIPT_PAGE_DEFAULT_BYTES,
   TRANSCRIPT_PAGE_MAX_BYTES,
@@ -37,6 +44,29 @@ export class RpcRequestError extends Error {
 }
 
 const GateContextParamsSchema = z.object({ run_id: z.string().min(1).max(128) }).strict();
+
+const GateEvidencePageParamsSchema = z
+  .object({
+    run_id: z.string().min(1).max(128),
+    cursor: z.string().min(1).max(2048),
+    limit: z.number().int().min(1).max(GATE_EVIDENCE_PAGE_MAX),
+  })
+  .strict();
+
+const GATE_CONTEXT_ERROR_CODES: Record<GateContextError["errorCode"], number> = {
+  no_open_gate: -32009,
+  gate_context_unavailable: -32010,
+  stale_cursor: -32011,
+  invalid_arguments: -32602,
+};
+
+function toGateContextRpcError(err: unknown): RpcRequestError {
+  if (err instanceof RpcRequestError) return err;
+  if (err instanceof GateContextError) {
+    return new RpcRequestError(GATE_CONTEXT_ERROR_CODES[err.errorCode], err.errorCode, err.message);
+  }
+  return new RpcRequestError(-32010, "gate_context_unavailable", err instanceof Error ? err.message : String(err));
+}
 
 const InspectTranscriptPageParamsSchema = z
   .object({
@@ -314,10 +344,34 @@ export class HuntDaemonRpcServer {
             });
             return { jsonrpc: "2.0", id: req.id, result: context };
           } catch (err) {
-            if (err instanceof GateContextError) {
-              throw new RpcRequestError(err.errorCode === "no_open_gate" ? -32009 : -32010, err.errorCode, err.message);
-            }
-            throw new RpcRequestError(-32010, "gate_context_unavailable", err instanceof Error ? err.message : String(err));
+            throw toGateContextRpcError(err);
+          }
+        }
+
+        case "hunt.gateEvidencePage": {
+          // Read-only: the next cited records of the run's CURRENT open gate.
+          const parsed = GateEvidencePageParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            throw new RpcRequestError(
+              -32602,
+              "invalid_arguments",
+              `hunt.gateEvidencePage requires exactly { run_id, cursor, limit: 1..${GATE_EVIDENCE_PAGE_MAX} }`,
+            );
+          }
+          const run = this.engine.stateStore.getRun(parsed.data.run_id);
+          if (!run) {
+            throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${parsed.data.run_id}'`);
+          }
+          try {
+            const page = await buildGateEvidencePage({
+              run,
+              cursor: parsed.data.cursor,
+              limit: parsed.data.limit,
+              resolveDataPlane: this.resolveDataPlane,
+            });
+            return { jsonrpc: "2.0", id: req.id, result: page };
+          } catch (err) {
+            throw toGateContextRpcError(err);
           }
         }
 
@@ -332,6 +386,34 @@ export class HuntDaemonRpcServer {
             const evidence = await buildRunEvidence({ run, resolveDataPlane: this.resolveDataPlane });
             return { jsonrpc: "2.0", id: req.id, result: evidence };
           } catch (err) {
+            throw new RpcRequestError(-32010, "evidence_unavailable", err instanceof Error ? err.message : String(err));
+          }
+        }
+
+        case "hunt.evidencePage": {
+          // Read-only: the next records of a run's evidence (cursor from hunt.evidence).
+          const parsed = GateEvidencePageParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            throw new RpcRequestError(
+              -32602,
+              "invalid_arguments",
+              `hunt.evidencePage requires exactly { run_id, cursor, limit: 1..${GATE_EVIDENCE_PAGE_MAX} }`,
+            );
+          }
+          const run = this.engine.stateStore.getRun(parsed.data.run_id);
+          if (!run) throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${parsed.data.run_id}'`);
+          try {
+            const page = await buildRunEvidencePage({
+              run,
+              cursor: parsed.data.cursor,
+              limit: parsed.data.limit,
+              resolveDataPlane: this.resolveDataPlane,
+            });
+            return { jsonrpc: "2.0", id: req.id, result: page };
+          } catch (err) {
+            if (err instanceof GateContextError && (err.errorCode === "stale_cursor" || err.errorCode === "invalid_arguments")) {
+              throw toGateContextRpcError(err);
+            }
             throw new RpcRequestError(-32010, "evidence_unavailable", err instanceof Error ? err.message : String(err));
           }
         }
@@ -391,14 +473,17 @@ export class HuntDaemonRpcServer {
           if (params.via === "desktop" && params.action !== "reject") {
             const run = this.engine.stateStore.getRun(String(params.hunt_id ?? ""));
             if (run?.open_gate && run.open_gate.gate === params.gate && run.open_gate.gate !== "scope") {
-              const context = await buildGateContext({
-                run,
-                receipts: this.engine.stateStore.listReceiptsForRun(run.run_id),
-                resolveDataPlane: this.resolveDataPlane,
-              });
-              if (context.incident?.evidence_truncated ||
-                  (context.reconcile?.reason_code === "citation_source_unavailable" && context.reconcile.evidence_truncated)) {
-                throw new RpcRequestError(-32010, "gate_context_unavailable", "Gate evidence is truncated; desktop approval is disabled.");
+              // Desktop approval needs the gate's full decision context: every cited id has a
+              // status (records are paged). If the context cannot be built, approval is refused.
+              try {
+                await buildGateContext({
+                  run,
+                  receipts: this.engine.stateStore.listReceiptsForRun(run.run_id),
+                  resolveDataPlane: this.resolveDataPlane,
+                });
+              } catch (err) {
+                const rpcErr = toGateContextRpcError(err);
+                throw new RpcRequestError(rpcErr.code, rpcErr.errorCode, `Desktop approval refused: ${rpcErr.message}`);
               }
             }
           }

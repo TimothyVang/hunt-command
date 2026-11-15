@@ -221,7 +221,10 @@ describe("WorkbenchService live runs", () => {
       if (method === "case.metadata") return metadata;
       if (method === "hunt.gateContext") return {
         run_id: id, case_id: input.caseId, gate: "incident", payload_sha256: current.open_gate!.payload_sha256,
-        incident: { citation_receipt: receipt, evidence: [record], evidence_truncated: false },
+        incident: {
+          citation_receipt: receipt, cited: [{ id: record.id, kind: record.kind, status: record.status }],
+          evidence: [record], evidence_total: 1, evidence_next_cursor: null,
+        },
       };
       if (method === "hunt.decideGate") {
         current = { ...current, status: "completed", open_gate: null as unknown as typeof current.open_gate };
@@ -229,7 +232,11 @@ describe("WorkbenchService live runs", () => {
       }
       if (method === "hunt.evidence") {
         if (offline) throw new Error("evidence_unavailable");
-        return { run_id: id, case_id: input.caseId, citation_receipt: receipt, evidence: [record], evidence_truncated: false };
+        return {
+          run_id: id, case_id: input.caseId, citation_receipt: receipt,
+          cited: [{ id: record.id, kind: record.kind, status: record.status }],
+          evidence: [record], evidence_total: 1, evidence_next_cursor: null,
+        };
       }
       throw new Error(method);
     };
