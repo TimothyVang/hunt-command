@@ -74,7 +74,9 @@ const APIKEY_RE = /\bApiKey\s+(?!\[REDACTED)[A-Za-z0-9._~+/=-]{6,}/gi;
 
 const STANDALONE_TOKENS: ReadonlyArray<readonly [RegExp, string]> = [
   // JSON Web Tokens: base64url header (always `eyJ`), payload, optional signature.
-  [/\be[y]J[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g, "[REDACTED_JWT]"],
+  // The lookbehind (not `\b`) lets a match start only at the head of a token run, so a
+  // run like `eyJ-eyJ-…` with no `.` is scanned once instead of once per `eyJ`.
+  [/(?<![A-Za-z0-9_-])e[y]J[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g, "[REDACTED_JWT]"],
   [/\b[s]k-(?:ant-)?[A-Za-z0-9_-]{8,}/g, "[REDACTED_SK_TOKEN]"],
   [/\bx[o]x[abposr]-[A-Za-z0-9-]{4,}/g, "[REDACTED_SLACK_TOKEN]"],
   [/\bx[a]pp-[A-Za-z0-9-]{4,}/g, "[REDACTED_SLACK_APP_TOKEN]"],

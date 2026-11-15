@@ -111,6 +111,7 @@ packages/daemon/test/gates-slack-rpc.test.ts
 packages/daemon/test/omp-pool-live.test.ts
 packages/daemon/test/ontology-validator.test.ts
 packages/daemon/test/review-regressions.test.ts
+packages/daemon/test/runtime-lock-race.test.ts
 packages/daemon/test/scrubber-and-fence.test.ts
 packages/daemon/test/wave-engine-and-durability.test.ts
 packages/data-plane/package.json

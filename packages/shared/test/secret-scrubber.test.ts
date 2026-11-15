@@ -73,4 +73,23 @@ describe("shared credential scrubber", () => {
       expect(performance.now() - started).toBeLessThan(500);
     }
   });
+
+  test("stays linear when any token prefix repeats with any separator", () => {
+    const MB = 1024 * 1024;
+    const prefixes = [
+      j("ey", "J"), j("ey", "Jabcd."), j("s", "k-"), j("s", "k-ant-"), j("xo", "xb-"), j("xa", "pp-"),
+      j("github", "_pat_"), j("gh", "p_"), j("gl", "pat-"), j("AK", "IA"), j("AI", "za"),
+      "Bearer ", "ApiKey ", "password", "token", "https://u:", '"password":"', "Authorization:",
+    ];
+    for (const prefix of prefixes) {
+      for (const sep of ["", "-", "_", ".", " ", ":", "=", "a"]) {
+        const unit = prefix + sep;
+        const input = unit.repeat(Math.ceil(MB / unit.length));
+        const started = performance.now();
+        scrubSecretText(input);
+        const ms = performance.now() - started;
+        expect(ms, `${JSON.stringify(unit)} x ${input.length} took ${Math.round(ms)}ms`).toBeLessThan(500);
+      }
+    }
+  });
 });
