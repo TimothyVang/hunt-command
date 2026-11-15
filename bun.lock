@@ -25,10 +25,18 @@
     "packages/daemon": {
       "name": "@hunt-command/daemon",
       "version": "0.2.0",
+      "bin": {
+        "hunt": "./src/cli.ts",
+        "hunt-daemon": "./src/cli.ts",
+      },
       "dependencies": {
         "@hunt-command/data-plane": "workspace:*",
         "@hunt-command/shared": "workspace:*",
         "@hunt-command/telemetry": "workspace:*",
+        "@oh-my-pi/pi-ai": "18.20.0",
+        "@oh-my-pi/pi-coding-agent": "18.20.0",
+        "@oh-my-pi/pi-natives": "18.20.0",
+        "zod": "^3.24.2",
       },
     },
     "packages/data-plane": {
