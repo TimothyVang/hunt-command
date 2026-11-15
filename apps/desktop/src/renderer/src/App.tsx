@@ -6,7 +6,7 @@ import type {
   StartRunInput,
 } from "../../shared/ipc.ts";
 import type { WatchBrowserState, WorkbenchSnapshot } from "../../shared/workbench-types.ts";
-import { listRuns, loadGateEvidencePage, selectRun, startRun } from "./lib/run-actions.ts";
+import { EventRefreshGuard, listRuns, loadGateEvidencePage, selectRun, startRun } from "./lib/run-actions.ts";
 import { invokeDesktop, subscribeDesktopEvent } from "./lib/bridge.ts";
 import { scopeWatchSnapshot } from "./lib/watch-open.ts";
 import { AttackGraphLineagePane } from "./panes/AttackGraphLineagePane.tsx";
@@ -52,8 +52,10 @@ export function App() {
   const [starting, setStarting] = useState(false);
   const watchEvents = useRef(new Map<string, { version: number; state: WatchBrowserState }>());
   const watchVersion = useRef(0);
+  const eventRefresh = useMemo(() => new EventRefreshGuard(), []);
 
   const applySnapshot = (snapshot: WorkbenchSnapshot, requestVersion: number) => {
+    eventRefresh.snapshotApplied();
     const latest = watchEvents.current.get(snapshot.huntId);
     workbenchStore.setWorkbenchSnapshot(scopeWatchSnapshot(
       snapshot,
@@ -108,13 +110,11 @@ export function App() {
         if (selectedHunt.current !== batch.huntId) return;
         const requestVersion = watchVersion.current;
         const selection = selectionVersion.current;
-        void invokeDesktop<WorkbenchSnapshot>("hunt:getWorkbenchState", {
-          huntId: batch.huntId,
-        }).then((res) => {
-          if (res.ok && res.data && selection === selectionVersion.current && selectedHunt.current === batch.huntId) {
-            applySnapshot(res.data, requestVersion);
-          }
-        });
+        void eventRefresh.refresh(
+          batch.huntId,
+          () => selection === selectionVersion.current && selectedHunt.current === batch.huntId,
+          (snapshot) => applySnapshot(snapshot, requestVersion),
+        );
       },
     );
 

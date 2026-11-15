@@ -706,6 +706,43 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
     }
   }, 120_000);
 
+  test("a delayed workbench refresh cannot restore a decided gate", async () => {
+    const h = await liveHarness(() => undefined);
+    const refreshReady = Promise.withResolvers<void>();
+    const releaseRefresh = Promise.withResolvers<void>();
+    try {
+      const snapshot = await toIncidentGate(h);
+      const original = h.sidecar.request.bind(h.sidecar);
+      let pause = true;
+      Object.assign(h.sidecar, { request: async (method: string, params?: Record<string, unknown>) => {
+        const result = await original(method, params);
+        if (method === "case.metadata" && pause) {
+          pause = false;
+          refreshReady.resolve();
+          await releaseRefresh.promise;
+        }
+        return result;
+      } });
+      const refreshing = h.service.getWorkbenchState({ huntId: snapshot.huntId });
+      await refreshReady.promise;
+      const decided = await h.service.submitGateDecision({
+        huntId: snapshot.huntId, gate: "incident", action: "approve", operatorName: "x", rbacRole: "incident_commander",
+        checkNote: "Checked the evidence.", payloadSha256: snapshot.activeGate!.payloadSha256,
+        operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
+      });
+      expect(decided.runStatus).toBe("completed");
+      expect(decided.activeGate).toBeNull();
+      releaseRefresh.resolve();
+      const late = await refreshing;
+      expect(late.runStatus).toBe("completed");
+      expect(late.activeGate).toBeNull();
+      expect(late.gateHistory.map((decision) => decision.gate)).toEqual(["scope", "incident"]);
+    } finally {
+      releaseRefresh.resolve();
+      await h.close();
+    }
+  });
+
   test("a delayed evidence page cannot restore a decided gate", async () => {
     const { h, huntId } = await bulkIncidentGate();
     const pageReady = Promise.withResolvers<void>();

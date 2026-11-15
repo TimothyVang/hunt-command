@@ -198,6 +198,8 @@ export class WorkbenchService {
   /** Cited-record paging per run (F18); holds the opaque cursor, which never reaches the renderer. */
   readonly #evidencePaging = new Map<string, GateEvidencePaging>();
   readonly #gateMutations = new Set<string>();
+  readonly #appliedSnapshotVersions = new Map<string, number>();
+  #nextSnapshotVersion = 0;
   #selectionVersion = 0;
   #activeHuntId: string;
 
@@ -294,9 +296,9 @@ export class WorkbenchService {
         : this.#activeHuntId;
 
     if (this.#liveRunIds.has(requestedHuntId) || !this.#runs.has(requestedHuntId)) {
+      const version = ++this.#nextSnapshotVersion;
       const run = await this.#deps.sidecar.request("hunt.status", { run_id: requestedHuntId });
-      const snap = await this.#liveSnapshot(run);
-      if (snap.huntId !== requestedHuntId) throw new Error("Daemon returned a different run ID.");
+      const snap = await this.#liveSnapshot(run, requestedHuntId, version);
       if (selection === this.#selectionVersion) this.#selectHunt(snap.huntId);
       return this.#attachWatchState(snap);
     }
@@ -320,6 +322,7 @@ export class WorkbenchService {
       }
       const runId = randomUUID();
       this.#liveRunIds.add(runId);
+      const version = ++this.#nextSnapshotVersion;
       let response: unknown;
       try {
         response = await this.#deps.sidecar.request("hunt.start", {
@@ -343,7 +346,7 @@ export class WorkbenchService {
       try {
         const started = LiveStartResultSchema.parse(response);
         if (started.run_id !== runId) throw new Error("Daemon returned a different run ID.");
-        snapshot = await this.#liveSnapshot(response);
+        snapshot = await this.#liveSnapshot(response, runId, version);
       } catch (error) {
         throw new Error(`Hunt '${runId}' may have started but its workbench could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -795,8 +798,9 @@ export class WorkbenchService {
     return { deleted: true, ref: parsed.ref };
   }
 
-  async #liveSnapshot(raw: unknown): Promise<WorkbenchSnapshot> {
+  async #liveSnapshot(raw: unknown, expectedRunId: string, version: number): Promise<WorkbenchSnapshot> {
     const checked = LiveStartResultSchema.parse(raw);
+    if (checked.run_id !== expectedRunId) throw new Error("Daemon returned a different run ID.");
     const run = checked as unknown as PersistedHuntRun;
     const metadata = CaseMetadataSchema.parse(await this.#deps.sidecar.request("case.metadata", { case_id: run.case_id }));
     if (metadata.case_id !== run.case_id) throw new Error("Daemon returned metadata for a different case.");
@@ -914,6 +918,14 @@ export class WorkbenchService {
       events: gate?.events ?? evidence?.events ?? [], arkimeFlows: [], packets: [], evidenceCatalog: gate?.evidenceCatalog ?? evidence?.evidenceCatalog ?? {},
       watchState: this.#standbyWatchState(run.run_id),
     };
+    if ((this.#appliedSnapshotVersions.get(run.run_id) ?? 0) > version) {
+      const latest = this.#runs.get(run.run_id);
+      if (!latest || latest.provenanceMode !== "live_daemon") {
+        throw new Error("Workbench refresh was superseded; refresh the hunt.");
+      }
+      return latest;
+    }
+    this.#appliedSnapshotVersions.set(run.run_id, version);
     this.#liveRunIds.add(run.run_id);
     const merged = this.#carryLoadedEvidence(run.run_id, snapshot, gate?.pagingState);
     this.#runs.set(run.run_id, merged);

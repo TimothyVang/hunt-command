@@ -7,6 +7,30 @@ export const listRuns = () => invokeDesktop<RunOption[]>("hunt:listRuns");
 export const startRun = (input: StartRunInput) => invokeDesktop<WorkbenchSnapshot>("hunt:startRun", input);
 export const selectRun = (huntId: string) => invokeDesktop<WorkbenchSnapshot>("hunt:getWorkbenchState", { huntId });
 
+/** Keep delayed daemon-event responses from replacing newer workbench state. */
+export class EventRefreshGuard {
+  #snapshotRevision = 0;
+  #refreshSequence = 0;
+
+  snapshotApplied(): void {
+    this.#snapshotRevision++;
+  }
+
+  async refresh(
+    huntId: string,
+    isSelectionCurrent: () => boolean,
+    applySnapshot: (snapshot: WorkbenchSnapshot) => void,
+  ): Promise<void> {
+    const revision = this.#snapshotRevision;
+    const sequence = ++this.#refreshSequence;
+    const result = await selectRun(huntId);
+    if (result.ok && result.data?.huntId === huntId && isSelectionCurrent() &&
+        revision === this.#snapshotRevision && sequence === this.#refreshSequence) {
+      applySnapshot(result.data);
+    }
+  }
+}
+
 /** Apply a page only while the requesting workbench version and selection remain current. */
 export async function loadGateEvidencePage(
   snapshot: WorkbenchSnapshot,

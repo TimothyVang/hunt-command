@@ -4,7 +4,7 @@ import { buildFixtureWorkbenchSnapshot } from "../src/shared/fixture-workbench.t
 import { AuthorityGateCard } from "../src/renderer/src/panes/AuthorityGateCard.tsx";
 import { projectLiveGate } from "../src/main/live-gate-context.ts";
 import { RunControls } from "../src/renderer/src/panes/RunControls.tsx";
-import { listRuns, loadGateEvidencePage, selectRun, startRun } from "../src/renderer/src/lib/run-actions.ts";
+import { EventRefreshGuard, listRuns, loadGateEvidencePage, selectRun, startRun } from "../src/renderer/src/lib/run-actions.ts";
 import { WorkbenchStore } from "../src/renderer/src/state/workbench-store.ts";
 
 describe("live run controls", () => {
@@ -117,6 +117,54 @@ describe("live run controls", () => {
     expect(/<button[^>]*data-testid="gate-approve-button"[^>]*>/.exec(html)?.[0]).not.toContain('disabled=""');
     // The cursor never reaches the renderer.
     expect(JSON.stringify(projection.activeGate)).not.toContain("cursor-1");
+  });
+
+  test("delayed daemon events cannot restore a decided gate or supersede a newer refresh", async () => {
+    const snapshot = buildFixtureWorkbenchSnapshot();
+    const globals = globalThis as unknown as { window?: unknown };
+    const previous = globals.window;
+    const store = new WorkbenchStore(snapshot);
+    const guard = new EventRefreshGuard();
+    const responses: Array<(result: unknown) => void> = [];
+    let selected = true;
+    globals.window = { huntWorkbench: { invoke: () => {
+      const deferred = Promise.withResolvers<unknown>();
+      responses.push(deferred.resolve);
+      return deferred.promise;
+    } } };
+    const apply = (value: typeof snapshot) => {
+      guard.snapshotApplied();
+      store.setWorkbenchSnapshot(value);
+    };
+    const refresh = () => guard.refresh(snapshot.huntId, () => selected, apply);
+    try {
+      const staleDecision = refresh();
+      const decided = { ...snapshot, activeGate: null };
+      apply(decided);
+      responses.shift()!({ ok: true, data: snapshot });
+      await staleDecision;
+      expect(store.getState().workbench).toBe(decided);
+
+      const older = refresh();
+      const newer = refresh();
+      const resolveOlder = responses.shift()!;
+      const resolveNewer = responses.shift()!;
+      const updated = { ...decided, runStatus: "completed" as const };
+      resolveNewer({ ok: true, data: updated });
+      await newer;
+      resolveOlder({ ok: true, data: snapshot });
+      await older;
+      expect(store.getState().workbench).toBe(updated);
+
+      const staleSelection = refresh();
+      selected = false;
+      responses.shift()!({ ok: true, data: snapshot });
+      await staleSelection;
+      expect(store.getState().workbench).toBe(updated);
+    } finally {
+      if (previous === undefined) delete globals.window;
+      else globals.window = previous;
+    }
   });
 
   test("F19: delayed evidence pages cannot replace newer workbench or selection state", async () => {
