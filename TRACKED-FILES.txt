@@ -27,6 +27,8 @@ packages/data-plane/src/timestamps-and-ip.ts
 packages/data-plane/test/connected.test.ts
 packages/data-plane/test/embedded-and-pcap.test.ts
 packages/data-plane/test/real-cases.bench.test.ts
+packages/data-plane/test/session-window.test.ts
+packages/data-plane/test/tool-wire.test.ts
 packages/shared/package.json
 packages/shared/src/contracts.ts
 packages/shared/src/fields.ts
