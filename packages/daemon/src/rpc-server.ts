@@ -373,6 +373,20 @@ export class HuntDaemonRpcServer {
               "via='slack' is reserved for the in-process Slack bridge and is not accepted over RPC",
             );
           }
+          if (params.via === "desktop" && params.action !== "reject") {
+            const run = this.engine.stateStore.getRun(String(params.hunt_id ?? ""));
+            if (run?.open_gate && run.open_gate.gate === params.gate && run.open_gate.gate !== "scope") {
+              const context = await buildGateContext({
+                run,
+                receipts: this.engine.stateStore.listReceiptsForRun(run.run_id),
+                resolveDataPlane: this.resolveDataPlane,
+              });
+              if (context.incident?.evidence_truncated ||
+                  (context.reconcile?.reason_code === "citation_source_unavailable" && context.reconcile.evidence_truncated)) {
+                throw new RpcRequestError(-32010, "gate_context_unavailable", "Gate evidence is truncated; desktop approval is disabled.");
+              }
+            }
+          }
           const updated = await this.engine.submitGateDecision({
             decisionId: typeof params.decision_id === "string" ? params.decision_id : undefined,
             huntId: String(params.hunt_id ?? ""),

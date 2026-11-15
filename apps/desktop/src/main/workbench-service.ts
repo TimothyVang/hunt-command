@@ -349,6 +349,9 @@ export class WorkbenchService {
         // Fail closed: never forward an approval for a gate whose decision context is not on screen.
         const missing = missingGateContextReason(current.activeGate);
         if (missing) throw new Error(missing);
+        if (current.activeGate.gate === "incident" && !current.activeGate.incidentSummary?.citationReceipt.allVerified) {
+          throw new Error("Gate 2 incident citations are not all verified, so approval is disabled.");
+        }
       }
       try {
         await this.#deps.sidecar.request("hunt.decideGate", {
@@ -677,6 +680,12 @@ export class WorkbenchService {
     const metadata = CaseMetadataSchema.parse(await this.#deps.sidecar.request("case.metadata", { case_id: run.case_id }));
     if (metadata.case_id !== run.case_id) throw new Error("Daemon returned metadata for a different case.");
     const handoffs = Object.values(run.reviewed_handoffs);
+    const incidentHandoff = HandoffSchema.safeParse(run.results["incident"]?.handoff);
+    if (checked.open_gate?.gate === "incident" && incidentHandoff.success && incidentHandoff.data.step_id === "incident") {
+      const index = handoffs.findIndex((h) => h.step_id === incidentHandoff.data.step_id);
+      if (index === -1) handoffs.push(incidentHandoff.data);
+      else handoffs[index] = incidentHandoff.data;
+    }
     const reviews = handoffs.flatMap((handoff) => handoff.reviews);
     const waveNumber = (wave: string): 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 =>
       Math.max(1, Math.min(8, HUNT_WAVES.indexOf(wave as typeof HUNT_WAVES[number]) + 1)) as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
@@ -703,6 +712,9 @@ export class WorkbenchService {
         } catch (error) {
           rawContext = error instanceof Error ? error : new Error(String(error));
         }
+      }
+      if (checked.open_gate.gate === "incident" && (!incidentHandoff.success || incidentHandoff.data.step_id !== "incident")) {
+        rawContext = new Error("The incident handoff is unavailable or invalid.");
       }
       gate = projectLiveGate(run.run_id, checked.open_gate, handoffs, rawContext, run.config.scopeText);
     }
@@ -766,7 +778,7 @@ export class WorkbenchService {
       }))),
       handoffs,
       snapshot: run.snapshot ?? { schema_version: 1, case_id: run.case_id, entities: [], relations: [] },
-      citationReceipt: gate?.citationReceipt ?? citationReceipt,
+      citationReceipt: gate ? gate.citationReceipt ?? { totalCited: 0, verifiedCount: 0, unresolvedCount: 0, outOfScopeCount: 0, allVerified: false, entries: [] } : citationReceipt,
       histogram: { bucketTimestampsSec: [], ecsEventCounts: [], networkFlowCounts: [], intervalSec: 60 },
       events: gate?.events ?? [], arkimeFlows: [], packets: [], evidenceCatalog: gate?.evidenceCatalog ?? {},
       watchState: this.#standbyWatchState(run.run_id),

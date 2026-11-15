@@ -227,6 +227,8 @@ export function projectLiveGate(
     expiresAtIso: openGate.expires_at,
     payloadSha256: openGate.payload_sha256,
   };
+  const incidentHandoff = openGate.gate === "incident" ? handoffs.find((h) => h.step_id === "incident") : undefined;
+  if (incidentHandoff) base.incidentHandoff = incidentHandoff;
   const fail = (reason: string): LiveGateProjection => ({
     activeGate: { ...base, contextError: reason },
     citationReceipt: null,
@@ -281,6 +283,7 @@ export function projectLiveGate(
       };
     }
     // citation_source_unavailable: the reason itself is the context; show what could and could not be checked.
+    if (reconcile.evidence_truncated) return fail("Reconcile evidence is truncated; the full decision context is unavailable.");
     const projected = projectEvidence(handoffs, reconcile.evidence, reconcile.evidence_truncated ?? false, reconcile.citation_receipt.verified);
     if (projected.uncovered) {
       return fail(`gate context does not cover cited ids: ${projected.uncovered.slice(0, 5).join(", ")}`);
@@ -302,7 +305,9 @@ export function projectLiveGate(
   }
 
   const incident = ctx.incident;
+  if (!incidentHandoff) return fail("The incident handoff is unavailable.");
   if (!incident) return fail("incident gate context has no citation receipt or evidence");
+  if (incident.evidence_truncated) return fail("Incident evidence is truncated; the full decision context is unavailable.");
   if (incident.citation_receipt.source_status !== "ok") {
     return fail(`citation backend unavailable: ${incident.citation_receipt.diagnostic ?? "source_status=unavailable"}`);
   }

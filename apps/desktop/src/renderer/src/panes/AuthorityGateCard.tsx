@@ -163,6 +163,24 @@ export function AuthorityGateCard({
         </div>
       )}
 
+      {activeGate.gate === "incident" && activeGate.incidentHandoff && (
+        <section data-testid="incident-handoff" className="space-y-2 rounded border border-slate-800 bg-slate-950/80 p-2 text-xs">
+          <h3 className="font-semibold text-slate-100">Incident handoff</h3>
+          {activeGate.incidentHandoff.claims.map((claim) => (
+            <div key={claim.claim_id}>
+              <div className="font-mono text-slate-400">{claim.claim_id} · {claim.kind}</div>
+              <SafeForensicText text={claim.statement} className="whitespace-pre-wrap break-words text-slate-100" />
+            </div>
+          ))}
+          <h4 className="font-semibold text-slate-300">Limitations</h4>
+          {activeGate.incidentHandoff.limitations.length === 0 ? (
+            <p className="text-slate-400">None reported.</p>
+          ) : activeGate.incidentHandoff.limitations.map((text, index) => (
+            <SafeForensicText key={index} text={text} className="whitespace-pre-wrap break-words text-slate-300" />
+          ))}
+        </section>
+      )}
+
       {/* Gate 2: Automated Citation Verification Receipt + Epistemic Split + Purple Summary */}
       {activeGate.gate === "incident" && activeGate.incidentSummary && (
         <div className="space-y-2.5 text-xs">

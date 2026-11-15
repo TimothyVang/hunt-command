@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 export class RuntimeLockHeldError extends Error {
   public readonly holderPid: number | null;
@@ -40,7 +41,8 @@ function readHolderPid(lockPath: string): number | null {
 }
 
 const FRESH_UNREADABLE_LOCK_MS = 5_000;
-const STALE_RECLAIM_MUTEX_MS = 30_000;
+const RECLAIM_RETRY_MS = 100;
+const reclaimRetryWait = new Int32Array(new SharedArrayBuffer(4));
 
 /** Why a lock file may be reclaimed right now, or null when it must be left alone. */
 function staleLockReason(lockPath: string): { holder: number | null } | null {
@@ -59,43 +61,30 @@ function staleLockReason(lockPath: string): { holder: number | null } | null {
 }
 
 /**
- * Takes the reclaim mutex (`<lock>.reclaim`, O_EXCL). Only its holder may delete a stale lock,
- * so two processes that both saw the same stale lock can't each delete and recreate it.
- * A mutex left by a crash mid-reclaim is moved aside atomically once it is old; one that
- * turns out to be fresh is linked back, so a live reclaimer is never displaced.
+ * An ownerless or crashed reclaim mutex cannot be distinguished safely from a paused
+ * owner. Never reclaim it automatically; an operator must first ensure all reclaimers
+ * have stopped before removing an abandoned mutex.
  */
-function tryTakeReclaimMutex(mutexPath: string): boolean {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      fs.closeSync(fs.openSync(mutexPath, "wx", 0o600));
-      return true;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST" || attempt > 0) return false;
-    }
-    const aside = `${mutexPath}.${process.pid}.${Date.now()}.stale`;
-    try {
-      fs.renameSync(mutexPath, aside);
-    } catch {
-      return false;
-    }
-    let ageMs = 0;
-    try {
-      ageMs = Date.now() - fs.statSync(aside).mtimeMs;
-    } catch {}
-    if (ageMs < STALE_RECLAIM_MUTEX_MS) {
-      try {
-        fs.linkSync(aside, mutexPath);
-      } catch {}
-      try {
-        fs.unlinkSync(aside);
-      } catch {}
-      return false;
-    }
-    try {
-      fs.unlinkSync(aside);
-    } catch {}
+function tryTakeReclaimMutex(mutexPath: string): (() => void) | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(mutexPath, "wx", 0o600);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return null;
+    throw err;
   }
-  return false;
+  const token = randomUUID();
+  try {
+    fs.writeSync(fd, JSON.stringify({ pid: process.pid, token }));
+  } finally {
+    fs.closeSync(fd);
+  }
+  return () => {
+    try {
+      const owner = JSON.parse(fs.readFileSync(mutexPath, "utf8")) as { token?: unknown };
+      if (owner.token === token) fs.unlinkSync(mutexPath);
+    } catch {}
+  };
 }
 
 /**
@@ -110,10 +99,11 @@ export function acquireRuntimeLock(lockPath: string): RuntimeLockHandle {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = fs.openSync(resolved, "wx", 0o600);
+      const token = randomUUID();
       try {
         fs.writeSync(
           fd,
-          JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() }),
+          JSON.stringify({ pid: process.pid, token, acquired_at: new Date().toISOString() }),
         );
         fs.fsyncSync(fd);
       } finally {
@@ -125,11 +115,10 @@ export function acquireRuntimeLock(lockPath: string): RuntimeLockHandle {
         release: () => {
           if (released) return;
           released = true;
-          if (readHolderPid(resolved) === process.pid) {
-            try {
-              fs.unlinkSync(resolved);
-            } catch {}
-          }
+          try {
+            const holder = JSON.parse(fs.readFileSync(resolved, "utf8")) as { token?: unknown };
+            if (holder.token === token) fs.unlinkSync(resolved);
+          } catch {}
         },
       };
     } catch (err) {
@@ -138,7 +127,13 @@ export function acquireRuntimeLock(lockPath: string): RuntimeLockHandle {
         throw new RuntimeLockHeldError(resolved, readHolderPid(resolved));
       }
       const mutexPath = `${resolved}.reclaim`;
-      if (!tryTakeReclaimMutex(mutexPath)) {
+      let releaseMutex = tryTakeReclaimMutex(mutexPath);
+      const retryUntil = Date.now() + RECLAIM_RETRY_MS;
+      while (!releaseMutex && Date.now() < retryUntil) {
+        Atomics.wait(reclaimRetryWait, 0, 0, 2);
+        releaseMutex = tryTakeReclaimMutex(mutexPath);
+      }
+      if (!releaseMutex) {
         throw new RuntimeLockHeldError(resolved, readHolderPid(resolved));
       }
       try {
@@ -151,9 +146,7 @@ export function acquireRuntimeLock(lockPath: string): RuntimeLockHandle {
           fs.unlinkSync(resolved);
         } catch {}
       } finally {
-        try {
-          fs.unlinkSync(mutexPath);
-        } catch {}
+        releaseMutex();
       }
     }
   }

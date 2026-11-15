@@ -131,6 +131,7 @@ export interface ActiveGatePrompt {
     maxTotalTokens: number;
     followUpCount: number;
   };
+  incidentHandoff?: Handoff;
   incidentSummary?: {
     citationReceipt: CitationVerificationReceipt;
     observedCount: number;
