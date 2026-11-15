@@ -4,7 +4,8 @@
  * Modified for Hunt Command v2 (#178 G1.3):
  * - Enforces Watch Browser CDP command filter (`deniedSessionCommand` blocking `Fetch.*`, mutating `Network.*`,
  *   `ServiceWorker.*`, `Storage.*`).
- * - Restricts `Target.createTarget` to `host.isOpenableUrl(url)` (`isOpenableWatchUrl`, pinned `127.0.0.1` only).
+ * - Restricts `Target.createTarget` and `Page.navigate` to `host.isOpenableUrl(url)` (`isOpenableWatchUrl`,
+ *   pinned `127.0.0.1` only).
  */
 import { CDP_ERROR_METHOD_NOT_FOUND, CDP_ERROR_SERVER, deniedSessionCommand } from "./cdp-filter.ts";
 
@@ -313,7 +314,9 @@ export class CdpHub {
       this.#replyError(conn, msg, `Session with given id not found: ${sessionId}`);
       return;
     }
-    const denied = deniedSessionCommand(msg.method, msg.params);
+    const denied = deniedSessionCommand(msg.method, msg.params, (url) =>
+      this.#host.isOpenableUrl(url),
+    );
     if (denied) {
       this.#replyError(conn, msg, denied);
       return;
@@ -346,7 +349,9 @@ export class CdpHub {
       this.#replyError(conn, msg, `Target closed: page ${ref.pageId}`);
       return;
     }
-    const denied = deniedSessionCommand(msg.method, msg.params);
+    const denied = deniedSessionCommand(msg.method, msg.params, (url) =>
+      this.#host.isOpenableUrl(url),
+    );
     if (denied) {
       this.#replyError(conn, msg, denied);
       return;

@@ -148,6 +148,22 @@ export class WatchBrowserController {
         this.#recordBlock("redirect_outside_scope");
       }
     });
+    // `will-navigate` covers only renderer-initiated main-frame loads; sub-frames need their own guard.
+    wc.on("will-frame-navigate", (details) => {
+      if (!details.isMainFrame && !documentAllowed(scope, details.url)) {
+        details.preventDefault();
+        this.#recordBlock("frame_navigation_outside_scope");
+      }
+    });
+    // Backstop for loads that skip the `will-*` events (CDP `Page.navigate`, history, browser-initiated):
+    // any main- or sub-frame navigation outside scope halts loading and resets the view to about:blank.
+    wc.on("did-start-navigation", (details) => {
+      if (!documentAllowed(scope, details.url)) {
+        this.#recordBlock("navigation_outside_scope");
+        wc.stop();
+        void wc.loadURL("about:blank").catch(() => {});
+      }
+    });
 
     await this.#armDebuggerFence(wc, scope);
 

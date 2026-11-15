@@ -9,6 +9,9 @@
  * - Blocks `ServiceWorker.*`, `Storage.*`, `IndexedDB.*`, `CacheStorage.*`, `BackgroundService.*`,
  *   `Page.setDownloadBehavior`, `Page.setBypassCSP`, and `Security.setIgnoreCertificateErrors`.
  * - Scopes `isOpenableWatchUrl` to `documentAllowed(scope, url)` (pinned `127.0.0.1:<port>` only — zero `localhost`).
+ * - Validates `Page.navigate` URLs with the same allowed-document check (CDP-initiated loads skip `will-navigate`),
+ *   and denies `Page.navigateToHistoryEntry`, `Page.setDocumentContent`, `Page.printToPDF`, `IO.*`, and
+ *   `DOM.setFileInputFiles` outright.
  */
 import { documentAllowed, type WatchScope } from "./browser-policy.ts";
 
@@ -41,6 +44,7 @@ const DENIED_DOMAINS: Record<string, true> = {
   DeviceAccess: true,
   BluetoothEmulation: true,
   FedCm: true,
+  IO: true,
 };
 
 /** Read-only `Network.*` commands permitted for passive telemetry inspection; all mutating `Network.*` fail. */
@@ -58,6 +62,16 @@ const DENIED_METHODS: Record<string, true> = {
   "Security.setIgnoreCertificateErrors": true,
   "Security.setOverrideCertificateErrors": true,
   "Emulation.setUserAgentOverride": true,
+  // History entries and replaced documents carry no URL the fence can check; PDF/IO/file inputs read local data.
+  "Page.navigateToHistoryEntry": true,
+  "Page.setDocumentContent": true,
+  "Page.printToPDF": true,
+  "DOM.setFileInputFiles": true,
+};
+
+/** Commands whose `params.url` loads a document and must pass the session's allowed-document check. */
+const URL_NAVIGATION_METHODS: Record<string, true> = {
+  "Page.navigate": true,
 };
 
 /** Browser-domain reads that are harmless on a page session. */
@@ -70,11 +84,13 @@ export const CDP_ERROR_METHOD_NOT_FOUND = -32601;
 
 /**
  * Returns why `method` is refused on a Watch Browser page (or child) session, or `null` when
- * the hub may handle or forward it.
+ * the hub may handle or forward it. `isOpenableUrl` is the session scope's allowed-document check;
+ * without it every URL-carrying navigation is refused (fail closed).
  */
 export function deniedSessionCommand(
   method: string,
   params: Record<string, unknown> | undefined,
+  isOpenableUrl?: (url: string) => boolean,
 ): string | null {
   const dot = method.indexOf(".");
   if (dot <= 0) {
@@ -104,6 +120,13 @@ export function deniedSessionCommand(
 
   if (params && Object.hasOwn(params, "browserContextId")) {
     return `'${method}' with browserContextId is denied in the Hunt Command Watch Browser`;
+  }
+
+  if (URL_NAVIGATION_METHODS[method] === true) {
+    const url = params?.url;
+    if (typeof url !== "string" || isOpenableUrl === undefined || !isOpenableUrl(url)) {
+      return `'${method}' URL is outside the pinned 127.0.0.1 Watch Browser scope`;
+    }
   }
 
   return null;

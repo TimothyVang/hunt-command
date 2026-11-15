@@ -9,6 +9,8 @@
  * - Strictly separates Model Analytical Prose (`observed`/`finding` vs `hypothesis`/`inference`)
  *   from Adversarial Purple Reviews (`reviews[]`), Contradictions (`contradicts[]`), Analytical
  *   Limitations (`limitations[]`), and Immutable Raw Source Telemetry Records (`evt-*`, `frame-*`, `ioc-*`).
+ * - Markdown-escapes every untrusted text segment (no live links, images, HTML, headings, or code-span
+ *   breakout), collapses newlines in inline fields, and defangs protocol-relative `//host` and `www.` hosts.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -19,6 +21,7 @@ import {
   RuntimeFenceError,
 } from "@hunt-command/shared";
 import {
+  defangIndicator,
   sanitizeSingleLine,
   stripControlAndBidiChars,
   tokenizeForensicText,
@@ -85,6 +88,69 @@ export function renderDefangedPlainText(raw: string): string {
     .join("");
 }
 
+const MARKDOWN_SPECIAL_RE = /[\\`*_[\]()<>#|!~&]/g;
+// `//host` (protocol-relative) and GFM `www.` autolink hosts that the TLD-bound tokenizer may miss.
+const PROTOCOL_RELATIVE_HOST_RE = /(^|[^A-Za-z0-9:/])\/\/([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)/g;
+const WWW_HOST_RE = /\bwww\./gi;
+
+/** Backslash-escapes Markdown/HTML syntax in an untrusted text segment after defanging stray hosts. */
+function escapeMarkdownText(text: string): string {
+  return text
+    .replace(
+      PROTOCOL_RELATIVE_HOST_RE,
+      (_m, lead: string, host: string) => `${lead}//${defangIndicator(host)}`,
+    )
+    .replace(WWW_HOST_RE, (m) => `${m.slice(0, 3)}[.]`)
+    .replace(MARKDOWN_SPECIAL_RE, (ch) => `\\${ch}`);
+}
+
+/** Inline code span with backticks stripped so untrusted values cannot close the span. */
+function mdCode(raw: string): string {
+  return `\`${sanitizeSingleLine(raw).replace(/`+/g, "")}\``;
+}
+
+/** Defanged, Markdown-escaped rendering; citations and indicators become inert literal text / code spans. */
+function renderDefangedMarkdown(cleaned: string): string {
+  return tokenizeForensicText(cleaned)
+    .map((tok) => {
+      if (tok.kind === "text") return escapeMarkdownText(tok.text);
+      if (tok.kind === "citation") return `\\[${escapeMarkdownText(tok.id)}\\]`;
+      return mdCode(tok.defanged);
+    })
+    .join("");
+}
+
+/** Single-line Markdown field: newlines collapse to spaces so text cannot forge headings or sections. */
+export function renderDefangedMarkdownInline(raw: string): string {
+  return renderDefangedMarkdown(sanitizeSingleLine(raw));
+}
+
+/**
+ * Multi-line Markdown paragraph: every line is escaped and stripped of leading indentation, and
+ * line-start list / setext / ordered-list markers are escaped, so no line can open a new block.
+ */
+export function renderDefangedMarkdownBlock(raw: string): string {
+  return stripControlAndBidiChars(raw)
+    .split("\n")
+    .map((line) => line.replace(/\t/g, " ").trim())
+    .filter((line) => line.length > 0)
+    .map((line) =>
+      renderDefangedMarkdown(line)
+        .replace(/^([-+=])/, "\\$1")
+        .replace(/^(\d+)([.)])/, "$1\\$2"),
+    )
+    .join("\n");
+}
+
+const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
+
+/** Fenced code block whose fence is longer than any backtick run inside `body`. */
+function mdFence(info: string, body: string): string[] {
+  const longestRun = Math.max(0, ...[...body.matchAll(/`+/g)].map((m) => m[0].length));
+  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  return [`${fence}${info}`, body, fence];
+}
+
 function escapeHtml(raw: string): string {
   return stripControlAndBidiChars(raw)
     .replace(/&/g, "&amp;")
@@ -123,15 +189,19 @@ export function buildCustomerReportMarkdown(
   const allReviews = workbench.handoffs.flatMap((h) => h.reviews);
 
   const lines: string[] = [];
-  lines.push(`# Hunt Command DFIR Investigation Report — ${sanitizeSingleLine(caseMetadata.case_id)}`);
-  lines.push("");
-  lines.push(`- **Case Title**: ${renderDefangedPlainText(caseMetadata.title)}`);
-  lines.push(`- **Hunt Run ID**: \`${sanitizeSingleLine(workbench.huntId)}\``);
-  lines.push(`- **Data Origin**: \`${caseMetadata.data_origin}\` (\`synthetic_only=${String(caseMetadata.synthetic_only)}\`)`);
   lines.push(
-    `- **Case Window (UTC)**: \`${sanitizeSingleLine(caseMetadata.time_window.start_iso)}\` to \`${sanitizeSingleLine(caseMetadata.time_window.end_iso)}\``,
+    `# Hunt Command DFIR Investigation Report — ${renderDefangedMarkdownInline(caseMetadata.case_id)}`,
   );
-  lines.push(`- **Exported At (UTC)**: \`${sanitizeSingleLine(exportedAtIso)}\``);
+  lines.push("");
+  lines.push(`- **Case Title**: ${renderDefangedMarkdownInline(caseMetadata.title)}`);
+  lines.push(`- **Hunt Run ID**: ${mdCode(workbench.huntId)}`);
+  lines.push(
+    `- **Data Origin**: ${mdCode(caseMetadata.data_origin)} (${mdCode(`synthetic_only=${String(caseMetadata.synthetic_only)}`)})`,
+  );
+  lines.push(
+    `- **Case Window (UTC)**: ${mdCode(caseMetadata.time_window.start_iso)} to ${mdCode(caseMetadata.time_window.end_iso)}`,
+  );
+  lines.push(`- **Exported At (UTC)**: ${mdCode(exportedAtIso)}`);
   lines.push(
     `- **Automated Citation Verification Receipt**: \`${citationReceipt.verifiedCount}/${citationReceipt.totalCited}\` resolved (\`${citationReceipt.unresolvedCount}\` unresolved, \`${citationReceipt.outOfScopeCount}\` out-of-scope)`,
   );
@@ -148,37 +218,35 @@ export function buildCustomerReportMarkdown(
     lines.push("_No observed or confirmed finding claims recorded._");
   } else {
     for (const row of observedAndFindings) {
-      const roleTitle = PROFILE_DISPLAY_TITLES[row.profile];
+      const roleTitle = renderDefangedMarkdownInline(PROFILE_DISPLAY_TITLES[row.profile] ?? row.profile);
       lines.push(
-        `### \`${sanitizeSingleLine(row.claim.claim_id)}\` [${row.claim.kind.toUpperCase()}] — ${roleTitle} (\`${row.stepId}\`)`,
+        `### ${mdCode(row.claim.claim_id)} \\[${renderDefangedMarkdownInline(row.claim.kind.toUpperCase())}\\] — ${roleTitle} (${mdCode(row.stepId)})`,
       );
       lines.push("");
-      lines.push(renderDefangedPlainText(row.claim.statement));
+      lines.push(renderDefangedMarkdownBlock(row.claim.statement));
       lines.push("");
       lines.push(
-        `- **Source Store IDs**: ${row.claim.evidence_ids.map((id) => `\`${sanitizeSingleLine(id)}\``).join(", ")}`,
+        `- **Source Store IDs**: ${row.claim.evidence_ids.map((id) => mdCode(id)).join(", ")}`,
       );
       lines.push(
         `- **Inline Citations**: ${
           row.inlineCitations.length > 0
-            ? row.inlineCitations.map((c) => `\`${c.id}\` (${c.status})`).join(", ")
+            ? row.inlineCitations.map((c) => `${mdCode(c.id)} (${mdCode(c.status)})`).join(", ")
             : "_None_"
         }`,
       );
       if (row.claim.entity_ids.length > 0) {
-        lines.push(
-          `- **Entities**: ${row.claim.entity_ids.map((e) => `\`${sanitizeSingleLine(e)}\``).join(", ")}`,
-        );
+        lines.push(`- **Entities**: ${row.claim.entity_ids.map((e) => mdCode(e)).join(", ")}`);
       }
       if (row.claim.contradicts.length > 0) {
         lines.push(
-          `- **Contradicts**: ${row.claim.contradicts.map((cid) => `\`${sanitizeSingleLine(cid)}\``).join(", ")}`,
+          `- **Contradicts**: ${row.claim.contradicts.map((cid) => mdCode(cid)).join(", ")}`,
         );
       }
       if (row.reviews.length > 0) {
         for (const rev of row.reviews) {
           lines.push(
-            `- **Purple Review (\`${sanitizeSingleLine(rev.review_id)}\` -> \`${rev.disposition}\`)**: ${renderDefangedPlainText(rev.rationale)}`,
+            `- **Purple Review (${mdCode(rev.review_id)} -> ${mdCode(rev.disposition)})**: ${renderDefangedMarkdownInline(rev.rationale)}`,
           );
         }
       }
@@ -192,22 +260,22 @@ export function buildCustomerReportMarkdown(
     lines.push("_No hypotheses or inferences recorded._");
   } else {
     for (const row of hypothesesAndInferences) {
-      const roleTitle = PROFILE_DISPLAY_TITLES[row.profile];
+      const roleTitle = renderDefangedMarkdownInline(PROFILE_DISPLAY_TITLES[row.profile] ?? row.profile);
       lines.push(
-        `### \`${sanitizeSingleLine(row.claim.claim_id)}\` [${row.claim.kind.toUpperCase()}] — ${roleTitle} (\`${row.stepId}\`)`,
+        `### ${mdCode(row.claim.claim_id)} \\[${renderDefangedMarkdownInline(row.claim.kind.toUpperCase())}\\] — ${roleTitle} (${mdCode(row.stepId)})`,
       );
       lines.push("");
-      lines.push(renderDefangedPlainText(row.claim.statement));
+      lines.push(renderDefangedMarkdownBlock(row.claim.statement));
       lines.push("");
       if (row.claim.contradicts.length > 0) {
         lines.push(
-          `- **Contradicts**: ${row.claim.contradicts.map((cid) => `\`${sanitizeSingleLine(cid)}\``).join(", ")}`,
+          `- **Contradicts**: ${row.claim.contradicts.map((cid) => mdCode(cid)).join(", ")}`,
         );
       }
       if (row.reviews.length > 0) {
         for (const rev of row.reviews) {
           lines.push(
-            `- **Purple Review (\`${sanitizeSingleLine(rev.review_id)}\` -> \`${rev.disposition}\`)**: ${renderDefangedPlainText(rev.rationale)}`,
+            `- **Purple Review (${mdCode(rev.review_id)} -> ${mdCode(rev.disposition)})**: ${renderDefangedMarkdownInline(rev.rationale)}`,
           );
         }
       }
@@ -222,7 +290,7 @@ export function buildCustomerReportMarkdown(
   } else {
     for (const rev of allReviews) {
       lines.push(
-        `- **\`${sanitizeSingleLine(rev.review_id)}\`** (\`${rev.disposition}\`) covering ${rev.claim_ids.map((id) => `\`${sanitizeSingleLine(id)}\``).join(", ")}: ${renderDefangedPlainText(rev.rationale)}`,
+        `- **${mdCode(rev.review_id)}** (${mdCode(rev.disposition)}) covering ${rev.claim_ids.map((id) => mdCode(id)).join(", ")}: ${renderDefangedMarkdownInline(rev.rationale)}`,
       );
     }
   }
@@ -235,7 +303,7 @@ export function buildCustomerReportMarkdown(
   } else {
     for (const lim of limitations) {
       lines.push(
-        `- **[${sanitizeSingleLine(lim.stepId)} / ${PROFILE_DISPLAY_TITLES[lim.profile]}]**: ${renderDefangedPlainText(lim.text)}`,
+        `- **\\[${renderDefangedMarkdownInline(lim.stepId)} / ${renderDefangedMarkdownInline(PROFILE_DISPLAY_TITLES[lim.profile] ?? lim.profile)}\\]**: ${renderDefangedMarkdownInline(lim.text)}`,
       );
     }
   }
@@ -246,7 +314,7 @@ export function buildCustomerReportMarkdown(
     lines.push("");
     for (const gd of gateHistory) {
       lines.push(
-        `- **Gate \`${sanitizeSingleLine(gd.gate)}\`** -> \`${gd.action.toUpperCase()}\` by \`${sanitizeSingleLine(gd.decided_by)}\` (\`${sanitizeSingleLine(gd.rbac_role)}\`, via \`${gd.via}\`) at \`${sanitizeSingleLine(gd.decided_at)}\` · SHA-256 \`${gd.payload_sha256}\`${gd.note ? ` · Note: ${renderDefangedPlainText(gd.note)}` : ""}`,
+        `- **Gate ${mdCode(gd.gate)}** -> ${mdCode(gd.action.toUpperCase())} by ${mdCode(gd.decided_by)} (${mdCode(gd.rbac_role)}, via ${mdCode(gd.via)}) at ${mdCode(gd.decided_at)} · SHA-256 ${SHA256_HEX_RE.test(gd.payload_sha256) ? mdCode(gd.payload_sha256) : "_invalid digest withheld_"}${gd.note ? ` · Note: ${renderDefangedMarkdownInline(gd.note)}` : ""}`,
       );
     }
     lines.push("");
@@ -261,14 +329,13 @@ export function buildCustomerReportMarkdown(
 
   for (const entry of citationReceipt.entries) {
     const record = workbench.evidenceCatalog[entry.citationId];
-    lines.push(`### Raw Record \`${sanitizeSingleLine(entry.citationId)}\` (\`${entry.status}\`)`);
+    lines.push(`### Raw Record ${mdCode(entry.citationId)} (${mdCode(entry.status)})`);
     lines.push("");
     if (!record) {
       lines.push("_Record not present in bounded case store._");
       lines.push("");
       continue;
     }
-    lines.push("```json");
     const defangedFields: Record<string, unknown> = {};
     for (const [fieldKey, fieldVal] of Object.entries(record.fields)) {
       if (typeof fieldVal === "string") {
@@ -281,8 +348,7 @@ export function buildCustomerReportMarkdown(
         defangedFields[fieldKey] = fieldVal;
       }
     }
-    lines.push(JSON.stringify(defangedFields, null, 2));
-    lines.push("```");
+    lines.push(...mdFence("json", JSON.stringify(defangedFields, null, 2)));
     lines.push("");
   }
 

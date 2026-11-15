@@ -8,6 +8,7 @@ import {
   sanitizeWatchRequestHeaders,
 } from "../src/main/watch/browser-policy.ts";
 import { deniedSessionCommand, isOpenableWatchUrl } from "../src/main/watch/cdp-filter.ts";
+import { CdpHub, type HubPage } from "../src/main/watch/cdp-hub.ts";
 import { isAllowedLoopbackCdpRequest } from "../src/main/watch/cdp-server.ts";
 
 const TEST_SCOPE = createWatchScope({
@@ -202,5 +203,104 @@ describe("Hardened Watch Browser request policy, proxy blackhole & CDP filter (#
         49210,
       ),
     ).toBe(false);
+  });
+
+  test("CDP navigation fence: Page.navigate is scope-checked; history/document/PDF/IO/file-input are denied", () => {
+    const openable = (url: string) => isOpenableWatchUrl(TEST_SCOPE, url);
+    const hostile = [
+      "file:///C:/x",
+      "data:text/html,<script>alert(1)</script>",
+      "chrome://settings",
+      "//evil.example.com/x",
+      "http://127.0.0.1:9999/",
+      "http://evil.example.com/",
+      "http://localhost:18400/board",
+      "javascript:alert(1)",
+    ];
+    for (const url of hostile) {
+      expect(deniedSessionCommand("Page.navigate", { url }, openable)).toMatch(/outside/);
+    }
+    expect(deniedSessionCommand("Page.navigate", {}, openable)).toMatch(/outside/);
+    expect(deniedSessionCommand("Page.navigate", { url: 42 }, openable)).toMatch(/outside/);
+    // Without a scope check the fence fails closed.
+    expect(deniedSessionCommand("Page.navigate", { url: "http://127.0.0.1:18400/board" })).toMatch(
+      /outside/,
+    );
+    expect(
+      deniedSessionCommand("Page.navigate", { url: "http://127.0.0.1:18400/board" }, openable),
+    ).toBeNull();
+    expect(deniedSessionCommand("Page.navigate", { url: "about:blank" }, openable)).toBeNull();
+
+    for (const method of [
+      "Page.navigateToHistoryEntry",
+      "Page.setDocumentContent",
+      "Page.printToPDF",
+      "IO.read",
+      "IO.resolveBlob",
+      "DOM.setFileInputFiles",
+    ]) {
+      expect(deniedSessionCommand(method, { entryId: 1, html: "x", handle: "h" }, openable)).toMatch(
+        /denied/,
+      );
+    }
+    expect(deniedSessionCommand("Page.reload", undefined, openable)).toBeNull();
+  });
+
+  test("CdpHub threads the session scope into Page.navigate on attached page sessions", async () => {
+    const forwarded: { method: string; params: unknown }[] = [];
+    const page: HubPage = {
+      id: 1,
+      url: () => "about:blank",
+      title: () => "",
+      attach: () => {},
+      detach: () => {},
+      send: async (method, params) => {
+        forwarded.push({ method, params });
+        return {};
+      },
+    };
+    const hub = new CdpHub({
+      pages: () => [page],
+      createPage: async () => page,
+      closePage: async () => {},
+      activatePage: () => {},
+      isOpenableUrl: (url) => isOpenableWatchUrl(TEST_SCOPE, url),
+      version: () => ({ product: "test", userAgent: "test" }),
+    });
+    const replies = new Map<number, Record<string, unknown>>();
+    const conn = hub.connect({
+      send: (text) => {
+        const msg = JSON.parse(text) as Record<string, unknown>;
+        if (typeof msg.id === "number") replies.set(msg.id, msg);
+      },
+      close: () => {},
+    });
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    hub.message(conn, JSON.stringify({ id: 1, method: "Target.attachToTarget", params: { targetId: "PAGE1", flatten: true } }));
+    await flush();
+    const sessionId = (replies.get(1)?.result as { sessionId: string }).sessionId;
+    expect(typeof sessionId).toBe("string");
+
+    const urls = [
+      "file:///C:/x",
+      "data:text/html,<h1>x</h1>",
+      "chrome://settings",
+      "//evil.example.com/x",
+      "http://evil.example.com/",
+    ];
+    urls.forEach((url, i) => {
+      hub.message(conn, JSON.stringify({ id: 10 + i, sessionId, method: "Page.navigate", params: { url } }));
+    });
+    hub.message(conn, JSON.stringify({ id: 20, sessionId, method: "Page.navigate", params: { url: "http://127.0.0.1:18400/board" } }));
+    await flush();
+
+    urls.forEach((_url, i) => {
+      expect(replies.get(10 + i)?.error).toBeDefined();
+    });
+    expect(replies.get(20)?.error).toBeUndefined();
+    const navigations = forwarded.filter((f) => f.method === "Page.navigate");
+    expect(navigations).toEqual([{ method: "Page.navigate", params: { url: "http://127.0.0.1:18400/board" } }]);
+    hub.closeAll();
   });
 });
