@@ -16,7 +16,7 @@ export const PY_WORD_END = String.raw`(?![\p{L}\p{N}_])`;
 /** Python `\d` for `str` patterns: any Unicode decimal digit. */
 export const PY_DIGIT = String.raw`\p{Nd}`;
 /** Python `\s` for `str` patterns: exactly the characters where `str.isspace()` is true. */
-export const PY_SPACE = String.raw`[\t\n\x0b\x0c\r\x1c-\x1f \x85\xa0  -     　]`;
+export const PY_SPACE = String.raw`[\t\n\x0b\x0c\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]`;
 /** Python `$` without MULTILINE: end of string, or just before one final `\n`. */
 const PY_END = String.raw`(?=\n?(?![\s\S]))`;
 /** Every scorer pattern built from the sources below must carry these flags. */
