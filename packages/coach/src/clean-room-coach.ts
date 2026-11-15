@@ -10,7 +10,6 @@ import {
   CLEAN_ROOM_TOOL_ABORT_EXIT_CODE,
   CleanRoomToolViolationError,
   CleanRoomViolationError,
-  isApiKeyEnvName,
   type CleanRoomRole,
   type CleanRoomWorkerTurnRequest,
   type CleanRoomWorkerTurnResult,
@@ -24,7 +23,7 @@ import {
 import {
   citedIds,
   loadJsonText,
-  names,
+  compareLexicographic,
   scoreReport,
   validateTruth,
   type ScenarioTruth,
@@ -240,19 +239,50 @@ function roundTo4(value: number): number {
 // 1. Clean-Room Out-of-Process Child Spawner
 // ============================================================================
 
+/**
+ * The only parent env vars a clean-room child inherits: process plumbing,
+ * temp/home/profile locations, locale, and the config directories where the
+ * subscription OAuth login lives. Everything else — any token, credential,
+ * proxy URL or provider setting, whatever its name — is dropped (allowlist,
+ * not denylist: `ANTHROPIC_AUTH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, ... never
+ * match a `*_API_KEY` rule).
+ */
+export const CLEAN_ROOM_CHILD_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
+  "PATH",
+  "PATHEXT",
+  "SYSTEMROOT",
+  "SYSTEMDRIVE",
+  "WINDIR",
+  "COMSPEC",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "HOME",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "XDG_CACHE_HOME",
+  "CLAUDE_CONFIG_DIR",
+  "PI_CODING_AGENT_DIR",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+]);
+
 export function buildCleanRoomChildEnv(
   baseEnv: Readonly<Record<string, string | undefined>> = process.env,
   options?: { allowTestSimulation?: boolean },
 ): Record<string, string> {
   const clean: Record<string, string> = {};
   for (const [key, val] of Object.entries(baseEnv)) {
-    if (val === undefined) {
-      continue;
-    }
-    if (isApiKeyEnvName(key)) {
-      continue;
-    }
-    if (key.toUpperCase() === "HUNT_COACH_ALLOW_TEST_SIM") {
+    // Windows env names are case-insensitive (`Path`, `SystemRoot`).
+    if (val === undefined || !CLEAN_ROOM_CHILD_ENV_ALLOWLIST.has(key.toUpperCase())) {
       continue;
     }
     clean[key] = val;
@@ -518,101 +548,147 @@ export interface HoldoutInspectionInput {
   readonly eventsVocab?: Iterable<string>;
 }
 
-const DEDALE_TOKEN_RE = /\bdedale\b/i;
-const REAL_WIN_CASE_RE = /\breal-win-[a-z0-9_-]*\b/i;
-const STORY_B_TOKEN_RE = /\bstory[-_]b(?:[-_]holdout)?\b/i;
-const TALVERIN_ENV_PHRASE_RE = /of\s+the\s+talverin\s+environment/i;
-const TALVERIN_DOMAIN_RE = /\btalverin\.example\b/i;
-const PORTAL_PROBING_SLUG = "attack.recon.portal-path-probing";
+/**
+ * Canonical spelling for holdout matching: compatibility-fold (full-width,
+ * ligatures), drop combining marks and invisible format characters (accents,
+ * zero-width splits, soft hyphens), lowercase, and treat `_`, `-` and runs of
+ * whitespace alike (all become `-`). `DÉDALE`, `ded<ZWSP>ale`, `Story B`,
+ * `public_dataset` and `ｒｅａｌ-ｗｉｎ` all reach the same token as the plain form.
+ */
+export function normalizeHoldoutToken(raw: string): string {
+  return raw
+    .normalize("NFKD")
+    .replace(/[\p{M}\p{Cf}]/gu, "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\s_-]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+}
 
-function collectAllStringsFromJson(value: unknown, out: string[]): void {
+const HOLDOUT_ALNUM = "[\\p{L}\\p{N}]";
+const holdoutToken = (body: string): RegExp =>
+  new RegExp(`(?<!${HOLDOUT_ALNUM})${body}(?!${HOLDOUT_ALNUM})`, "u");
+
+const DEDALE_TOKEN_RE = holdoutToken("dedale");
+const REAL_WIN_CASE_RE = new RegExp(`(?<!${HOLDOUT_ALNUM})real-?win(?![\\p{L}])`, "u");
+const STORY_B_TOKEN_RE = holdoutToken("story-?b(?:-holdout)?");
+const TALVERIN_RE = /talverin/u;
+const PORTAL_PROBING_SLUG = "attack.recon.portal-path-probing";
+/** The only data origin a coach case may have (HUNT-BOTS.md rule 1). */
+const SYNTHETIC_DATA_ORIGIN = "synthetic";
+const STORY_KEY = "story";
+const DATA_ORIGIN_KEYS: ReadonlySet<string> = new Set(["data-origin", "dataorigin"]);
+const SOURCE_KEY = "source";
+
+function dataOriginReason(normalizedOrigin: string): string {
+  return normalizedOrigin === "public-dataset"
+    ? "data_origin==='public-dataset'"
+    : normalizedOrigin === "work-export" || normalizedOrigin === "work-connected"
+      ? `data_origin==='${normalizedOrigin}'`
+      : "data_origin!=='synthetic'";
+}
+
+function scanHoldoutString(raw: string, reasons: Set<string>): void {
+  const token = normalizeHoldoutToken(raw);
+  if (STORY_B_TOKEN_RE.test(token)) {
+    reasons.add("story==='b'");
+  }
+  if (TALVERIN_RE.test(token)) {
+    reasons.add("talverin.example");
+  }
+  if (token.includes(PORTAL_PROBING_SLUG)) {
+    reasons.add("attack.recon.portal-path-probing");
+  }
+  if (token === "public-dataset" || token === "work-export" || token === "work-connected") {
+    reasons.add(dataOriginReason(token));
+  }
+  if (DEDALE_TOKEN_RE.test(token) || REAL_WIN_CASE_RE.test(token)) {
+    reasons.add("DEDALE");
+  }
+}
+
+/** Every leaf value under a key, flattened (so `story: ["b"]` reads like `story: "b"`). */
+function leafStrings(value: unknown, out: string[]): void {
   if (typeof value === "string") {
     out.push(value);
-    return;
-  }
-  if (Array.isArray(value)) {
+  } else if (Array.isArray(value)) {
     for (const item of value) {
-      collectAllStringsFromJson(item, out);
-    }
-    return;
-  }
-  if (isPlainObject(value)) {
-    for (const [k, v] of Object.entries(value)) {
-      out.push(k);
-      collectAllStringsFromJson(v, out);
+      leafStrings(item, out);
     }
   }
 }
 
+function scanHoldoutJson(value: unknown, reasons: Set<string>, depth: number): void {
+  if (depth > 64) {
+    // Deeper than any real case.json: refuse rather than skip the unseen part.
+    reasons.add("holdout_scan_too_deep");
+    return;
+  }
+  if (typeof value === "string") {
+    scanHoldoutString(value, reasons);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      scanHoldoutJson(item, reasons, depth + 1);
+    }
+    return;
+  }
+  if (!isPlainObject(value)) {
+    return;
+  }
+  for (const [rawKey, child] of Object.entries(value)) {
+    scanHoldoutString(rawKey, reasons);
+    const key = normalizeHoldoutToken(rawKey);
+    const leaves: string[] = [];
+    leafStrings(child, leaves);
+    const normalizedLeaves = leaves.map(normalizeHoldoutToken);
+    if (key === STORY_KEY && normalizedLeaves.some((v) => v === "b")) {
+      reasons.add("story==='b'");
+    }
+    if (DATA_ORIGIN_KEYS.has(key)) {
+      for (const origin of normalizedLeaves) {
+        if (origin !== SYNTHETIC_DATA_ORIGIN) {
+          reasons.add(dataOriginReason(origin));
+        }
+      }
+      if (leaves.length === 0 && child !== undefined && child !== null) {
+        reasons.add("data_origin!=='synthetic'");
+      }
+    }
+    if (key === "synthetic-only" && child === false) {
+      reasons.add("data_origin!=='synthetic'");
+    }
+    if (key === SOURCE_KEY && normalizedLeaves.some((v) => DEDALE_TOKEN_RE.test(v))) {
+      reasons.add("DEDALE");
+    }
+    scanHoldoutJson(child, reasons, depth + 1);
+  }
+}
+
 /**
- * Detects whether a case belongs to any sealed holdout family:
- * - `story === 'b'` (or `story_b_holdout`)
+ * Detects whether a case belongs to any sealed holdout family, at any depth of
+ * the case metadata / truth and in the events vocabulary, after normalizing
+ * case, width, accents, zero-width characters and `_`/`-`/space spelling:
+ * - `story === 'b'` (or `story_b_holdout`, `Story B`)
  * - `'of the Talverin environment'` / `'talverin.example'`
  * - `'attack.recon.portal-path-probing'`
- * - `data_origin === 'public-dataset'`
+ * - any `data_origin` other than `synthetic` (`public-dataset`, `work-export`, `work-connected`)
  * - `'DEDALE'` / `'real-win-*'`
  */
 export function detectHoldoutReasons(input: HoldoutInspectionInput): string[] {
   const reasons = new Set<string>();
-
-  const checkStoryAndOrigin = (obj: Record<string, unknown> | null | undefined): void => {
-    if (!obj) {
-      return;
-    }
-    const story = obj.story;
-    if (typeof story === "string" && story.trim().toLowerCase() === "b") {
-      reasons.add("story==='b'");
-    }
-    const dataOrigin = obj.data_origin;
-    if (
-      typeof dataOrigin === "string" &&
-      dataOrigin.trim().toLowerCase() === "public-dataset"
-    ) {
-      reasons.add("data_origin==='public-dataset'");
-    }
-    const source = obj.source;
-    if (typeof source === "string" && DEDALE_TOKEN_RE.test(source)) {
-      reasons.add("DEDALE");
-    }
-  };
-
-  checkStoryAndOrigin(input.caseMeta ?? undefined);
-  checkStoryAndOrigin(
-    input.truth ? (input.truth as unknown as Record<string, unknown>) : undefined,
-  );
-
-  const stringsToScan: string[] = [];
   if (input.caseMeta) {
-    collectAllStringsFromJson(input.caseMeta, stringsToScan);
+    scanHoldoutJson(input.caseMeta, reasons, 0);
   }
   if (input.truth) {
-    collectAllStringsFromJson(input.truth, stringsToScan);
+    scanHoldoutJson(input.truth, reasons, 0);
   }
   if (input.eventsVocab) {
     for (const token of input.eventsVocab) {
-      stringsToScan.push(token);
+      scanHoldoutString(token, reasons);
     }
   }
-
-  for (const s of stringsToScan) {
-    const lower = s.toLowerCase();
-    if (STORY_B_TOKEN_RE.test(s)) {
-      reasons.add("story==='b'");
-    }
-    if (TALVERIN_ENV_PHRASE_RE.test(s) || TALVERIN_DOMAIN_RE.test(s) || /\btalverin\b/i.test(s)) {
-      reasons.add("talverin.example");
-    }
-    if (lower.includes(PORTAL_PROBING_SLUG)) {
-      reasons.add("attack.recon.portal-path-probing");
-    }
-    if (lower === "public-dataset") {
-      reasons.add("data_origin==='public-dataset'");
-    }
-    if (DEDALE_TOKEN_RE.test(s) || REAL_WIN_CASE_RE.test(s)) {
-      reasons.add("DEDALE");
-    }
-  }
-
   return [...reasons].sort();
 }
 
@@ -825,22 +901,74 @@ export function buildForbiddenSet(options?: BuildForbiddenSetOptions): Set<strin
 }
 
 const SINGLE_TOKEN_ENUM_LEAF_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
-const FACT_SLUG_RE = /\b(?:attack|decoy|benign|coverage)\.[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\b/i;
-const RAW_EVT_ID_RE = /\bevt-[a-z0-9_-]+\b/i;
-const RAW_FRAME_ID_RE = /\bframe-\d+\b/i;
-const RAW_IOC_ID_RE = /\bioc-\d+\b/i;
-const CASE_ID_LEAK_RE =
-  /\b(?:story[-_]?[ab](?:[-_][a-z0-9_-]+)?|team-(?:easy|med|hard)-\d+|solo-[a-z]+-\d+|real-win-[a-z0-9_-]*|case[-_]\d+)\b/i;
-const IPV4_LEAK_RE = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
-const IPV6_LEAK_RE = /\b(?:[0-9a-f]{1,4}:){2,}[0-9a-f:]{1,24}\b/i;
-const SYNTH_DOMAIN_LEAK_RE =
-  /\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:example|test|invalid|local|internal|corp|lan|home)\b/i;
-const HEX_HASH_LEAK_RE = /\b(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})\b/i;
-const SEALED_KEYWORD_LEAK_RE =
-  /(?:northvale|talverin|dedale|truth\.json|operator-only|story_b_holdout)/i;
 
-// Global copies used ONLY for `.replace` so every occurrence is redacted. The
-// non-global originals above stay in use for `.test` (no `lastIndex` state).
+// Leak patterns. Boundaries are "not a letter or number", so `_`, `-`, `.`
+// and punctuation all separate tokens (`id_evt-000101`, `md5_<hex>`,
+// `svc-backup_admin` are caught; JS `\b` treats `_` as part of a word).
+const LEAK_ALNUM = String.raw`[\p{L}\p{N}]`;
+const LB = `(?<!${LEAK_ALNUM})`;
+const LA = `(?!${LEAK_ALNUM})`;
+const HEX4 = "[0-9a-f]{1,4}";
+const leakRe = (body: string): RegExp => new RegExp(body, "iu");
+
+const FACT_SLUG_RE = leakRe(`${LB}(?:attack|decoy|benign|coverage)\\.[a-z0-9_-]+(?:\\.[a-z0-9_-]+)*${LA}`);
+const RAW_EVT_ID_RE = leakRe(`${LB}evt-[a-z0-9_-]+`);
+const RAW_FRAME_ID_RE = leakRe(`${LB}frame-\\d+${LA}`);
+const RAW_IOC_ID_RE = leakRe(`${LB}ioc-\\d+${LA}`);
+const CASE_ID_LEAK_RE = leakRe(
+  `${LB}(?:story[-_]?[ab](?:[-_][a-z0-9_-]+)?|team-(?:easy|med|hard)-\\d+|solo-[a-z]+-\\d+|real[-_]?win[-_a-z0-9]*|case[-_]\\d+)${LA}`,
+);
+// An address followed by letters (`10.0.0.1abc`) still names the address.
+const IPV4_LEAK_RE = leakRe(`(?<![\\p{N}.])(?:\\d{1,3}\\.){3}\\d{1,3}(?![\\p{N}])`);
+// Full, `::`-compressed (`fe80::1`, `fd12::5`, `fe80::a1b2:c3d4`) and colon-run forms.
+const IPV6_LEAK_RE = leakRe(
+  `(?<![\\p{L}\\p{N}:])(?:(?:${HEX4}:){7}${HEX4}|(?:${HEX4}:){0,6}${HEX4}?::(?:${HEX4}:){0,6}${HEX4}?|(?:${HEX4}:){2,}[0-9a-f:]{1,24})(?![\\p{L}\\p{N}:])`,
+);
+const SYNTH_DOMAIN_LEAK_RE = leakRe(
+  `${LB}[a-z0-9-]+(?:\\.[a-z0-9-]+)*\\.(?:example|test|invalid|local|internal|corp|lan|home)${LA}`,
+);
+const HEX_HASH_LEAK_RE = leakRe(`${LB}(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})${LA}`);
+const SEALED_KEYWORD_LEAK_RE = leakRe(
+  "(?:northvale|talverin|dedale|truth\\.json|operator-only|story_b_holdout)",
+);
+
+/** Defanged dots (`evil[.]corp`, `10(.)0(.)0(.)5`, `x[dot]test`) read as real dots. */
+const DEFANGED_DOT_RE = /\[\.\]|\(\.\)|\{\.\}|\[dot\]|\(dot\)|\{dot\}/giu;
+
+/**
+ * Canonical text for leak matching: compatibility-fold (full-width forms),
+ * drop invisible format characters (zero-width splits) and refang dots.
+ */
+function canonicalLeakText(raw: string): string {
+  return raw.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(DEFANGED_DOT_RE, ".");
+}
+
+/** Forbidden terms shorter than this cannot identify anything and would match everywhere. */
+const MIN_FORBIDDEN_TERM_CHARS = 2;
+
+/**
+ * One matcher for a forbidden vocabulary: terms longest-first (so a shorter
+ * prefix such as `alpha` never pre-empts `alpha-host-7`), case-insensitive,
+ * bounded by "not a letter or number" so `_`-joined forms match too, and
+ * with `-` and `_` inside a term interchangeable (`svc-backup` ~ `svc_backup`).
+ */
+function forbiddenTermsMatcher(forbidden: ReadonlySet<string>): RegExp | null {
+  const terms = [
+    ...new Set(
+      [...forbidden]
+        .map((t) => canonicalLeakText(t).toLowerCase())
+        .filter((t) => t.length >= MIN_FORBIDDEN_TERM_CHARS),
+    ),
+  ].sort((a, b) => b.length - a.length || compareLexicographic(a, b));
+  if (terms.length === 0) {
+    return null;
+  }
+  const alternation = terms
+    .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/[-_]/g, "[-_]"))
+    .join("|");
+  return new RegExp(`${LB}(?:${alternation})${LA}`, "giu");
+}
+
 const toGlobal = (re: RegExp): RegExp => new RegExp(re.source, `${re.flags}g`);
 const SCRUB_RULES: ReadonlyArray<readonly [RegExp, string]> = [
   [toGlobal(FACT_SLUG_RE), "[REDACTED_FACT]"],
@@ -849,8 +977,8 @@ const SCRUB_RULES: ReadonlyArray<readonly [RegExp, string]> = [
   [toGlobal(RAW_IOC_ID_RE), "[REDACTED_IOC]"],
   [toGlobal(CASE_ID_LEAK_RE), "[REDACTED_CASE]"],
   [toGlobal(SYNTH_DOMAIN_LEAK_RE), "[REDACTED_DOMAIN]"],
-  [toGlobal(IPV4_LEAK_RE), "[REDACTED_IP]"],
   [toGlobal(IPV6_LEAK_RE), "[REDACTED_IP]"],
+  [toGlobal(IPV4_LEAK_RE), "[REDACTED_IP]"],
   [toGlobal(HEX_HASH_LEAK_RE), "[REDACTED_HASH]"],
   [toGlobal(SEALED_KEYWORD_LEAK_RE), "[REDACTED_SEALED]"],
 ];
@@ -859,18 +987,15 @@ export function scrubText(
   raw: string,
   forbidden?: ReadonlySet<string>,
 ): string {
-  let out = raw;
+  let out = canonicalLeakText(raw);
+  // Case vocabulary first, in one longest-first pass, so a generic rule cannot
+  // split a forbidden term and leave part of it behind.
+  const vocab = forbidden ? forbiddenTermsMatcher(forbidden) : null;
+  if (vocab) {
+    out = out.replace(vocab, "[REDACTED_VOCAB]");
+  }
   for (const [re, replacement] of SCRUB_RULES) {
     out = out.replace(re, replacement);
-  }
-
-  if (forbidden && forbidden.size > 0) {
-    for (const term of forbidden) {
-      if (term.length >= 3 && names(out, term)) {
-        const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        out = out.replace(new RegExp(escaped, "gi"), "[REDACTED_VOCAB]");
-      }
-    }
   }
   return out;
 }
@@ -879,35 +1004,134 @@ export interface AssertCleanPacketOptions extends BuildForbiddenSetOptions {
   readonly forbidden?: ReadonlySet<string>;
 }
 
+/** A leak guard after `requireLeakGuard`: the resolved, non-empty forbidden vocabulary. */
+export interface ResolvedLeakGuard extends AssertCleanPacketOptions {
+  readonly forbidden: ReadonlySet<string>;
+}
+
+function isStringIterable(value: unknown): value is Iterable<string> {
+  if (value === null || typeof value !== "object" || !(Symbol.iterator in value)) {
+    return false;
+  }
+  for (const item of value as Iterable<unknown>) {
+    if (typeof item !== "string") {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
- * Fail closed when the case-specific leak guard is missing or empty: without
- * truth / case ids / vocab / forbidden terms the packet check only covers the
- * generic patterns, so the packet must not reach a clean-room model.
+ * Fail closed when the case-specific leak guard is missing, malformed or
+ * empty: the guard must resolve to at least one forbidden term (from truth,
+ * case ids, events vocabulary, extra or explicit forbidden terms). `{caseIds: []}`
+ * or `{forbidden: new Set()}` leave only the generic patterns, so the packet
+ * must not reach a clean-room model.
  */
 export function requireLeakGuard(
   where: string,
   leakGuard: AssertCleanPacketOptions | undefined,
-): AssertCleanPacketOptions {
-  const hasAny =
-    isPlainObject(leakGuard) &&
-    (leakGuard.truth !== undefined ||
-      leakGuard.caseIds !== undefined ||
-      leakGuard.eventsVocab !== undefined ||
-      leakGuard.extraForbidden !== undefined ||
-      leakGuard.forbidden !== undefined);
-  if (!hasAny) {
+): ResolvedLeakGuard {
+  const refuse = (detail: string): never => {
     throw new CleanRoomViolationError(
       "leak_guard_missing",
-      `'${where}' refused: a non-empty leakGuard is required (fail closed)`,
+      `'${where}' refused: a non-empty leakGuard is required (fail closed): ${detail}`,
     );
+  };
+  if (!isPlainObject(leakGuard)) {
+    return refuse("leakGuard is not an object");
   }
-  return leakGuard as AssertCleanPacketOptions;
+  // Shape-checked field by field below before any field is used.
+  const guard = leakGuard as AssertCleanPacketOptions;
+  for (const key of ["caseIds", "eventsVocab", "extraForbidden", "forbidden"] as const) {
+    const value = (guard as Record<string, unknown>)[key];
+    if (value !== undefined && !isStringIterable(value)) {
+      refuse(`'${key}' must be a collection of strings`);
+    }
+  }
+  if (guard.truth !== undefined) {
+    const truths = Array.isArray(guard.truth) ? guard.truth : [guard.truth];
+    for (const truth of truths) {
+      try {
+        validateTruth(truth);
+      } catch {
+        refuse("'truth' is not a valid scenario truth");
+      }
+    }
+  }
+  const forbidden = new Set<string>();
+  for (const term of guard.forbidden ?? []) {
+    const norm = term.trim().toLowerCase();
+    if (norm.length >= MIN_FORBIDDEN_TERM_CHARS) {
+      forbidden.add(norm);
+    }
+  }
+  for (const term of buildForbiddenSet(guard)) {
+    if (term.length >= MIN_FORBIDDEN_TERM_CHARS) {
+      forbidden.add(term);
+    }
+  }
+  if (forbidden.size === 0) {
+    refuse("it resolves to zero forbidden terms");
+  }
+  return { forbidden };
 }
+
+/**
+ * Constant tokens of the packet schema (keys and closed enums). They are
+ * fixed by this module, carry no case information, and are exempt from the
+ * case-vocabulary match only when they equal a schema token exactly (an
+ * events word like `found` must not refuse the `mean_found` key).
+ */
+const PACKET_SCHEMA_TOKENS: ReadonlySet<string> = new Set([
+  "schema_version",
+  "case_count",
+  "round_count",
+  "aggregates",
+  "mean_found",
+  "mean_attack_found",
+  "mean_coverage_found",
+  "misattributed_decoys_total",
+  "mean_citation_precision",
+  "g2_1_pass",
+  "g2_1_pass_rate",
+  "steps_halted_total",
+  "reason_code_counts",
+  "stage_citation_funnel",
+  "claims_emitted",
+  "cited_ids_emitted",
+  "cited_ids_retained_in_incident",
+  "rounds",
+  "round_index",
+  "found_mean",
+  "attack_found_mean",
+  "misattributed_decoys",
+  "citation_precision_mean",
+  "revert_ledger",
+  "attempt_index",
+  "track",
+  "outcome",
+  "reason_code",
+  "probe_delta_found",
+  "provenance",
+  "holdout_checked",
+  "sealed",
+  "holdout_reason_count",
+  "playbook",
+  "code_pr",
+  "promoted",
+  "reverted_probe",
+  "reverted_pass2",
+  "reverted_panel",
+  "rejected_validation",
+  ...DIAGNOSTIC_REASON_CODES,
+  ...STAGE_IDS,
+]);
 
 function inspectCleanStringToken(
   token: string,
   fieldPath: string,
-  forbidden: ReadonlySet<string>,
+  vocab: RegExp | null,
 ): void {
   // 1. Structural anti-prompt-injection rule (#178 G1.1):
   // Every string in the diagnostics packet MUST be a compact single-token enum/identifier,
@@ -920,63 +1144,52 @@ function inspectCleanStringToken(
     );
   }
 
-  if (FACT_SLUG_RE.test(token)) {
-    throw new PacketLeakError(fieldPath, "FACT_SLUG", `Fact slug leaked: '${token}'`);
-  }
-  if (RAW_EVT_ID_RE.test(token)) {
-    throw new PacketLeakError(fieldPath, "EVT_ID", `Event ID leaked: '${token}'`);
-  }
-  if (RAW_FRAME_ID_RE.test(token)) {
-    throw new PacketLeakError(fieldPath, "FRAME_ID", `Frame ID leaked: '${token}'`);
-  }
-  if (RAW_IOC_ID_RE.test(token)) {
-    throw new PacketLeakError(fieldPath, "IOC_ID", `IOC ID leaked: '${token}'`);
-  }
-  if (CASE_ID_LEAK_RE.test(token)) {
-    throw new PacketLeakError(fieldPath, "CASE_ID", `Case ID leaked: '${token}'`);
-  }
-  if (IPV4_LEAK_RE.test(token) || IPV6_LEAK_RE.test(token)) {
-    throw new PacketLeakError(fieldPath, "IP_ADDRESS", `IP address leaked: '${token}'`);
-  }
-  if (SYNTH_DOMAIN_LEAK_RE.test(token)) {
-    throw new PacketLeakError(fieldPath, "SYNTH_DOMAIN", `Domain leaked: '${token}'`);
-  }
-  if (HEX_HASH_LEAK_RE.test(token)) {
-    throw new PacketLeakError(fieldPath, "HEX_HASH", `Hex hash leaked: '${token}'`);
-  }
-  if (SEALED_KEYWORD_LEAK_RE.test(token)) {
-    throw new PacketLeakError(
-      fieldPath,
-      "SEALED_KEYWORD",
-      `Sealed keyword leaked: '${token}'`,
-    );
+  const rules: ReadonlyArray<readonly [RegExp, string, string]> = [
+    [FACT_SLUG_RE, "FACT_SLUG", "Fact slug leaked"],
+    [RAW_EVT_ID_RE, "EVT_ID", "Event ID leaked"],
+    [RAW_FRAME_ID_RE, "FRAME_ID", "Frame ID leaked"],
+    [RAW_IOC_ID_RE, "IOC_ID", "IOC ID leaked"],
+    [CASE_ID_LEAK_RE, "CASE_ID", "Case ID leaked"],
+    [IPV4_LEAK_RE, "IP_ADDRESS", "IP address leaked"],
+    [IPV6_LEAK_RE, "IP_ADDRESS", "IP address leaked"],
+    [SYNTH_DOMAIN_LEAK_RE, "SYNTH_DOMAIN", "Domain leaked"],
+    [HEX_HASH_LEAK_RE, "HEX_HASH", "Hex hash leaked"],
+    [SEALED_KEYWORD_LEAK_RE, "SEALED_KEYWORD", "Sealed keyword leaked"],
+  ];
+  for (const [re, rule, label] of rules) {
+    if (re.test(token)) {
+      throw new PacketLeakError(fieldPath, rule, `${label}: '${token}'`);
+    }
   }
 
-  const lower = token.toLowerCase();
-  if (forbidden.has(lower)) {
-    throw new PacketLeakError(
-      fieldPath,
-      "FORBIDDEN_VOCAB",
-      `Forbidden entity/vocab token leaked: '${token}'`,
-    );
-  }
-
-  for (const term of forbidden) {
-    if (term.length >= 3 && (lower === term || names(lower, term))) {
+  if (vocab && !PACKET_SCHEMA_TOKENS.has(token)) {
+    vocab.lastIndex = 0;
+    const hit = vocab.exec(token.toLowerCase());
+    vocab.lastIndex = 0;
+    if (hit) {
       throw new PacketLeakError(
         fieldPath,
         "FORBIDDEN_VOCAB",
-        `Forbidden entity/vocab '${term}' matched inside '${token}'`,
+        `Forbidden entity/vocab '${hit[0]}' matched inside '${token}'`,
       );
     }
   }
+}
+
+/** JSON-shaped object: `Object.prototype` or null prototype (no `Date`, `Map`, class instances). */
+function isPlainDataObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 export function assertCleanPacket(
   packet: unknown,
   options?: AssertCleanPacketOptions,
 ): void {
-  if (!isPlainObject(packet)) {
+  if (!isPlainDataObject(packet)) {
     throw new PacketLeakError("$", "INVALID_ROOT", "Diagnostics packet must be a plain object");
   }
 
@@ -984,6 +1197,7 @@ export function assertCleanPacket(
   for (const extra of buildForbiddenSet(options)) {
     combinedForbidden.add(extra);
   }
+  const vocab = forbiddenTermsMatcher(combinedForbidden);
 
   const walk = (node: unknown, currentPath: string): void => {
     if (node === null || typeof node === "boolean") {
@@ -1000,7 +1214,7 @@ export function assertCleanPacket(
       return;
     }
     if (typeof node === "string") {
-      inspectCleanStringToken(node, currentPath, combinedForbidden);
+      inspectCleanStringToken(node, currentPath, vocab);
       return;
     }
     if (Array.isArray(node)) {
@@ -1009,9 +1223,9 @@ export function assertCleanPacket(
       }
       return;
     }
-    if (isPlainObject(node)) {
+    if (isPlainDataObject(node)) {
       for (const [k, v] of Object.entries(node)) {
-        inspectCleanStringToken(k, `${currentPath}.<key:${k}>`, combinedForbidden);
+        inspectCleanStringToken(k, `${currentPath}.<key:${k}>`, vocab);
         walk(v, `${currentPath}.${k}`);
       }
       return;
@@ -1019,7 +1233,7 @@ export function assertCleanPacket(
     throw new PacketLeakError(
       currentPath,
       "UNSUPPORTED_TYPE",
-      `Unsupported value type '${typeof node}' in diagnostics packet`,
+      `Unsupported value type '${node instanceof Object ? node.constructor.name : typeof node}' in diagnostics packet`,
     );
   };
 
@@ -1155,12 +1369,8 @@ export interface CaseJudgeEvaluation {
 export interface BuildDiagnosticsPacketInput {
   readonly rounds: ReadonlyArray<ReadonlyArray<CaseJudgeEvaluation>>;
   readonly stageCitationFunnel?: Record<string, StageCitationFunnelEntry>;
-  readonly revertHistory?: ReadonlyArray<{
-    readonly track: "playbook" | "code_pr";
-    readonly outcome: RevertOutcomeCode;
-    readonly reason?: string;
-    readonly probeDeltaFound?: number;
-  }>;
+  /** Prior attempts, normally `PromotionPipelineResult.revertEntry` values. */
+  readonly revertHistory?: ReadonlyArray<RevertHistoryEntry>;
   readonly leakGuard: AssertCleanPacketOptions;
 }
 
@@ -1290,13 +1500,29 @@ export function buildDiagnosticsPacket(
   }
 
   const revertLedger: DiagnosticsRevertEntry[] = (input.revertHistory ?? []).map(
-    (entry, idx) => ({
-      attempt_index: idx,
-      track: entry.track,
-      outcome: entry.outcome,
-      reason_code: classifyReasonCode(entry.reason),
-      probe_delta_found: roundTo4(entry.probeDeltaFound ?? 0),
-    }),
+    (entry, idx) => {
+      // A revert delta is a number the proposer sees: it must come from clean
+      // (non-sealed, non-holdout) metrics, so its provenance is required.
+      requireCleanMetricsProvenance(
+        "propose",
+        isPlainObject(entry) ? entry.provenance : undefined,
+        `revertHistory[${idx}]`,
+      );
+      const delta = entry.probeDeltaFound ?? 0;
+      if (typeof delta !== "number" || !Number.isFinite(delta)) {
+        throw new CleanRoomViolationError(
+          "revert_history_invalid",
+          `buildDiagnosticsPacket refused: revertHistory[${idx}].probeDeltaFound is not a finite number`,
+        );
+      }
+      return {
+        attempt_index: idx,
+        track: entry.track,
+        outcome: entry.outcome,
+        reason_code: classifyReasonCode(entry.reason),
+        probe_delta_found: roundTo4(delta),
+      };
+    },
   );
 
   const packet: CleanDiagnosticsPacket = {
@@ -1889,6 +2115,18 @@ export interface JudgeBatchResult {
   readonly summary: RoundEvalMetrics;
 }
 
+/**
+ * Where a set of round metrics came from. `summarizeCaseEvaluations` stamps
+ * it from the evaluations it reads; anything derived from a sealed or holdout
+ * evaluation carries `sealed: true` / a non-zero reason count and is refused
+ * by the promotion gate and the proposer packet.
+ */
+export interface RoundMetricsProvenance {
+  readonly holdout_checked: true;
+  readonly sealed: boolean;
+  readonly holdout_reason_count: number;
+}
+
 export interface RoundEvalMetrics {
   readonly round_index: number;
   readonly case_count: number;
@@ -1897,6 +2135,112 @@ export interface RoundEvalMetrics {
   readonly misattributed_decoys_total: number;
   readonly mean_citation_precision: number;
   readonly all_g2_1_pass: boolean;
+  readonly provenance: RoundMetricsProvenance;
+}
+
+/** A prior promotion attempt as fed back to the proposer (see `PromotionPipelineResult.revertEntry`). */
+export interface RevertHistoryEntry {
+  readonly track: "playbook" | "code_pr";
+  readonly outcome: RevertOutcomeCode;
+  readonly reason?: string;
+  readonly probeDeltaFound?: number;
+  readonly provenance: RoundMetricsProvenance;
+}
+
+/** Refuses values whose provenance is missing, malformed, sealed or holdout-derived. */
+function requireCleanMetricsProvenance(
+  subcommand: CoachSubcommand,
+  raw: unknown,
+  where: string,
+): RoundMetricsProvenance {
+  if (
+    !isPlainObject(raw) ||
+    raw.holdout_checked !== true ||
+    typeof raw.sealed !== "boolean" ||
+    typeof raw.holdout_reason_count !== "number" ||
+    !Number.isInteger(raw.holdout_reason_count) ||
+    raw.holdout_reason_count < 0
+  ) {
+    throw new CleanRoomViolationError(
+      "metrics_holdout_provenance_missing",
+      `'${subcommand}' refused: ${where} lacks holdout provenance (fail closed)`,
+    );
+  }
+  if (raw.sealed || raw.holdout_reason_count !== 0) {
+    throw new HoldoutSealedError(subcommand, [`${where}:sealed_or_holdout_derived`]);
+  }
+  return { holdout_checked: true, sealed: false, holdout_reason_count: 0 };
+}
+
+function invalidMetrics(where: string, detail: string): never {
+  throw new CleanRoomViolationError(
+    "round_metrics_invalid",
+    `'promote' refused: ${where} ${detail} (fail closed)`,
+  );
+}
+
+function finiteNonNegative(raw: Record<string, unknown>, key: string, where: string): number {
+  const v = raw[key];
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+    return invalidMetrics(where, `'${key}' must be a finite non-negative number, got ${JSON.stringify(v) ?? String(v)}`);
+  }
+  return v;
+}
+
+function nonNegativeInteger(raw: Record<string, unknown>, key: string, where: string): number {
+  const v = finiteNonNegative(raw, key, where);
+  if (!Number.isInteger(v)) {
+    return invalidMetrics(where, `'${key}' must be an integer`);
+  }
+  return v;
+}
+
+/**
+ * Boundary parser for round metrics entering the promotion gate (they come
+ * from a caller-supplied evaluator, possibly a worker's JSON). Every number
+ * must be finite, `all_g2_1_pass` a real boolean, and the provenance clean;
+ * anything else refuses instead of letting `NaN`/`"false"` slip through a
+ * comparison.
+ */
+export function parseRoundEvalMetrics(raw: unknown, where: string): RoundEvalMetrics {
+  if (!isPlainObject(raw)) {
+    return invalidMetrics(where, "is not an object");
+  }
+  const caseCount = nonNegativeInteger(raw, "case_count", where);
+  if (caseCount < 1) {
+    return invalidMetrics(where, "'case_count' must be >= 1");
+  }
+  const precision = finiteNonNegative(raw, "mean_citation_precision", where);
+  if (precision > 1) {
+    return invalidMetrics(where, "'mean_citation_precision' must be <= 1");
+  }
+  if (typeof raw.all_g2_1_pass !== "boolean") {
+    return invalidMetrics(where, "'all_g2_1_pass' must be a boolean");
+  }
+  return {
+    round_index: nonNegativeInteger(raw, "round_index", where),
+    case_count: caseCount,
+    mean_found: finiteNonNegative(raw, "mean_found", where),
+    mean_attack_found: finiteNonNegative(raw, "mean_attack_found", where),
+    misattributed_decoys_total: nonNegativeInteger(raw, "misattributed_decoys_total", where),
+    mean_citation_precision: precision,
+    all_g2_1_pass: raw.all_g2_1_pass,
+    provenance: requireCleanMetricsProvenance("promote", raw.provenance, where),
+  };
+}
+
+/** `minFoundGain` must be a finite, strictly positive margin. */
+export function parseMinFoundGain(raw: unknown): number {
+  if (raw === undefined) {
+    return DEFAULT_MIN_FOUND_GAIN;
+  }
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
+    throw new CleanRoomViolationError(
+      "min_found_gain_invalid",
+      `'promote' refused: minFoundGain must be a finite number > 0, got ${JSON.stringify(raw) ?? String(raw)} (fail closed)`,
+    );
+  }
+  return raw;
 }
 
 export function summarizeCaseEvaluations(
@@ -1911,8 +2255,16 @@ export function summarizeCaseEvaluations(
   let totalDecoys = 0;
   let sumPrecision = 0;
   let allG2 = true;
+  let sealed = false;
+  const holdoutReasons = new Set<string>();
 
   for (const ev of evaluations) {
+    if (ev.sealed !== false) {
+      sealed = true;
+    }
+    for (const r of Array.isArray(ev.holdoutReasons) ? ev.holdoutReasons : ["holdout_provenance_missing"]) {
+      holdoutReasons.add(r);
+    }
     sumFound += ev.score.found;
     sumAttack += ev.score.by_kind.attack?.found ?? 0;
     totalDecoys += ev.score.misattributed_decoys.length;
@@ -1930,6 +2282,11 @@ export function summarizeCaseEvaluations(
     misattributed_decoys_total: totalDecoys,
     mean_citation_precision: roundTo4(sumPrecision / evaluations.length),
     all_g2_1_pass: allG2,
+    provenance: {
+      holdout_checked: true,
+      sealed,
+      holdout_reason_count: holdoutReasons.size,
+    },
   };
 }
 
@@ -2144,7 +2501,7 @@ export async function runCleanRoomThreeVerifierPanel(options: {
 }): Promise<VerifierPanelResult> {
   assertPacketHoldoutProvenance("promote", options.packet);
   assertCleanPacket(options.packet, requireLeakGuard("verifier-panel", options.leakGuard));
-  const minFoundGain = options.minFoundGain ?? DEFAULT_MIN_FOUND_GAIN;
+  const minFoundGain = parseMinFoundGain(options.minFoundGain);
 
   const hardAudit = deterministicSafetyAudit({
     proposal: options.proposal,
@@ -2366,6 +2723,8 @@ export interface PromotionPipelineResult {
   readonly pass2?: readonly [RoundEvalMetrics, RoundEvalMetrics];
   readonly verifier_panel?: VerifierPanelResult;
   readonly telemetry: CoachEvalTelemetryRecord;
+  /** This attempt as a `buildDiagnosticsPacket` revert-history entry (clean provenance). */
+  readonly revertEntry: RevertHistoryEntry;
 }
 
 /**
@@ -2387,7 +2746,17 @@ export async function runPromotionPipeline(
 
   const evalId = options.evalId ?? `coach-eval-${crypto.randomUUID()}`;
   const ts = new Date().toISOString();
-  const minFoundGain = options.minFoundGain ?? DEFAULT_MIN_FOUND_GAIN;
+  const minFoundGain = parseMinFoundGain(options.minFoundGain);
+  const baseline = parseRoundEvalMetrics(options.baseline, "baseline metrics");
+  const evaluateRound = async (
+    stage: "probe" | "pass2",
+    roundIndex: number,
+    proposal: CoachProposal,
+  ): Promise<RoundEvalMetrics> =>
+    parseRoundEvalMetrics(
+      await options.evaluateRound({ stage, roundIndex, proposal }),
+      `${stage} round ${roundIndex} metrics`,
+    );
 
   const finalize = async (params: {
     track: "playbook" | "code_pr";
@@ -2410,15 +2779,18 @@ export async function runPromotionPipeline(
       stopped_at_stage: params.stoppedAt,
       reason_code: params.reasonCode,
       baseline: {
-        mean_found: options.baseline.mean_found,
-        misattributed_decoys: options.baseline.misattributed_decoys_total,
-        all_g2_1_pass: options.baseline.all_g2_1_pass,
+        mean_found: baseline.mean_found,
+        misattributed_decoys: baseline.misattributed_decoys_total,
+        all_g2_1_pass: baseline.all_g2_1_pass,
       },
       ...(params.probe ? { probe: params.probe } : {}),
       ...(params.pass2 ? { pass2: params.pass2 } : {}),
       ...(params.panel ? { verifier_panel: params.panel } : {}),
     };
 
+    const probeDeltaFound = params.probe
+      ? roundTo4(params.probe.mean_found - baseline.mean_found)
+      : 0;
     if (options.ledgerPath) {
       appendCoachLedgerEntry(options.ledgerPath, {
         eval_id: evalId,
@@ -2427,11 +2799,9 @@ export async function runPromotionPipeline(
         outcome: params.outcome,
         stopped_at_stage: params.stoppedAt,
         reason_code: params.reasonCode,
-        baseline_mean_found: options.baseline.mean_found,
+        baseline_mean_found: baseline.mean_found,
         probe_mean_found: params.probe ? params.probe.mean_found : null,
-        probe_delta_found: params.probe
-          ? roundTo4(params.probe.mean_found - options.baseline.mean_found)
-          : 0,
+        probe_delta_found: probeDeltaFound,
         pass2_mean_founds: params.pass2
           ? [params.pass2[0].mean_found, params.pass2[1].mean_found]
           : null,
@@ -2455,6 +2825,13 @@ export async function runPromotionPipeline(
       ...(params.pass2 ? { pass2: params.pass2 } : {}),
       ...(params.panel ? { verifier_panel: params.panel } : {}),
       telemetry,
+      revertEntry: {
+        track: params.track,
+        outcome: params.outcome,
+        reason: params.reasonCode,
+        probeDeltaFound,
+        provenance: baseline.provenance,
+      },
     };
   };
 
@@ -2483,12 +2860,8 @@ export async function runPromotionPipeline(
   }
 
   // Stage 1: 1-round probe
-  const probeMetrics = await options.evaluateRound({
-    stage: "probe",
-    roundIndex: 0,
-    proposal,
-  });
-  const probeCheck = checkRoundGate(probeMetrics, options.baseline, minFoundGain);
+  const probeMetrics = await evaluateRound("probe", 0, proposal);
+  const probeCheck = checkRoundGate(probeMetrics, baseline, minFoundGain);
   if (!probeCheck.pass) {
     return finalize({
       track: proposal.track,
@@ -2502,22 +2875,14 @@ export async function runPromotionPipeline(
   }
 
   // Stage 2: 2-round pass^2 (BOTH rounds must clear baseline + minFoundGain, decoy ceiling, and g2_1_pass)
-  const pass2Round1 = await options.evaluateRound({
-    stage: "pass2",
-    roundIndex: 1,
-    proposal,
-  });
-  const pass2Round2 = await options.evaluateRound({
-    stage: "pass2",
-    roundIndex: 2,
-    proposal,
-  });
+  const pass2Round1 = await evaluateRound("pass2", 1, proposal);
+  const pass2Round2 = await evaluateRound("pass2", 2, proposal);
   const pass2Tuple: readonly [RoundEvalMetrics, RoundEvalMetrics] = [
     pass2Round1,
     pass2Round2,
   ];
 
-  const r1Check = checkRoundGate(pass2Round1, options.baseline, minFoundGain);
+  const r1Check = checkRoundGate(pass2Round1, baseline, minFoundGain);
   if (!r1Check.pass) {
     return finalize({
       track: proposal.track,
@@ -2530,7 +2895,7 @@ export async function runPromotionPipeline(
       pass2: pass2Tuple,
     });
   }
-  const r2Check = checkRoundGate(pass2Round2, options.baseline, minFoundGain);
+  const r2Check = checkRoundGate(pass2Round2, baseline, minFoundGain);
   if (!r2Check.pass) {
     return finalize({
       track: proposal.track,
@@ -2548,7 +2913,7 @@ export async function runPromotionPipeline(
   const panelResult = await runCleanRoomThreeVerifierPanel({
     packet: options.packet,
     proposal,
-    baseline: options.baseline,
+    baseline,
     probe: probeMetrics,
     pass2: pass2Tuple,
     minFoundGain,

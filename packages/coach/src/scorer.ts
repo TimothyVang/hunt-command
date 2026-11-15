@@ -2,9 +2,37 @@ import fs from "node:fs";
 
 export const SCORER_SCHEMA_VERSION = 1 as const;
 
-export const EVENT_ID_SOURCE = String.raw`\bevt-\d{6,}\b`;
-export const FRAME_ID_SOURCE = String.raw`\bframe-(\d+)\b`;
-export const INTEL_ID_SOURCE = String.raw`\bioc-\d{5,}\b`;
+// The Python reference (`scenario.py`) compiles `str` patterns, so `re` is
+// Unicode-aware there: `\w`/`\b` cover every letter, number and `_`, `\d` is any
+// decimal digit (Nd) and `\s` is `str.isspace()`. JS `\b`, `\d` and `\s` are
+// ASCII-only or a different set, so every scorer pattern spells those classes
+// out below and is compiled with the `u` flag (see `PY_RE_FLAGS`).
+/** Python `str` `\w`: letters, numbers and `_`. */
+export const PY_WORD_CLASS = String.raw`[\p{L}\p{N}_]`;
+/** Python `\b` before a word character. */
+export const PY_WORD_START = String.raw`(?<![\p{L}\p{N}_])`;
+/** Python `\b` after a word character. */
+export const PY_WORD_END = String.raw`(?![\p{L}\p{N}_])`;
+/** Python `\d` for `str` patterns: any Unicode decimal digit. */
+export const PY_DIGIT = String.raw`\p{Nd}`;
+/** Python `\s` for `str` patterns: exactly the characters where `str.isspace()` is true. */
+export const PY_SPACE = String.raw`[\t\n\x0b\x0c\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]`;
+/** Python `$` without MULTILINE: end of string, or just before one final `\n`. */
+const PY_END = String.raw`(?=\n?(?![\s\S]))`;
+/** Every scorer pattern built from the sources below must carry these flags. */
+export const PY_RE_FLAGS = "u" as const;
+const S = PY_SPACE;
+const B0 = PY_WORD_START;
+const B1 = PY_WORD_END;
+
+const EVENT_ID_SOURCE = `${PY_WORD_START}evt-${PY_DIGIT}{6,}${PY_WORD_END}`;
+const FRAME_ID_SOURCE = `${PY_WORD_START}frame-(${PY_DIGIT}+)${PY_WORD_END}`;
+const INTEL_ID_SOURCE = `${PY_WORD_START}ioc-${PY_DIGIT}{5,}${PY_WORD_END}`;
+
+/** Fresh global matchers for the citation patterns (the sources need `PY_RE_FLAGS`). */
+export const eventIdMatcher = (): RegExp => new RegExp(EVENT_ID_SOURCE, `g${PY_RE_FLAGS}`);
+export const frameIdMatcher = (): RegExp => new RegExp(FRAME_ID_SOURCE, `gi${PY_RE_FLAGS}`);
+export const intelIdMatcher = (): RegExp => new RegExp(INTEL_ID_SOURCE, `g${PY_RE_FLAGS}`);
 
 export const EVENT_ID_EXACT_RE = /^evt-\d{6,}$/;
 export const FRAME_ID_EXACT_RE = /^frame-(\d+)$/i;
@@ -59,25 +87,34 @@ export const BENIGN_TERMS = [
   "no evidence of compromise",
 ] as const;
 
-const COMP_NEG_SOURCE =
-  String.raw`\b(?:not|no|never|neither|nor|without|lacks?|ruled?\s+out|ruling\s+out|rather\s+than|instead\s+of|looks?\s+like|looked\s+like|resembles?|resembled|mimics?|appeared\s+to\s+be|appears\s+to\s+be|false\s+positive(?:\s+for)?)\b`;
+const COMP_NEG_SOURCE = `${B0}(?:not|no|never|neither|nor|without|lacks?|ruled?${S}+out|ruling${S}+out|rather${S}+than|instead${S}+of|looks?${S}+like|looked${S}+like|resembles?|resembled|mimics?|appeared${S}+to${S}+be|appears${S}+to${S}+be|false${S}+positive(?:${S}+for)?)${B1}`;
 
-export const COMP_NEG_RE = new RegExp(COMP_NEG_SOURCE);
+export const COMP_NEG_RE = new RegExp(COMP_NEG_SOURCE, PY_RE_FLAGS);
 
-export const COMP_POST_NEG_RE =
-  /(?<!not\s)(?<!never\s)\b(?:(?:was|were|is|are|been)\s+(?:ruled\s+out|disproved|refuted|unfounded|false\s+positive|not\s+(?:observed|found|detected|confirmed|present))|ruled\s+out|disproved|refuted|not\s+(?:observed|found|detected))\b/;
+export const COMP_POST_NEG_RE = new RegExp(
+  `(?<!not${S})(?<!never${S})${B0}(?:(?:was|were|is|are|been)${S}+(?:ruled${S}+out|disproved|refuted|unfounded|false${S}+positive|not${S}+(?:observed|found|detected|confirmed|present))|ruled${S}+out|disproved|refuted|not${S}+(?:observed|found|detected))${B1}`,
+  PY_RE_FLAGS,
+);
 
-export const BENIGN_HEDGE_PRE_RE =
-  /\b(?:not|no|never|without|zero|lacks?|unlikely(?:\s+to\s+be)?|possibly|possible|maybe|potentially|potential|whether|if|despite|although|though|rule[ds]?\s+out)\s+(?:a\s+|an\s+|the\s+|any\s+|to\s+be\s+)?$/;
+export const BENIGN_HEDGE_PRE_RE = new RegExp(
+  `${B0}(?:not|no|never|without|zero|lacks?|unlikely(?:${S}+to${S}+be)?|possibly|possible|maybe|potentially|potential|whether|if|despite|although|though|rule[ds]?${S}+out)${S}+(?:a${S}+|an${S}+|the${S}+|any${S}+|to${S}+be${S}+)?${PY_END}`,
+  PY_RE_FLAGS,
+);
 
-export const BENIGN_HEDGE_POST_RE =
-  /^\s*(?:alternative|explanation|possibility|hypothesis|(?:is\s+|was\s+)?unlikely|not\s+ruled\s+out)\b/;
+export const BENIGN_HEDGE_POST_RE = new RegExp(
+  `^${S}*(?:alternative|explanation|possibility|hypothesis|(?:is${S}+|was${S}+)?unlikely|not${S}+ruled${S}+out)${B1}`,
+  PY_RE_FLAGS,
+);
 
-export const LEADING_COMPROMISE_RE = /^\s*(?:malicious|compromised?|intrusion)\s*[(,:]/;
+export const LEADING_COMPROMISE_RE = new RegExp(
+  `^${S}*(?:malicious|compromised?|intrusion)${S}*[(,:]`,
+  PY_RE_FLAGS,
+);
 
-const CONTRAST_PIVOT_SOURCE = String.raw`(?:,\s*|\s+)(?:but|however|yet)\b`;
-export const CONTRAST_PIVOT_RE = new RegExp(CONTRAST_PIVOT_SOURCE);
-const CLAUSE_BOUNDARY_RE = /\.(?=\s|$)|[;:]/;
+const CONTRAST_PIVOT_SOURCE = `(?:,${S}*|${S}+)(?:but|however|yet)${B1}`;
+export const CONTRAST_PIVOT_RE = new RegExp(CONTRAST_PIVOT_SOURCE, PY_RE_FLAGS);
+const CLAUSE_BOUNDARY_RE = new RegExp(String.raw`\.(?=${S}|${PY_END})|[;:]`, PY_RE_FLAGS);
+const OR_NOR_LEAD_RE = new RegExp(`^${S}*(?:or|nor)${B1}`, PY_RE_FLAGS);
 const HEDGE_SPLIT_RE = /[,;.():]/;
 
 export interface TruthFact {
@@ -380,21 +417,73 @@ export function hasTerm(text: string, terms: readonly string[]): string[] {
   return matched;
 }
 
+const DECIMAL_DIGIT_RE = /^\p{Nd}$/u;
+
+/**
+ * Value of one Unicode decimal digit, as Python's `int()` reads it. Unicode
+ * encodes every decimal digit set as a contiguous run in 0..9 order (adjacent
+ * sets, such as the mathematical digits, abut), so the value is the offset from
+ * the start of its run, modulo 10.
+ */
+function decimalDigitValue(codePoint: number): number {
+  let start = codePoint;
+  while (start > 0 && DECIMAL_DIGIT_RE.test(String.fromCodePoint(start - 1))) {
+    start -= 1;
+  }
+  return (codePoint - start) % 10;
+}
+
+/** ASCII spelling of a run of Unicode decimal digits (Python `str(int(digits))` minus sign handling). */
+export function asciiDigits(digits: string): string {
+  let out = "";
+  for (const ch of digits) {
+    const cp = ch.codePointAt(0)!;
+    out += cp >= 0x30 && cp <= 0x39 ? ch : String(decimalDigitValue(cp));
+  }
+  return out;
+}
+
 export function normalizeFrameCitation(digits: string): string {
-  return `frame-${BigInt(digits).toString(10)}`;
+  return `frame-${BigInt(asciiDigits(digits)).toString(10)}`;
+}
+
+/** Python `s[-n:]`: the last `n` code points (JS string indices are UTF-16 units). */
+export function lastCodePoints(text: string, count: number): string {
+  let idx = text.length;
+  for (let seen = 0; idx > 0 && seen < count; seen++) {
+    const low = text.charCodeAt(idx - 1);
+    const pair =
+      idx >= 2 && low >= 0xdc00 && low <= 0xdfff && (text.charCodeAt(idx - 2) & 0xfc00) === 0xd800;
+    idx -= pair ? 2 : 1;
+  }
+  return text.slice(idx);
+}
+
+/** Python `s[:n]`: the first `n` code points. */
+export function firstCodePoints(text: string, count: number): string {
+  let idx = 0;
+  for (let seen = 0; idx < text.length && seen < count; seen++) {
+    const high = text.charCodeAt(idx);
+    const pair =
+      idx + 1 < text.length &&
+      (high & 0xfc00) === 0xd800 &&
+      (text.charCodeAt(idx + 1) & 0xfc00) === 0xdc00;
+    idx += pair ? 2 : 1;
+  }
+  return text.slice(0, idx);
 }
 
 export function citedIds(text: string): Set<string> {
   const result = new Set<string>();
-  for (const match of text.matchAll(new RegExp(EVENT_ID_SOURCE, "g"))) {
+  for (const match of text.matchAll(eventIdMatcher())) {
     result.add(match[0]);
   }
-  for (const match of text.matchAll(new RegExp(FRAME_ID_SOURCE, "gi"))) {
+  for (const match of text.matchAll(frameIdMatcher())) {
     if (match[1] !== undefined) {
       result.add(normalizeFrameCitation(match[1]));
     }
   }
-  for (const match of text.matchAll(new RegExp(INTEL_ID_SOURCE, "g"))) {
+  for (const match of text.matchAll(intelIdMatcher())) {
     result.add(match[0]);
   }
   return result;
@@ -406,14 +495,14 @@ export interface TermPositionHit {
 }
 
 function splitContrastPivots(segment: string): string[] {
-  return segment.split(new RegExp(CONTRAST_PIVOT_SOURCE));
+  return segment.split(CONTRAST_PIVOT_RE);
 }
 
 export function compNegated(statement: string, matchStart: number, matchEnd: number): boolean {
   const preClause = statement.slice(0, matchStart).split(CLAUSE_BOUNDARY_RE).at(-1) ?? "";
-  const pre = (splitContrastPivots(preClause).at(-1) ?? "").slice(-96);
+  const pre = lastCodePoints(splitContrastPivots(preClause).at(-1) ?? "", 96);
 
-  for (const neg of pre.matchAll(new RegExp(COMP_NEG_SOURCE, "g"))) {
+  for (const neg of pre.matchAll(new RegExp(COMP_NEG_SOURCE, `g${PY_RE_FLAGS}`))) {
     const negIdx = neg.index ?? 0;
     const span = pre.slice(negIdx + neg[0].length);
     const bhits: number[] = [];
@@ -423,13 +512,13 @@ export function compNegated(statement: string, matchStart: number, matchEnd: num
         bhits.push((bm.index ?? 0) + bm[0].length);
       }
     }
-    if (bhits.length === 0 || /^\s*(?:or|nor)\b/.test(span.slice(Math.max(...bhits)))) {
+    if (bhits.length === 0 || OR_NOR_LEAD_RE.test(span.slice(Math.max(...bhits)))) {
       return true;
     }
   }
 
   const postClause = statement.slice(matchEnd).split(CLAUSE_BOUNDARY_RE)[0] ?? "";
-  const clause = (splitContrastPivots(postClause)[0] ?? "").slice(0, 96);
+  const clause = firstCodePoints(splitContrastPivots(postClause)[0] ?? "", 96);
   const hit = COMP_POST_NEG_RE.exec(clause);
   return Boolean(hit && hasTerm(clause.slice(0, hit.index), BENIGN_TERMS).length === 0);
 }
@@ -458,7 +547,7 @@ export function affirmativeBenign(statement: string): TermPositionHit[] {
       const start = match.index ?? 0;
       const end = start + match[0].length;
       const preClause = statement.slice(0, start).split(HEDGE_SPLIT_RE).at(-1) ?? "";
-      const postSlice = statement.slice(end, end + 32);
+      const postSlice = firstCodePoints(statement.slice(end), 32);
       if (!BENIGN_HEDGE_PRE_RE.test(preClause) && !BENIGN_HEDGE_POST_RE.test(postSlice)) {
         hits.push({ start, term });
       }
@@ -475,7 +564,7 @@ export function blamesDecoy(statement: string): boolean {
     return false;
   }
 
-  const pivots = [...low.matchAll(new RegExp(CONTRAST_PIVOT_SOURCE, "g"))];
+  const pivots = [...low.matchAll(new RegExp(CONTRAST_PIVOT_SOURCE, `g${PY_RE_FLAGS}`))];
   const lastPivot = pivots.at(-1);
   if (lastPivot !== undefined) {
     const tail = low.slice((lastPivot.index ?? 0) + lastPivot[0].length);
