@@ -21,6 +21,7 @@ import {
   buildRunEvidence,
   buildRunEvidencePage,
 } from "./gate-context.ts";
+import { scrubCredentials } from "./scrubber-and-fence.ts";
 import {
   TRANSCRIPT_PAGE_DEFAULT_BYTES,
   TRANSCRIPT_PAGE_MAX_BYTES,
@@ -561,7 +562,8 @@ export class HuntDaemonRpcServer {
         id: req.id,
         error: {
           code: err instanceof RpcRequestError ? err.code : -32000,
-          message: err instanceof Error ? err.message : String(err),
+          // Error text can carry a data source's own diagnostic (connection strings, credentials).
+          message: scrubCredentials(err instanceof Error ? err.message : String(err)),
           error_code: errorCode,
         },
       };

@@ -163,11 +163,7 @@ export function missingGateContextReason(activeGate: ActiveGatePrompt): string |
   if (activeGate.gate === "reconcile" && !activeGate.reconcileContext) {
     return "Reconcile dispatch receipt is not available, so approval is disabled.";
   }
-  if (
-    activeGate.gate === "reconcile" &&
-    activeGate.reconcileContext?.reasonCode === "citation_source_unavailable" &&
-    !activeGate.reconcileContext.affectedStep
-  ) {
+  if (activeGate.gate === "reconcile" && !activeGate.reconcileContext?.affectedStep) {
     return "The step this reconcile gate decides could not be identified, so approval is disabled.";
   }
   return null;

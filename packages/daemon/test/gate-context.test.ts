@@ -450,8 +450,9 @@ describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () 
   async function flakyPlane(
     readable: boolean,
     healthyVerifyCalls = 0,
-  ): Promise<{ plane: HuntDataPlanePort; close: () => Promise<void>; recover: () => void }> {
+  ): Promise<{ plane: HuntDataPlanePort; close: () => Promise<void>; recover: () => void; breakSource: () => void }> {
     let recovered = false;
+    let broken = false;
     let verifyCalls = 0;
     const { createCaseDirDataPlaneResolver } = await import("../src/index.ts");
     const resolver = createCaseDirDataPlaneResolver({ casesDir, cacheDir: makeTmpDir("hunt-gatectx-cache-") });
@@ -460,7 +461,7 @@ describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () 
       caseMetadata: real.caseMetadata,
       capabilities: () => real.capabilities(),
       executeTool: (...a) => real.executeTool(...a),
-      verifyCitations: async (r) => (recovered || ++verifyCalls <= healthyVerifyCalls) ? real.verifyCitations(r) : ({
+      verifyCitations: async (r) => (!broken && (recovered || ++verifyCalls <= healthyVerifyCalls)) ? real.verifyCitations(r) : ({
         verified: false,
         checked_at: new Date().toISOString(),
         case_id: r.case_id,
@@ -479,8 +480,54 @@ describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () 
             throw new Error("events index offline");
           },
     };
-    return { plane, close: () => resolver.close(), recover: () => { recovered = readable; } };
+    return { plane, close: () => resolver.close(), recover: () => { recovered = readable; }, breakSource: () => { broken = true; } };
   }
+
+  test("a source diagnostic carrying a credential never reaches an RPC client in an error message", async () => {
+    runtimeDir = makeTmpDir("hunt-gatectx-leak-rt-");
+    // Verification is healthy until the incident gate is open, then the source goes down with a
+    // credential in its diagnostic.
+    const { plane, close, breakSource } = await flakyPlane(true, Number.MAX_SAFE_INTEGER);
+    try {
+      const serve = async (line: string) => {
+        const out: string[] = [];
+        await runHuntCli(
+          ["serve", "--runtime-dir", runtimeDir],
+          { writeStdout: (t) => void out.push(t), writeStderr: () => {} },
+          { modelRunner: runner, resolveDataPlane: () => plane, stdin: linesOf(line) },
+        );
+        return out.join("");
+      };
+      const started = JSON.parse((await serve(rpc("s", "hunt.start", { run_id: "hunt-leak", case_id: CASE_ID, scope: "Scope.", follow_ups: 0 })))
+        .trim().split("\n").find((l) => (JSON.parse(l) as RpcLine).id === "s")!) as RpcLine;
+      const atIncident = await approveThroughServe(runtimeDir, plane, "hunt-leak", "scope", (started.result as PersistedHuntRun).open_gate!.payload_sha256);
+      expect(atIncident.open_gate?.gate).toBe("incident");
+      breakSource();
+      const tokenOut: string[] = [];
+      await runHuntCli(["token", "--principal", "alice", "--role", "analyst", "--runtime-dir", runtimeDir], {
+        writeStdout: (t) => void tokenOut.push(t), writeStderr: () => {},
+      });
+      let errors = 0;
+      for (const [method, params] of [
+        ["hunt.gateContext", { run_id: "hunt-leak" }],
+        ["hunt.evidence", { run_id: "hunt-leak" }],
+        ["hunt.decideGate", { hunt_id: "hunt-leak", gate: "incident", action: "approve", via: "desktop", operator_token: tokenOut.join("").trim(),
+          payload_sha256: atIncident.open_gate!.payload_sha256, check_note: "Tried while the source is down." }],
+      ] as Array<[string, unknown]>) {
+        const raw = await serve(rpc("x", method, params));
+        const line = raw.trim().split("\n").map((l) => JSON.parse(l) as RpcLine).find((l) => l.id === "x")!;
+        expect(raw, method).not.toContain(LEAK);
+        if (line.error) {
+          errors++;
+          expect(line.error.message, method).toContain("events index offline");
+        }
+      }
+      // The outage is reported (with the non-secret part of its diagnostic), never the credential.
+      expect(errors).toBeGreaterThanOrEqual(2);
+    } finally {
+      await close();
+    }
+  });
 
   for (const readable of [true, false]) {
     test(`opens the gate through serve and returns its context (source ${readable ? "back" : "still down"})`, async () => {

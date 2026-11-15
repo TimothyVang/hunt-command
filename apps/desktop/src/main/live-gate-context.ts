@@ -647,6 +647,11 @@ function projectCitedEvidence(
   if (uncovered.length > 0) {
     return { error: `gate context does not cover cited ids: ${uncovered.slice(0, 5).join(", ")}` };
   }
+  // The reverse also holds: a record nobody cited is not this gate's evidence and must not be shown as such.
+  const uncited = cited.filter((c) => !refs.has(c.id)).map((c) => c.id);
+  if (uncited.length > 0) {
+    return { error: `gate context lists ids that no handoff cites: ${uncited.slice(0, 5).join(", ")}` };
+  }
 
   const records = new Map(evidence.map((e) => [e.id, e]));
   const status = new Map<string, "verified" | "unresolved" | "out_of_scope">();

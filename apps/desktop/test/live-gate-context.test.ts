@@ -237,6 +237,35 @@ describe("F4: gate approval requires the gate's decision context", () => {
     }
   });
 
+  test("F17: a dispatch reconcile whose affected step does not match or contradicts itself cannot be approved", () => {
+    const receipt = { execution_id: "exec-1", session_id: "sess-1", input_id: "in-1", step_id: "analysis", profile: "framework-coordinator", reserved_at: "2026-11-14T10:00:05Z", reason_code: "previous_dispatch_unknown" };
+    const required = { step_id: "analysis", profile: "framework-coordinator", wave: "analysis", optional: false, approve_transition: "reconcile_halt", reject_reason_code: "reconcile_rejected" };
+    for (const affected_step of [
+      { ...required, step_id: "other-step" },
+      { ...required, optional: true },
+      { ...required, approve_transition: "reconcile_drop" },
+    ]) {
+      const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, {
+        run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
+        reconcile: { reason_code: "previous_dispatch_unknown", affected_step, receipts: [receipt] },
+      });
+      expect(p.activeGate.reconcileContext?.affectedStep).toBeUndefined();
+      expect(String(missingGateContextReason(p.activeGate))).toContain("could not be identified");
+      expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
+      expect(validateGateSubmission(p.activeGate, draft("reject")).valid).toBe(true);
+    }
+  });
+
+  test("a record that no handoff cites is not shown as the gate's evidence", () => {
+    const inc = incidentContext().incident;
+    const stray = { ...inc.evidence[0]!, id: "evt-0000000000000777" };
+    const p = projectLiveGate("run-1", OPEN, HANDOFFS, incidentContext({ incident: { ...inc, ...paged([...inc.evidence, stray]) } }));
+    expect(p.activeGate.contextError).toContain("no handoff cites");
+    expect(p.evidenceCatalog).toEqual({});
+    expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
+    expect(validateGateSubmission(p.activeGate, draft("reject")).valid).toBe(true);
+  });
+
   test("an outage projects only affected cited IDs as unresolved without inventing evidence", () => {
     const failed = {
       ...HANDOFFS[0]!,
