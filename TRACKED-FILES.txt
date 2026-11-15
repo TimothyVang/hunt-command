@@ -26,6 +26,7 @@ apps/desktop/src/main/export/report-exporter.ts
 apps/desktop/src/main/film/cfr-editor.ts
 apps/desktop/src/main/film/offscreen-recorder.ts
 apps/desktop/src/main/index.ts
+apps/desktop/src/main/live-gate-context.ts
 apps/desktop/src/main/logger.ts
 apps/desktop/src/main/network-quiet.ts
 apps/desktop/src/main/secret-vault.ts
@@ -46,6 +47,7 @@ apps/desktop/src/renderer/src/components/SafeForensicText.tsx
 apps/desktop/src/renderer/src/env.d.ts
 apps/desktop/src/renderer/src/lib/bridge.ts
 apps/desktop/src/renderer/src/lib/run-actions.ts
+apps/desktop/src/renderer/src/lib/transcript-view.ts
 apps/desktop/src/renderer/src/lib/watch-open.ts
 apps/desktop/src/renderer/src/main.tsx
 apps/desktop/src/renderer/src/panes/AttackGraphLineagePane.tsx
@@ -70,6 +72,7 @@ apps/desktop/test/daemon-sidecar.test.ts
 apps/desktop/test/defang-case.test.ts
 apps/desktop/test/film-cfr-live.test.ts
 apps/desktop/test/gate-and-store.test.ts
+apps/desktop/test/live-gate-context.test.ts
 apps/desktop/test/live-run-controls.test.tsx
 apps/desktop/test/network-quiet.test.ts
 apps/desktop/test/preload-sandbox.test.ts

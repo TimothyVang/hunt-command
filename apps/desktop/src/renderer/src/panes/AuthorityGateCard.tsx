@@ -6,7 +6,7 @@ import {
   PROFILE_DISPLAY_TITLES,
   type CaseMetadata,
 } from "@hunt-command/shared";
-import { validateGateSubmission } from "../../../shared/gate-validation.ts";
+import { missingGateContextReason, validateGateSubmission } from "../../../shared/gate-validation.ts";
 import { SafeForensicText } from "../components/SafeForensicText.tsx";
 import type { ActiveGatePrompt } from "../../../shared/workbench-types.ts";
 import type { GateDraftFields } from "../state/workbench-store.ts";
@@ -50,6 +50,8 @@ export function AuthorityGateCard({
     payloadSha256: activeGate.payloadSha256,
     action: "reject",
   });
+
+  const contextMissing = missingGateContextReason(activeGate);
 
   const citationBlocked =
     activeGate.gate === "incident" &&
@@ -240,13 +242,14 @@ export function AuthorityGateCard({
       )}
 
       {/* Crash-Recovery Reconcile Gate */}
-      {activeGate.gate === "reconcile" && activeGate.reconcileContext && (
+      {activeGate.gate === "reconcile" && activeGate.reconcileContext?.reasonCode === "previous_dispatch_unknown" && (
         <div
           data-testid="reconcile-gate-context"
           className="rounded border border-amber-500/50 bg-amber-950/30 p-2.5 font-mono text-[11px] space-y-1"
         >
           <div className="font-bold text-amber-200">
-            reason_code: {activeGate.reconcileContext.reasonCode}
+            reason_code: previous_dispatch_unknown — the daemon restarted while this step's dispatch was
+            reserved, so whether the model call ran is unknown.
           </div>
           <div className="text-slate-300">
             execution_id: {activeGate.reconcileContext.executionId} · session_id:{" "}
@@ -257,8 +260,44 @@ export function AuthorityGateCard({
             input_id: {activeGate.reconcileContext.inputId}
           </div>
           <div className="text-slate-400">
-            reserved_at: {activeGate.reconcileContext.reservedAtIso} — Daemon crashed after reserving
-            step execution receipt; operator must approve replay or reject to halt run cleanly.
+            reserved_at: {activeGate.reconcileContext.reservedAtIso} — approve to replay or reject to halt
+            the run cleanly.
+            {activeGate.reconcileContext.additionalReceiptCount
+              ? ` ${activeGate.reconcileContext.additionalReceiptCount} more unknown dispatch(es) are covered by this gate.`
+              : ""}
+          </div>
+        </div>
+      )}
+
+      {activeGate.gate === "reconcile" && activeGate.reconcileContext?.reasonCode === "citation_source_unavailable" && (
+        <div
+          data-testid="reconcile-gate-context"
+          className="rounded border border-amber-500/50 bg-amber-950/30 p-2.5 font-mono text-[11px] space-y-1"
+        >
+          <div className="font-bold text-amber-200">
+            reason_code: citation_source_unavailable — the citation source could not be reached, so the
+            cited records below could not all be verified.
+          </div>
+          <div className="text-slate-300">
+            unavailable sources: {activeGate.reconcileContext.unavailableSources.join(", ") || "(not named)"}
+          </div>
+          <div className="text-slate-300">
+            citations: {activeGate.reconcileContext.citationReceipt.verifiedCount}/
+            {activeGate.reconcileContext.citationReceipt.totalCited} verified · unresolved=
+            {activeGate.reconcileContext.citationReceipt.unresolvedCount} · out_of_scope=
+            {activeGate.reconcileContext.citationReceipt.outOfScopeCount}
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {activeGate.reconcileContext.citationReceipt.entries.map((entry) => (
+              <button
+                key={entry.citationId}
+                type="button"
+                onClick={() => onSelectCitation(entry.citationId)}
+                className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-200 cursor-pointer"
+              >
+                {entry.citationId} · {entry.status}
+              </button>
+            ))}
           </div>
         </div>
       )}
@@ -338,6 +377,16 @@ export function AuthorityGateCard({
         </div>
       )}
 
+      {contextMissing && (
+        <div
+          role="alert"
+          data-testid="gate-context-unavailable"
+          className="rounded border border-rose-500/70 bg-rose-950/60 px-2.5 py-1.5 text-[11px] font-medium text-rose-200"
+        >
+          {contextMissing} You can still reject this gate.
+        </div>
+      )}
+
       {/* Action Buttons */}
       <div className="flex items-center justify-end gap-2 pt-1">
         <button
@@ -353,7 +402,7 @@ export function AuthorityGateCard({
         <button
           type="button"
           data-testid="gate-approve-button"
-          disabled={!approveValidation.valid || (requiresToken && !operatorToken.trim())}
+          disabled={contextMissing !== null || !approveValidation.valid || (requiresToken && !operatorToken.trim())}
           onClick={() => submit("approve")}
           className="inline-flex items-center gap-1.5 rounded border border-emerald-400/70 bg-emerald-700 px-3.5 py-1.5 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-40 cursor-pointer"
         >

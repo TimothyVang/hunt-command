@@ -7,6 +7,7 @@ import type {
 } from "../../../shared/workbench-types.ts";
 import { SafeForensicText } from "../components/SafeForensicText.tsx";
 import { invokeDesktop } from "../lib/bridge.ts";
+import { type TranscriptView, transcriptViewFor } from "../lib/transcript-view.ts";
 import { buildWatchOpenRequest } from "../lib/watch-open.ts";
 import type { CenterPaneTab, GateDraftFields } from "../state/workbench-store.ts";
 import { AuthorityGateCard } from "./AuthorityGateCard.tsx";
@@ -53,7 +54,8 @@ export function ClaimsAndGatesPane({
   onUpdateGateDraft,
   onSubmitGateDecision,
 }: ClaimsAndGatesPaneProps) {
-  const [transcriptPage, setTranscriptPage] = useState<TranscriptPageSlice | null>(null);
+  const [transcriptView, setTranscriptView] = useState<TranscriptView>({ kind: "loading" });
+  const transcriptPage = transcriptView.kind === "page" ? transcriptView.page : null;
   const [byteOffset, setByteOffset] = useState(0);
   const [watchUrlInput, setWatchUrlInput] = useState("http://127.0.0.1:18400/");
   const [watchError, setWatchError] = useState<string | null>(null);
@@ -105,15 +107,13 @@ export function ClaimsAndGatesPane({
   useEffect(() => {
     if (centerTab !== "transcript") return;
     let cancelled = false;
+    const request = { huntId: workbench.huntId, stepId: selectedStepId, byteOffset };
+    setTranscriptView({ kind: "loading" });
     void invokeDesktop<TranscriptPageSlice>("hunt:inspectTranscriptPage", {
-      huntId: workbench.huntId,
-      stepId: selectedStepId,
-      byteOffset,
+      ...request,
       byteLimit: 16_384,
     }).then((res) => {
-      if (!cancelled && res.ok && res.data) {
-        setTranscriptPage(res.data);
-      }
+      if (!cancelled) setTranscriptView(transcriptViewFor(request, res));
     });
     return () => {
       cancelled = true;
@@ -434,7 +434,7 @@ export function ClaimsAndGatesPane({
                 <button
                   type="button"
                   disabled={!transcriptPage?.hasMore}
-                  onClick={() => setByteOffset(byteOffset + 16_384)}
+                  onClick={() => setByteOffset(transcriptPage?.nextByteOffset ?? byteOffset + 16_384)}
                   className="rounded border border-slate-700 px-2 py-0.5 text-slate-200 disabled:opacity-40 cursor-pointer"
                 >
                   Next
@@ -442,8 +442,17 @@ export function ClaimsAndGatesPane({
               </div>
             </div>
             <pre className="rounded border border-slate-800 bg-[#070b13] p-3 font-mono text-[11px] text-slate-200 whitespace-pre-wrap break-words">
-              {transcriptPage?.content ?? "Loading byte-paged bot transcript slice..."}
+              {transcriptView.kind === "page"
+                ? transcriptView.page.content
+                : transcriptView.kind === "loading"
+                  ? "Loading byte-paged bot transcript slice..."
+                  : ""}
             </pre>
+            {transcriptView.kind === "error" && (
+              <div role="alert" data-testid="transcript-error" className="rounded border border-rose-500/60 bg-rose-950/60 px-2.5 py-1.5 font-mono text-[11px] text-rose-200">
+                Transcript unavailable: {transcriptView.message}
+              </div>
+            )}
           </div>
         )}
 
