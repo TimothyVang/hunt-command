@@ -28,6 +28,8 @@ const SECRET_KEY_NAMES = new Set([
   "sessiontoken",
   "authtoken",
   "privatekey",
+  "accesskey",
+  "secretaccesskey",
 ]);
 
 export function isSecretKeyName(key: string): boolean {
@@ -47,11 +49,23 @@ const SECRET_KEY_ALTERNATION = [
   `(?:access|refresh|id|session|auth)${SEP}token`,
   "token",
   `private${SEP}key`,
+  `(?:secret${SEP})?access${SEP}key`,
 ].join("|");
 
-/** `"password": "..."`, `"Authorization": "ApiKey ..."`, `{"cookie":"..."}` (JSON string values). */
+/**
+ * `"password": "..."`, `"Authorization": "ApiKey ..."`, `{"cookie":"..."}` (JSON string values),
+ * at any escape depth: `{\"api_key\":\"...\"}` inside a log line is the same pair with every quote
+ * preceded by one backslash run. The opening value quote's run (group 2) is the delimiter; the
+ * value ends at the next quote with exactly that run, so deeper-escaped quotes stay inside it.
+ *
+ * Linear: the key's run is anchored by a lookbehind (no restart inside a backslash run), and each
+ * value alternative starts on a distinct character class and consumes a maximal backslash run.
+ */
 const JSON_SECRET_KV_RE = new RegExp(
-  `("(?:${SECRET_KEY_ALTERNATION})"\\s*:\\s*")(?!\\[REDACTED)(?:[^"\\\\\\r\\n]|\\\\.)+(")`,
+  `((?<!\\\\)\\\\*"(?:${SECRET_KEY_ALTERNATION})\\\\*"\\s*:\\s*(\\\\*)")` +
+    `(?!\\[REDACTED)` +
+    `(?:[^"\\\\\\r\\n]|\\\\+(?=[^"\\\\\\r\\n])|(?!\\2")\\\\+")+` +
+    `((?<!\\\\)\\2")`,
   "gi",
 );
 
@@ -62,9 +76,14 @@ const JSON_SECRET_KV_RE = new RegExp(
 const HEADER_LINE_RE =
   /(\b(?:proxy-)?authorization\s*:\s*|\b(?:set-)?cookie\s*:\s*|\bx-api-key\s*:\s*)(?!\[REDACTED)[^\s"'}][^\r\n"'}]*/gi;
 
-/** `password=...`, `access_token=...&`, `client_secret: ...`, `'api_key': '...'`. */
+/**
+ * `password=...`, `access_token=...&`, `client_secret: ...`, `'api_key': '...'`, and env-style
+ * names whose last segments are a credential keyword: `DB_PASSWORD=`, `export FOO_SECRET=`,
+ * `AWS_SECRET_ACCESS_KEY=`, `MY_API_KEY: ...`. The `[A-Za-z0-9]+_` prefix segments cannot contain
+ * `_`, so splitting is deterministic and the scan stays linear; `tokens observed` never matches.
+ */
 const KEY_VALUE_RE = new RegExp(
-  `(\\b(?:${SECRET_KEY_ALTERNATION})["']?\\s*[:=]\\s*["']?)(?!\\[REDACTED)[^\\s"'&,;}]+`,
+  `(\\b(?:[A-Za-z0-9]+_)*(?:${SECRET_KEY_ALTERNATION})["']?\\s*[:=]\\s*["']?)(?!\\[REDACTED)[^\\s"'&,;}]+`,
   "gi",
 );
 
@@ -97,7 +116,7 @@ export function scrubSecretText(input: string): string {
   }
   let out = input;
   out = out.replace(URL_USERINFO_RE, "$1[REDACTED_URL_CREDENTIALS]@");
-  out = out.replace(JSON_SECRET_KV_RE, "$1[REDACTED_SECRET]$2");
+  out = out.replace(JSON_SECRET_KV_RE, "$1[REDACTED_SECRET]$3");
   out = out.replace(HEADER_LINE_RE, "$1[REDACTED_SECRET]");
   out = out.replace(BEARER_RE, "Bearer [REDACTED_BEARER]");
   out = out.replace(APIKEY_RE, "ApiKey [REDACTED_API_KEY]");
