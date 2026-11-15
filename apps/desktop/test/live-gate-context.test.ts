@@ -89,6 +89,36 @@ describe("F4: gate approval requires the gate's decision context", () => {
     expect(missingGateContextReason(p.activeGate)).toBeNull();
   });
 
+  test("truncated incident evidence is never presented as complete or approvable", () => {
+    const ctx = incidentContext();
+    ctx.incident.evidence_truncated = true;
+    const p = projectLiveGate("run-1", OPEN, HANDOFFS, ctx);
+    expect(p.activeGate.contextError).toContain("truncated");
+    expect(p.activeGate.incidentSummary).toBeUndefined();
+    expect(p.citationReceipt).toBeNull();
+    expect(p.activeGate.incidentHandoff?.claims[0]?.statement).toContain("Beacon seen");
+    expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
+    expect(validateGateSubmission(p.activeGate, draft("reject")).valid).toBe(true);
+  });
+
+  test("truncated reconcile evidence also blocks approval", () => {
+    const inc = incidentContext().incident;
+    const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, {
+      run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
+      reconcile: { reason_code: "citation_source_unavailable", citation_receipt: inc.citation_receipt,
+        unavailable_sources: [], evidence: inc.evidence, evidence_truncated: true },
+    });
+    expect(p.activeGate.contextError).toContain("truncated");
+    expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
+    expect(validateGateSubmission(p.activeGate, draft("reject")).valid).toBe(true);
+  });
+
+  test("an absent incident handoff cannot be approved", () => {
+    const p = projectLiveGate("run-1", OPEN, [], incidentContext());
+    expect(p.activeGate.contextError).toContain("incident handoff");
+    expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(false);
+  });
+
   test("unresolved citations keep approve blocked by the citation rule", () => {
     const ctx = incidentContext();
     (ctx.incident as { evidence: Array<{ status: string }> }).evidence[0]!.status = "unresolved";
@@ -231,8 +261,8 @@ async function liveHarness(gateContext: (params: Record<string, unknown>, store:
       status: "completed",
       output_text: JSON.stringify({
         schema_version: 1, case_id: req.caseId, step_id: req.stepId, profile: req.profile,
-        claims: [{ claim_id: `${req.stepId}:c1`, kind: "observed", statement: "The process was observed.", evidence_ids: ["events.jsonl"], entity_ids: [], contradicts: [] }],
-        reviews: [], disposition: "review_ready", limitations: [], requested_decisions: [],
+        claims: [{ claim_id: `${req.stepId}:c1`, kind: "observed", statement: req.stepId === "incident" ? "Incident-specific process finding." : "The process was observed.", evidence_ids: ["events.jsonl"], entity_ids: [], contradicts: [] }],
+        reviews: [], disposition: "review_ready", limitations: req.stepId === "incident" ? ["Incident-specific collection limitation."] : [], requested_decisions: [],
       }),
       usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 2, turns: 1, provider: "anthropic", model: "stub", billing_mode: "oauth_subscription", actual_billed_usd: 0, shadow_api_usd: 0, cache_savings_usd: 0 },
     }),
@@ -274,7 +304,7 @@ async function liveHarness(gateContext: (params: Record<string, unknown>, store:
     await resolver.close();
     fs.rmSync(root, { recursive: true, force: true });
   };
-  return { service, store, gates, calls, recorded, caseId, close };
+  return { service, sidecar, store, gates, calls, recorded, caseId, close };
 }
 
 async function toIncidentGate(h: Awaited<ReturnType<typeof liveHarness>>) {
@@ -297,6 +327,10 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
       const snap = await toIncidentGate(h);
       expect(snap.activeGate?.contextError).toBeUndefined();
       expect(snap.activeGate?.incidentSummary?.observedCount).toBeGreaterThan(0);
+      expect(snap.handoffs.filter((h) => h.step_id === "incident")).toHaveLength(1);
+      expect(snap.claims.find((c) => c.stepId === "incident")?.claim.statement).toBe("Incident-specific process finding.");
+      expect(snap.limitations.find((l) => l.stepId === "incident")?.text).toBe("Incident-specific collection limitation.");
+      expect(snap.activeGate?.incidentHandoff?.limitations).toEqual(["Incident-specific collection limitation."]);
       expect(h.calls).toContain("hunt.gateContext");
       const done = await h.service.submitGateDecision({
         huntId: snap.huntId, gate: "incident", action: "approve", operatorName: "x", rbacRole: "incident_commander",
@@ -304,10 +338,56 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
         operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
       });
       expect(done.gateHistory.map((d) => d.gate)).toEqual(["scope", "incident"]);
+      expect(done.handoffs.filter((h) => h.step_id === "incident")).toHaveLength(1);
     } finally {
       await h.close();
     }
   });
+  test("a truncated context cannot be approved through the service, but can be rejected", async () => {
+    const h = await liveHarness((params, store) => {
+      const run = store.getRun(String(params.run_id))!;
+      return incidentContext({ run_id: run.run_id, case_id: run.case_id, payload_sha256: run.open_gate!.payload_sha256,
+        incident: { ...incidentContext().incident, evidence_truncated: true } });
+    });
+    try {
+      const snap = await toIncidentGate(h);
+      expect(snap.activeGate?.contextError).toContain("truncated");
+      expect(snap.citationReceipt.allVerified).toBe(false);
+      const decide = (action: "approve" | "reject") => h.service.submitGateDecision({
+        huntId: snap.huntId, gate: "incident", action, operatorName: "x", rbacRole: "incident_commander",
+        checkNote: "Checked context.", payloadSha256: snap.activeGate!.payloadSha256,
+        operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
+      });
+      const before = h.calls.filter((c) => c === "hunt.decideGate").length;
+      await expect(decide("approve")).rejects.toThrow(/truncated/);
+      expect(h.calls.filter((c) => c === "hunt.decideGate")).toHaveLength(before);
+      await decide("reject");
+      expect(h.store.getRun(snap.huntId)!.decisions.at(-1)?.action).toBe("reject");
+    } finally {
+      await h.close();
+    }
+  });
+
+  test("direct desktop RPC cannot bypass the truncated evidence gate", async () => {
+    const h = await liveHarness(() => undefined);
+    try {
+      const snap = await toIncidentGate(h);
+      const run = h.store.getRun(snap.huntId)!;
+      const result = run.results["incident"]!;
+      const ids = Array.from({ length: 501 }, (_, i) => `evt-${i.toString(16).padStart(16, "0")}`);
+      run.results["incident"] = { ...result, handoff: { ...result.handoff!, limitations: [ids.join(" ")] } };
+      h.store.saveRun(run);
+      const input = { hunt_id: snap.huntId, gate: "incident", via: "desktop", payload_sha256: snap.activeGate!.payloadSha256,
+        check_note: "Reviewed evidence.", operator_token: h.gates.sessionAuthority.issueToken("real-analyst", "analyst") };
+      await expect(h.sidecar.request("hunt.decideGate", { ...input, action: "approve" })).rejects.toThrow(/truncated/);
+      expect(h.store.getRun(snap.huntId)!.decisions.map((d) => d.gate)).toEqual(["scope"]);
+      await h.sidecar.request("hunt.decideGate", { ...input, action: "reject" });
+      expect(h.store.getRun(snap.huntId)!.decisions.at(-1)?.action).toBe("reject");
+    } finally {
+      await h.close();
+    }
+  });
+
 
   test("when the gate context cannot be loaded, approve never reaches the daemon; reject still does", async () => {
     const h = await liveHarness(() => {

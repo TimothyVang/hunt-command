@@ -53,6 +53,20 @@ import {
   type ScenarioTruth,
 } from "../src/index.ts";
 
+/**
+ * Fastest of up to three timed runs, stopping at the first one under budget. A load spike on a
+ * busy machine can't fail a linear-time check this way, but a quadratic input is slow on every run.
+ */
+function fastestMs(run: () => unknown, budgetMs: number): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let attempt = 0; attempt < 3 && best >= budgetMs; attempt++) {
+    const started = performance.now();
+    run();
+    best = Math.min(best, performance.now() - started);
+  }
+  return best;
+}
+
 const CLEAN_METRICS_PROVENANCE = {
   holdout_checked: true,
   sealed: false,
@@ -1702,10 +1716,8 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
       fill("northval"), // sealed keyword
     ];
     for (const input of inputs) {
-      const started = performance.now();
-      scrubText(input, forbidden);
       // Linear runs take ~10-250 ms per MB here; a quadratic rule takes minutes.
-      expect(performance.now() - started).toBeLessThan(3000);
+      expect(fastestMs(() => scrubText(input, forbidden), 3000)).toBeLessThan(3000);
     }
   }, 60_000);
 });
