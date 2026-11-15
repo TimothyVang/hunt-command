@@ -1,0 +1,46 @@
+# Adapted from omp-desktop/app/electron-builder.yml
+# Copyright (c) omp-desktop contributors (MIT License — see root THIRD-PARTY-NOTICES.md).
+# Modified for Hunt Command v2: appId com.huntcommand.desktop, unpacked hunt-daemon + pi_natives
+# extraResources for PI_NATIVES_DIR, stripped node-pty, publish: null.
+appId: com.huntcommand.desktop
+productName: Hunt Command
+copyright: Copyright © 2026 Hunt Command contributors (AGPL-3.0-only; shell portions MIT)
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**/*
+  - resources/icon.ico
+  - package.json
+  - "!**/*.map"
+extraResources:
+  - from: ../../LICENSE
+    to: LICENSE
+  - from: ../../THIRD-PARTY-NOTICES.md
+    to: THIRD-PARTY-NOTICES.md
+  - from: build/extra/hunt-daemon
+    to: hunt-daemon
+asar: true
+asarUnpack:
+  - resources/icon.ico
+publish: null
+npmRebuild: false
+nodeGypRebuild: false
+buildDependenciesFromSource: false
+win:
+  icon: resources/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  signAndEditExecutable: true
+nsis:
+  differentialPackage: false
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+  artifactName: "${productName}-${version}-setup-${arch}.${ext}"
+portable:
+  artifactName: "${productName}-${version}-portable-${arch}.${ext}"

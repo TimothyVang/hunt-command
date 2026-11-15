@@ -1,0 +1,46 @@
+{
+  "name": "@hunt-command/desktop",
+  "productName": "Hunt Command",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Hardened 4-pane DFIR desktop workbench, Gantt flight recorder, fenced Watch browser, and 1920x1080 CFR 30fps recorder for Hunt Command",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "bun test",
+    "stage:resources": "bun run scripts/stage-extra-resources.ts",
+    "pack:hunt": "bun run build && bun run stage:resources && electron-builder --config electron-builder.yml --win --x64 --dir --publish never",
+    "package:win": "bun run build && bun run stage:resources && electron-builder --config electron-builder.yml --win --x64 --publish never",
+    "postinstall": "node scripts/ensure-electron.mjs"
+  },
+  "dependencies": {
+    "@hunt-command/shared": "workspace:*",
+    "graphology": "^0.26.0",
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "sigma": "^3.0.2",
+    "uplot": "^1.6.32",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/bun": "^1.4.4",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "electron": "36.9.5",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^3.1.0",
+    "graphology-types": "^0.24.7",
+    "tailwindcss": "^4.1.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}
