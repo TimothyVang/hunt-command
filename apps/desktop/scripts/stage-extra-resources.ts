@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { piNativesPackageDirs } from "../src/main/daemon/resolve-daemon.ts";
 
 /**
  * Stages unpacked extraResources for electron-builder (`pack:hunt` / `package:win`):
@@ -26,9 +27,9 @@ function findPiNativesBinary(): string | null {
   } catch {
     // Try direct node_modules walk.
   }
-  candidates.push(
-    path.join(repoRoot, "node_modules", "@oh-my-pi", "pi-natives-win32-x64", "pi_natives.win32-x64-baseline.node"),
-  );
+  for (const dir of piNativesPackageDirs(path.join(repoRoot, "node_modules"))) {
+    candidates.push(path.join(dir, "pi_natives.win32-x64-baseline.node"));
+  }
 
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {

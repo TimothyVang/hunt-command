@@ -23,6 +23,7 @@ import { recordOffscreenWorkbenchAndCutFilm } from "./film/offscreen-recorder.ts
 import { createLogger } from "./logger.ts";
 import { SecretVault } from "./secret-vault.ts";
 import { hardenSession, hardenWindow, TrustedRenderers } from "./security.ts";
+import { createWatchScope } from "./watch/browser-policy.ts";
 import { WatchBrowserController } from "./watch/watch-panel.ts";
 import { WorkbenchService } from "./workbench-service.ts";
 
@@ -92,6 +93,8 @@ async function bootstrap(): Promise<void> {
         isPackaged: app.isPackaged,
         resourcesPath: process.resourcesPath,
         repoRoot,
+        runtimeDir: runtimePaths.rootDir,
+        casesDir: process.env.HUNT_COMMAND_CASES_DIR?.trim() || null,
       }),
     runtimeRootDir: runtimePaths.rootDir,
     log,
@@ -158,6 +161,23 @@ async function bootstrap(): Promise<void> {
       getState: () => watch.getState(),
       setBounds: (bounds) => watch.setBounds(bounds),
       navigate: async (runId, role, url) => await watch.navigate(runId, role, url),
+      open: async (input) => {
+        const labOrigin = input.labOrigin;
+        const scope = createWatchScope({
+          caseId: input.caseId,
+          labOrigin,
+          arkimeOrigin: input.arkimeOrigin ?? labOrigin,
+          kibanaOrigin: input.kibanaOrigin ?? null,
+          startSec: input.startSec,
+          stopSec: input.stopSec,
+        });
+        return await watch.openFencedSession(
+          input.runId,
+          input.role,
+          scope,
+          input.initialUrl ?? `${scope.labOrigin}/`,
+        );
+      },
     },
   });
 
@@ -187,6 +207,8 @@ async function bootstrap(): Promise<void> {
         return service.getWatchState();
       case "watch:setBounds":
         return service.setWatchBounds(payload);
+      case "watch:open":
+        return await service.openWatch(payload);
       case "watch:navigate":
         return await service.navigateWatch(payload);
       case "export:customerReport":

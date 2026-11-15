@@ -31,6 +31,8 @@ import {
   VaultSetSecretInputSchema,
   WatchBoundsInputSchema,
   WatchNavigateInputSchema,
+  type WatchOpenInput,
+  WatchOpenInputSchema,
   type DaemonHealthStatus,
   type FilmExportResult,
   type ReportExportResult,
@@ -82,6 +84,7 @@ export interface WorkbenchServiceDeps {
     getState: () => WatchBrowserState;
     setBounds: (bounds: { x: number; y: number; width: number; height: number } | null) => WatchBrowserState;
     navigate: (runId: string, role: ProfileId, url: string) => Promise<WatchBrowserState>;
+    open: (input: WatchOpenInput) => Promise<WatchBrowserState>;
   };
 }
 
@@ -517,6 +520,14 @@ export class WorkbenchService {
       return this.getWatchState();
     }
     return this.#deps.watchHandlers.setBounds(parsed.bounds);
+  }
+
+  async openWatch(rawInput: unknown): Promise<WatchBrowserState> {
+    const parsed = WatchOpenInputSchema.parse(rawInput);
+    if (!this.#deps.watchHandlers) {
+      throw new Error("Watch Browser controller is not attached in headless test mode.");
+    }
+    return await this.#deps.watchHandlers.open(parsed);
   }
 
   async navigateWatch(rawInput: unknown): Promise<WatchBrowserState> {

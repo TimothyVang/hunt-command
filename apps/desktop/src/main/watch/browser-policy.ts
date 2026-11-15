@@ -8,7 +8,7 @@
  *   case time window (`ese`/`es` strategies only; ES|QL, SQL, EQL refused), value suggestions forced to `terms_agg`.
  * - Arkime origin: read-only sessions/spiview/spigraph/unique/connections, every `expression` wrapped in
  *   `(<expr>) && tags == "case:<caseId>"` and clamped to `[startSec, stopSec]`; admin/pcap/raw/scrub/delete routes blocked.
- * - Session proxy blackhole (`http://127.0.0.1:1` with `<allowed 127.0.0.1:ports>;<-loopback>`) backs up CDP `Fetch.enable`.
+ * - Session proxy blackhole (`http://127.0.0.1:1` with `<-loopback>;<allowed 127.0.0.1:ports>`) backs up CDP `Fetch.enable`.
  */
 
 export const SEARCH_KEYS = ["expression", "date", "startTime", "stopTime"] as const;
@@ -204,6 +204,11 @@ export function listAllowedWatchOrigins(scope: WatchScope): string[] {
  * Builds Electron `session.setProxy` rules that route every non-allowlisted host/port
  * (including `localhost`, `[::1]`, unpinned `127.0.0.1` ports, and all internet egress)
  * into closed loopback port `127.0.0.1:1`.
+ *
+ * Order matters: Chromium evaluates bypass rules last-to-first and the LAST matching rule wins.
+ * `<-loopback>` (which removes the implicit loopback bypass, i.e. "proxy loopback") must therefore
+ * come FIRST so the explicit pinned `127.0.0.1:<port>` entries after it override it. With
+ * `<-loopback>` last, every loopback URL, including the pinned lab origin, went to the blackhole.
  */
 export function buildWatchProxyConfig(scope: WatchScope): {
   proxyRules: string;
@@ -212,7 +217,7 @@ export function buildWatchProxyConfig(scope: WatchScope): {
   const bypassTargets = listAllowedWatchOrigins(scope).map(hostPortFromPinnedOrigin);
   return {
     proxyRules: "http://127.0.0.1:1",
-    proxyBypassRules: [...bypassTargets, "<-loopback>"].join(";"),
+    proxyBypassRules: ["<-loopback>", ...bypassTargets].join(";"),
   };
 }
 

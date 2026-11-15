@@ -39,6 +39,33 @@ export function buildDaemonChildEnv(
   return clean;
 }
 
+const PI_NATIVES_ADDON = "pi_natives.win32-x64-baseline.node";
+const PI_NATIVES_PACKAGE = "pi-natives-win32-x64";
+
+/**
+ * `@oh-my-pi/pi-natives-win32-x64` package directories under `nodeModulesDir`: the hoisted layout
+ * (`node_modules/@oh-my-pi/<pkg>`) first, then Bun's isolated layout
+ * (`node_modules/.bun/@oh-my-pi+<pkg>@<version>/node_modules/@oh-my-pi/<pkg>`, newest version first).
+ */
+export function piNativesPackageDirs(nodeModulesDir: string): string[] {
+  const dirs = [path.join(nodeModulesDir, "@oh-my-pi", PI_NATIVES_PACKAGE)];
+  const isolatedRoot = path.join(nodeModulesDir, ".bun");
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(isolatedRoot);
+  } catch {
+    entries = [];
+  }
+  const prefix = `@oh-my-pi+${PI_NATIVES_PACKAGE}@`;
+  const versions = entries
+    .filter((name) => name.startsWith(prefix))
+    .sort((a, b) => b.localeCompare(a, "en", { numeric: true }));
+  for (const name of versions) {
+    dirs.push(path.join(isolatedRoot, name, "node_modules", "@oh-my-pi", PI_NATIVES_PACKAGE));
+  }
+  return dirs;
+}
+
 export function resolvePiNativesDir(options: {
   isPackaged: boolean;
   resourcesPath?: string;
@@ -49,13 +76,12 @@ export function resolvePiNativesDir(options: {
     candidates.push(path.join(options.resourcesPath, "hunt-daemon"));
   }
   candidates.push(
-    path.join(options.repoRoot, "node_modules", "@oh-my-pi", "pi-natives-win32-x64"),
+    ...piNativesPackageDirs(path.join(options.repoRoot, "node_modules")),
     path.join(options.repoRoot, "apps", "desktop", "build", "extra", "hunt-daemon"),
   );
 
   for (const dir of candidates) {
-    const addon = path.join(dir, "pi_natives.win32-x64-baseline.node");
-    if (fs.existsSync(addon)) {
+    if (fs.existsSync(path.join(dir, PI_NATIVES_ADDON))) {
       return dir;
     }
   }
@@ -85,14 +111,36 @@ function findBunExecutable(): string | null {
 }
 
 /**
- * Resolves the persistent `hunt-daemon` binary or workspace RPC entrypoint (`#180` G1.1 & G1.2).
+ * `hunt-daemon serve` arguments: the daemon speaks stdio NDJSON JSON-RPC on `serve` and keeps its state
+ * in the same runtime directory the desktop resolved (never a `.git` tree).
  */
-export function resolveDaemonLaunch(options: {
+export function buildDaemonServeArgs(runtimeDir: string, casesDir?: string | null): string[] {
+  const args = ["serve", "--runtime-dir", runtimeDir];
+  if (casesDir) {
+    args.push("--cases-dir", casesDir);
+  }
+  return args;
+}
+
+export interface ResolveDaemonLaunchOptions {
   isPackaged: boolean;
   resourcesPath?: string;
   repoRoot: string;
-}): ResolvedDaemonLaunch {
+  /** Runtime root handed to `serve --runtime-dir`. */
+  runtimeDir: string;
+  /** Optional case directory handed to `serve --cases-dir`. */
+  casesDir?: string | null;
+  /** Override for locating `bun` (tests); defaults to `BUN_INSTALL` then `PATH`. */
+  findBun?: () => string | null;
+}
+
+/**
+ * Resolves the persistent `hunt-daemon` binary or workspace CLI entrypoint (`#180` G1.1 & G1.2),
+ * launched as `serve --runtime-dir <dir> [--cases-dir <dir>]`.
+ */
+export function resolveDaemonLaunch(options: ResolveDaemonLaunchOptions): ResolvedDaemonLaunch {
   const piNativesDir = resolvePiNativesDir(options);
+  const serveArgs = buildDaemonServeArgs(options.runtimeDir, options.casesDir);
 
   if (options.isPackaged && options.resourcesPath) {
     const unpackedDir = path.join(options.resourcesPath, "hunt-daemon");
@@ -104,26 +152,22 @@ export function resolveDaemonLaunch(options: {
       return {
         available: true,
         command: exePath,
-        args: ["--rpc"],
+        args: serveArgs,
         piNativesDir: piNativesDir ?? unpackedDir,
         source: "packaged_exe",
       };
     }
   }
 
-  const rpcCandidates = [
-    path.join(options.repoRoot, "packages", "daemon", "src", "cli.ts"),
-    path.join(options.repoRoot, "packages", "daemon", "src", "rpc-server.ts"),
-  ];
-
-  const foundEntry = rpcCandidates.find((p) => fs.existsSync(p));
-  const bunBin = findBunExecutable();
+  const cliEntry = path.join(options.repoRoot, "packages", "daemon", "src", "cli.ts");
+  const foundEntry = fs.existsSync(cliEntry);
+  const bunBin = (options.findBun ?? findBunExecutable)();
 
   if (foundEntry && bunBin) {
     return {
       available: true,
       command: bunBin,
-      args: ["run", foundEntry, "--rpc"],
+      args: ["run", cliEntry, ...serveArgs],
       piNativesDir,
       source: "workspace_bun",
     };
@@ -137,6 +181,6 @@ export function resolveDaemonLaunch(options: {
     source: "unavailable",
     reason: foundEntry
       ? "Bun executable not found on PATH"
-      : "Workspace packages/daemon RPC entrypoint not yet present (standby fixture mode)",
+      : "Workspace packages/daemon/src/cli.ts entrypoint not present (standby fixture mode)",
   };
 }

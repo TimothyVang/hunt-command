@@ -19,7 +19,17 @@ export interface GateDraftFields {
   checkNote: string;
 }
 
+/**
+ * Whether the renderer has real data from the main process. Until a snapshot arrives the panes are not
+ * rendered at all, so a missing preload bridge shows an explicit error instead of placeholder hunts.
+ */
+export type WorkbenchConnection =
+  | { readonly kind: "connecting" }
+  | { readonly kind: "ready" }
+  | { readonly kind: "unavailable"; readonly code: string; readonly message: string };
+
 export interface WorkbenchUiState {
+  connection: WorkbenchConnection;
   workbench: WorkbenchSnapshot;
   selectedCitationId: string | null;
   selectedClaimId: string | null;
@@ -56,6 +66,7 @@ export class WorkbenchStore {
     const firstEntity = snap.snapshot.entities[0]?.entity_id ?? null;
 
     this.#state = {
+      connection: initialSnapshot ? { kind: "ready" } : { kind: "connecting" },
       workbench: snap,
       selectedCitationId: firstCitation,
       selectedClaimId: firstClaim,
@@ -110,12 +121,19 @@ export class WorkbenchStore {
 
     this.#setState({
       ...this.#state,
+      connection: { kind: "ready" },
       workbench: nextSnapshot,
       selectedEvidenceId: firstEvidence,
       centerTab:
         nextGateKey && nextGateKey !== prevGateKey ? "gate" : this.#state.centerTab,
       gateDrafts: nextDrafts,
     });
+  }
+
+  /** Records that the main process could not provide a snapshot (for example, no preload bridge). */
+  setConnectionUnavailable(code: string, message: string): void {
+    if (this.#state.connection.kind === "ready") return;
+    this.#setState({ ...this.#state, connection: { kind: "unavailable", code, message } });
   }
 
   /**
