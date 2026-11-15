@@ -17,6 +17,7 @@ packages/data-plane/package.json
 packages/data-plane/src/index.ts
 packages/shared/package.json
 packages/shared/src/contracts.ts
+packages/shared/src/fields.ts
 packages/shared/src/index.ts
 packages/shared/src/prices.ts
 packages/shared/src/runtime-paths.ts
