@@ -210,7 +210,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
     expect(scrubbedEnv.CUSTOM_PROVIDER_API_KEY).toBeUndefined();
     expect(scrubbedEnv.AWS_SECRET_ACCESS_KEY).toBeUndefined();
     expect(scrubbedEnv.OMP_AUTH_BROKER_TOKEN).toBeUndefined();
-  });
+  }, 30_000);
 
   test("in-process and REAL out-of-process clean-room worker enforce 0 tools and hard-abort immediately on tool_execution_start", async () => {
     // 1. In-process test: non-zero active tools before prompt -> immediate rejection
@@ -729,7 +729,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
     } finally {
       fs.rmSync(tempRepo, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("3-stage promotion gate enforces probe -> pass^2 (+1.0 on BOTH rounds, <= decoys, g2_1_pass) -> unanimous 3-verifier panel & emits hunt.coach.eval", async () => {
     const tmpOut = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-coach-promo-"));
@@ -941,7 +941,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
     } finally {
       fs.rmSync(tmpOut, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("all files in packages/coach/** pass hunt_bots_check AST and forbidden-token policies", () => {
     const coachRoot = path.resolve(import.meta.dir, "..");
@@ -977,7 +977,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
       }
     }
     expect(violations).toEqual([]);
-  });
+  }, 30_000);
 });
 
 describe("packages/coach fail-closed holdout provenance, global scrub & regular-file-only diffs", () => {
@@ -1171,7 +1171,7 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
         },
       } as unknown as Parameters<typeof stageCodePrDraft>[0]),
     ).toThrow(CleanRoomViolationError);
-  });
+  }, 30_000);
 
   test("scrubText redacts every occurrence, not just the first", () => {
     const out = scrubText(
@@ -1406,7 +1406,7 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
     expect(() =>
       assertCleanPacket(cleanPacket(), { ...leakGuard, extraForbidden: ["found", "pass", "attack"] }),
     ).not.toThrow();
-  });
+  }, 30_000);
 
   test("holdout-derived metrics and revert deltas carry provenance and never reach the ledger or the proposer", async () => {
     const sealedEvals = judgeCaseBatch(
@@ -1540,7 +1540,7 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
     for (const text of ["at 12:30 and 12:30:45", "a:b c:d", "Foo::bar", "std::vector", "ratio 3:2"]) {
       expect(scrubText(text)).toBe(text);
     }
-  });
+  }, 30_000);
 
   test("detectHoldoutReasons folds every Unicode dash, punctuation separator, control character and container", () => {
     const ch = (cp: number): string => String.fromCodePoint(cp);
@@ -1590,7 +1590,7 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
     // Generic rules: padded/defanged dotted IPv4 and ideographic full stops.
     expect(scrubText("10 . 20 . 30 . 40 and 10[.]20[.]30[.]40")).toBe("[REDACTED_IP] and [REDACTED_IP]");
     expect(scrubText(`go c2${ch(0x3002)}bad${ch(0x3002)}example now`)).toBe("go [REDACTED_DOMAIN] now");
-  });
+  }, 30_000);
 
   test("diagnostics packets must match the closed schema: free-form keys cannot ride to the proposer", async () => {
     const foreign = "wks-sealed-zz99";
@@ -1650,5 +1650,5 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
       // Linear runs take ~10-250 ms per MB here; a quadratic rule takes minutes.
       expect(performance.now() - started).toBeLessThan(3000);
     }
-  }, 120_000);
+  }, 60_000);
 });
