@@ -269,6 +269,11 @@ export const CLEAN_ROOM_CHILD_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
   "XDG_CACHE_HOME",
   "CLAUDE_CONFIG_DIR",
   "PI_CODING_AGENT_DIR",
+  // libuv re-adds these to every Windows child even when the env omits them
+  // (required by Win32); listed so the allowlist states what a child gets.
+  "LOGONSERVER",
+  "USERDOMAIN",
+  "USERNAME",
   "LANG",
   "LC_ALL",
   "LC_CTYPE",
@@ -550,18 +555,20 @@ export interface HoldoutInspectionInput {
 
 /**
  * Canonical spelling for holdout matching: compatibility-fold (full-width,
- * ligatures), drop combining marks and invisible format characters (accents,
- * zero-width splits, soft hyphens), lowercase, and treat `_`, `-` and runs of
- * whitespace alike (all become `-`). `DÉDALE`, `ded<ZWSP>ale`, `Story B`,
+ * ligatures), drop combining marks, invisible format characters and
+ * non-whitespace control characters (accents, zero-width splits, soft hyphens,
+ * NUL), lowercase, and fold every run of characters that are not letters or
+ * numbers (`_`, `-`, every Unicode dash and minus sign, whitespace, `.`, `/`,
+ * `:`, ...) to a single `-`. `DÉDALE`, `ded<ZWSP>ale`, `Story B`,
  * `public_dataset` and `ｒｅａｌ-ｗｉｎ` all reach the same token as the plain form.
  */
 export function normalizeHoldoutToken(raw: string): string {
   return raw
     .normalize("NFKD")
-    .replace(/[\p{M}\p{Cf}]/gu, "")
+    .replace(/[\p{M}\p{Cf}]|(?!\s)\p{Cc}/gu, "")
     .normalize("NFKC")
     .toLowerCase()
-    .replace(/[\s_-]+/gu, "-")
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
     .replace(/^-+|-+$/g, "");
 }
 
@@ -574,6 +581,7 @@ const REAL_WIN_CASE_RE = new RegExp(`(?<!${HOLDOUT_ALNUM})real-?win(?![\\p{L}])`
 const STORY_B_TOKEN_RE = holdoutToken("story-?b(?:-holdout)?");
 const TALVERIN_RE = /talverin/u;
 const PORTAL_PROBING_SLUG = "attack.recon.portal-path-probing";
+const PORTAL_PROBING_TOKEN = normalizeHoldoutToken(PORTAL_PROBING_SLUG);
 /** The only data origin a coach case may have (HUNT-BOTS.md rule 1). */
 const SYNTHETIC_DATA_ORIGIN = "synthetic";
 const STORY_KEY = "story";
@@ -596,7 +604,7 @@ function scanHoldoutString(raw: string, reasons: Set<string>): void {
   if (TALVERIN_RE.test(token)) {
     reasons.add("talverin.example");
   }
-  if (token.includes(PORTAL_PROBING_SLUG)) {
+  if (token.includes(PORTAL_PROBING_TOKEN)) {
     reasons.add("attack.recon.portal-path-probing");
   }
   if (token === "public-dataset" || token === "work-export" || token === "work-connected") {
@@ -609,9 +617,9 @@ function scanHoldoutString(raw: string, reasons: Set<string>): void {
 
 /** Every leaf value under a key, flattened (so `story: ["b"]` reads like `story: "b"`). */
 function leafStrings(value: unknown, out: string[]): void {
-  if (typeof value === "string") {
-    out.push(value);
-  } else if (Array.isArray(value)) {
+  if (typeof value === "string" || value instanceof String) {
+    out.push(value.valueOf());
+  } else if (Array.isArray(value) || value instanceof Set) {
     for (const item of value) {
       leafStrings(item, out);
     }
@@ -634,7 +642,34 @@ function scanHoldoutJson(value: unknown, reasons: Set<string>, depth: number): v
     }
     return;
   }
-  if (!isPlainObject(value)) {
+  if (value instanceof String) {
+    scanHoldoutString(value.valueOf(), reasons);
+    return;
+  }
+  if (value instanceof Set) {
+    scanHoldoutJson([...value], reasons, depth + 1);
+    return;
+  }
+  if (value instanceof Map) {
+    // Read a Map like the object it stands for (keys must be strings to count).
+    const asObject: Record<string, unknown> = {};
+    for (const [k, v] of value) {
+      if (typeof k === "string") {
+        asObject[k] = v;
+      } else {
+        scanHoldoutJson(k, reasons, depth + 1);
+        scanHoldoutJson(v, reasons, depth + 1);
+      }
+    }
+    scanHoldoutJson(asObject, reasons, depth + 1);
+    return;
+  }
+  if (value === null || typeof value !== "object") {
+    return;
+  }
+  if (!isPlainObject(value) || !isPlainDataObject(value)) {
+    // A class instance cannot be read as case metadata: refuse it.
+    reasons.add("holdout_unscannable_value");
     return;
   }
   for (const [rawKey, child] of Object.entries(value)) {
@@ -905,31 +940,71 @@ const SINGLE_TOKEN_ENUM_LEAF_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 // Leak patterns. Boundaries are "not a letter or number", so `_`, `-`, `.`
 // and punctuation all separate tokens (`id_evt-000101`, `md5_<hex>`,
 // `svc-backup_admin` are caught; JS `\b` treats `_` as part of a word).
+//
+// Every rule is linear in the input: a rule either has a bounded length, or
+// can only START where a run begins (its lookbehind rejects the characters
+// the run itself is made of) and has no trailing condition that could fail
+// after an unbounded scan. `scrubText` is timed on 1 MB adversarial inputs.
 const LEAK_ALNUM = String.raw`[\p{L}\p{N}]`;
 const LB = `(?<!${LEAK_ALNUM})`;
 const LA = `(?!${LEAK_ALNUM})`;
-const HEX4 = "[0-9a-f]{1,4}";
 const leakRe = (body: string): RegExp => new RegExp(body, "iu");
 
-const FACT_SLUG_RE = leakRe(`${LB}(?:attack|decoy|benign|coverage)\\.[a-z0-9_-]+(?:\\.[a-z0-9_-]+)*${LA}`);
-const RAW_EVT_ID_RE = leakRe(`${LB}evt-[a-z0-9_-]+`);
-const RAW_FRAME_ID_RE = leakRe(`${LB}frame-\\d+${LA}`);
-const RAW_IOC_ID_RE = leakRe(`${LB}ioc-\\d+${LA}`);
+const FACT_SLUG_RE = leakRe(
+  String.raw`${LB}(?:attack|decoy|benign|coverage)\.[a-z0-9_-]+(?:\.[a-z0-9_-]+)*`,
+);
+const RAW_EVT_ID_RE = leakRe(String.raw`${LB}evt-[a-z0-9_-]+`);
+const RAW_FRAME_ID_RE = leakRe(String.raw`${LB}frame-\d+`);
+const RAW_IOC_ID_RE = leakRe(String.raw`${LB}ioc-\d+`);
 const CASE_ID_LEAK_RE = leakRe(
-  `${LB}(?:story[-_]?[ab](?:[-_][a-z0-9_-]+)?|team-(?:easy|med|hard)-\\d+|solo-[a-z]+-\\d+|real[-_]?win[-_a-z0-9]*|case[-_]\\d+)${LA}`,
+  String.raw`${LB}(?:story[-_]?[ab](?:[-_][a-z0-9_-]*|${LA})|team-(?:easy|med|hard)-\d+|solo-[a-z]+-\d+|real[-_]?win[-_a-z0-9]*|case[-_]\d+)`,
 );
-// An address followed by letters (`10.0.0.1abc`) still names the address.
-const IPV4_LEAK_RE = leakRe(`(?<![\\p{N}.])(?:\\d{1,3}\\.){3}\\d{1,3}(?![\\p{N}])`);
-// Full, `::`-compressed (`fe80::1`, `fd12::5`, `fe80::a1b2:c3d4`) and colon-run forms.
+const IPV4_OCTET = String.raw`(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)`;
+const IPV4_ADDR = String.raw`${IPV4_OCTET}(?:\.${IPV4_OCTET}){3}`;
+// An address followed by letters (`10.0.0.1abc`) still names the address; dots
+// may be padded with up to two spaces/tabs (`10 . 20 . 30 . 40`, also refanged).
+const IPV4_DOT = String.raw`[ \t]{0,2}\.[ \t]{0,2}`;
+const IPV4_LEAK_RE = leakRe(String.raw`(?<![\p{N}.])(?:\d{1,3}${IPV4_DOT}){3}\d{1,3}(?!\p{N})`);
+const H6 = "[0-9a-f]{1,4}";
+/**
+ * Every RFC 4291 text form, longest first, each of bounded length: full,
+ * `::`-compressed in any position (`fe80::1`, `::1`, `2001:db8::`), embedded
+ * IPv4 (`::ffff:10.0.0.5`, `64:ff9b::192.0.2.33`) and an optional zone id
+ * (`fe80::1%eth0`). Forms that start with a hex group may follow a label and
+ * colon (`src:fe80::1`); forms that start with `::` may follow one label
+ * colon (`src:::1`) but not a letter, number or another `::`, so `Foo::bar`
+ * is not an address. Times (`12:30`) and `a:b` text
+ * have neither eight groups nor `::` and never match.
+ */
+const IPV6_HEX_START_FORMS = [
+  `(?:${H6}:){6}${IPV4_ADDR}`,
+  `(?:${H6}:){1,4}:${IPV4_ADDR}`,
+  `(?:${H6}:){7}${H6}`,
+  `(?:${H6}:){1,6}:${H6}`,
+  `(?:${H6}:){1,5}(?::${H6}){1,2}`,
+  `(?:${H6}:){1,4}(?::${H6}){1,3}`,
+  `(?:${H6}:){1,3}(?::${H6}){1,4}`,
+  `(?:${H6}:){1,2}(?::${H6}){1,5}`,
+  `${H6}:(?::${H6}){1,6}`,
+  `(?:${H6}:){1,7}:`,
+];
+const IPV6_COLON_START_FORMS = [
+  String.raw`::(?:ffff(?::0{1,4})?:)?${IPV4_ADDR}`,
+  `:(?::${H6}){1,7}`,
+];
+const IPV6_ZONE = "(?:%[0-9a-z._~-]{1,32})?";
+const IPV6_END = String.raw`(?![0-9a-f:]|\.\d)`;
 const IPV6_LEAK_RE = leakRe(
-  `(?<![\\p{L}\\p{N}:])(?:(?:${HEX4}:){7}${HEX4}|(?:${HEX4}:){0,6}${HEX4}?::(?:${HEX4}:){0,6}${HEX4}?|(?:${HEX4}:){2,}[0-9a-f:]{1,24})(?![\\p{L}\\p{N}:])`,
+  `(?:${LB}(?:${IPV6_HEX_START_FORMS.join("|")})|(?<![\\p{L}\\p{N}]|::)(?:${IPV6_COLON_START_FORMS.join("|")}))${IPV6_ZONE}${IPV6_END}`,
 );
+// Starts only where a dotted/hyphenated run begins, so `1.1.1.1...` is one scan.
 const SYNTH_DOMAIN_LEAK_RE = leakRe(
-  `${LB}[a-z0-9-]+(?:\\.[a-z0-9-]+)*\\.(?:example|test|invalid|local|internal|corp|lan|home)${LA}`,
+  String.raw`(?<![\p{L}\p{N}.-])[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:example|test|invalid|local|internal|corp|lan|home)`,
 );
-const HEX_HASH_LEAK_RE = leakRe(`${LB}(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})${LA}`);
+// Starts only where a hex run begins; bounded alternatives, longest first.
+const HEX_HASH_LEAK_RE = leakRe(`${LB}(?:[0-9a-f]{64}|[0-9a-f]{40}|[0-9a-f]{32})${LA}`);
 const SEALED_KEYWORD_LEAK_RE = leakRe(
-  "(?:northvale|talverin|dedale|truth\\.json|operator-only|story_b_holdout)",
+  String.raw`(?:northvale|talverin|dedale|truth\.json|operator-only|story_b_holdout)`,
 );
 
 /** Defanged dots (`evil[.]corp`, `10(.)0(.)0(.)5`, `x[dot]test`) read as real dots. */
@@ -937,36 +1012,100 @@ const DEFANGED_DOT_RE = /\[\.\]|\(\.\)|\{\.\}|\[dot\]|\(dot\)|\{dot\}/giu;
 
 /**
  * Canonical text for leak matching: compatibility-fold (full-width forms),
- * drop invisible format characters (zero-width splits) and refang dots.
+ * drop invisible format characters (zero-width splits, soft hyphens) and
+ * refang dots.
  */
+/** Full stops NFKC leaves alone: ideographic (U+3002; halfwidth U+FF61 folds to it). */
+const IDEOGRAPHIC_FULL_STOP_RE = new RegExp(`[${String.fromCodePoint(0x3002)}]`, "gu");
+
 function canonicalLeakText(raw: string): string {
-  return raw.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(DEFANGED_DOT_RE, ".");
+  return raw
+    .normalize("NFKC")
+    .replace(/\p{Cf}/gu, "")
+    .replace(IDEOGRAPHIC_FULL_STOP_RE, ".")
+    .replace(DEFANGED_DOT_RE, ".");
 }
 
 /** Forbidden terms shorter than this cannot identify anything and would match everywhere. */
 const MIN_FORBIDDEN_TERM_CHARS = 2;
+/**
+ * Terms of at most this many characters and a single letter/number run (`qa`,
+ * `dc`) only match as whole tokens; every other term matches anywhere.
+ */
+const MAX_BOUNDED_TERM_CHARS = 3;
+/** Between two segments of a term: nothing, or a short run of anything but letters/numbers. */
+const TERM_SEPARATOR = String.raw`[^\p{L}\p{N}]{0,4}`;
+const SEGMENT_BREAK = "\u0000sep";
+
+interface TermTrieNode {
+  readonly children: Map<string, TermTrieNode>;
+  end: boolean;
+}
+
+function termTrieSource(node: TermTrieNode): string {
+  const keys = [...node.children.keys()].sort(compareLexicographic);
+  const parts = keys.map((key) => {
+    const child = node.children.get(key)!;
+    const head = key === SEGMENT_BREAK ? TERM_SEPARATOR : key;
+    return head + termTrieSource(child);
+  });
+  if (parts.length === 0) {
+    return "";
+  }
+  const body = parts.length === 1 ? parts[0]! : `(?:${parts.join("|")})`;
+  // Greedy optional continuation: at any start the LONGEST term wins, so a
+  // shorter prefix (`alpha`) never pre-empts `alpha-host-7`.
+  return node.end ? `(?:${body})?` : body;
+}
+
+function buildTermTrie(segmentLists: readonly (readonly string[])[]): TermTrieNode {
+  const root: TermTrieNode = { children: new Map(), end: false };
+  for (const segments of segmentLists) {
+    let node = root;
+    segments.forEach((segment, idx) => {
+      const units = idx === 0 ? [...segment] : [SEGMENT_BREAK, ...segment];
+      for (const unit of units) {
+        let next = node.children.get(unit);
+        if (!next) {
+          next = { children: new Map(), end: false };
+          node.children.set(unit, next);
+        }
+        node = next;
+      }
+    });
+    node.end = true;
+  }
+  return root;
+}
 
 /**
- * One matcher for a forbidden vocabulary: terms longest-first (so a shorter
- * prefix such as `alpha` never pre-empts `alpha-host-7`), case-insensitive,
- * bounded by "not a letter or number" so `_`-joined forms match too, and
- * with `-` and `_` inside a term interchangeable (`svc-backup` ~ `svc_backup`).
+ * One precompiled matcher for a forbidden vocabulary, independent of term
+ * order. A term is its letter/number runs ("segments"); between segments the
+ * text may have nothing or up to four characters that are not letters or
+ * numbers (`wks-fin-07` also matches `WKS_FIN_07`, `wks fin 07`, `wks.fin.07`,
+ * `wks<U+2010>fin<en dash>07`, `wksfin07`). Terms are compiled into a prefix trie,
+ * so each start position costs at most one walk of the longest term: linear.
  */
 function forbiddenTermsMatcher(forbidden: ReadonlySet<string>): RegExp | null {
-  const terms = [
-    ...new Set(
-      [...forbidden]
-        .map((t) => canonicalLeakText(t).toLowerCase())
-        .filter((t) => t.length >= MIN_FORBIDDEN_TERM_CHARS),
-    ),
-  ].sort((a, b) => b.length - a.length || compareLexicographic(a, b));
-  if (terms.length === 0) {
-    return null;
+  const anywhere: string[][] = [];
+  const bounded: string[][] = [];
+  for (const raw of forbidden) {
+    const term = canonicalLeakText(raw).toLowerCase();
+    const segments = term.match(/[\p{L}\p{N}]+/gu) ?? [];
+    const length = segments.join("").length;
+    if (length < MIN_FORBIDDEN_TERM_CHARS) {
+      continue;
+    }
+    (segments.length === 1 && length <= MAX_BOUNDED_TERM_CHARS ? bounded : anywhere).push(segments);
   }
-  const alternation = terms
-    .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/[-_]/g, "[-_]"))
-    .join("|");
-  return new RegExp(`${LB}(?:${alternation})${LA}`, "giu");
+  const alternatives: string[] = [];
+  if (anywhere.length > 0) {
+    alternatives.push(`(?:${termTrieSource(buildTermTrie(anywhere))})`);
+  }
+  if (bounded.length > 0) {
+    alternatives.push(`${LB}(?:${termTrieSource(buildTermTrie(bounded))})${LA}`);
+  }
+  return alternatives.length === 0 ? null : new RegExp(alternatives.join("|"), "giu");
 }
 
 const toGlobal = (re: RegExp): RegExp => new RegExp(re.source, `${re.flags}g`);
@@ -988,7 +1127,7 @@ export function scrubText(
   forbidden?: ReadonlySet<string>,
 ): string {
   let out = canonicalLeakText(raw);
-  // Case vocabulary first, in one longest-first pass, so a generic rule cannot
+  // Case vocabulary first, in one longest-match pass, so a generic rule cannot
   // split a forbidden term and leave part of it behind.
   const vocab = forbidden ? forbiddenTermsMatcher(forbidden) : null;
   if (vocab) {
@@ -1296,7 +1435,158 @@ export interface CleanDiagnosticsPacket {
   };
 }
 
-/** Refuses packets without clean holdout provenance (e.g. hand-built or tampered). */
+const PACKET_TOP_KEYS = [
+  "schema_version",
+  "case_count",
+  "round_count",
+  "aggregates",
+  "reason_code_counts",
+  "stage_citation_funnel",
+  "rounds",
+  "revert_ledger",
+  "provenance",
+] as const;
+const PACKET_AGGREGATE_KEYS = [
+  "mean_found",
+  "mean_attack_found",
+  "mean_coverage_found",
+  "misattributed_decoys_total",
+  "mean_citation_precision",
+  "g2_1_pass",
+  "g2_1_pass_rate",
+  "steps_halted_total",
+] as const;
+const PACKET_FUNNEL_KEYS = [
+  "claims_emitted",
+  "cited_ids_emitted",
+  "cited_ids_retained_in_incident",
+] as const;
+const PACKET_ROUND_KEYS = [
+  "round_index",
+  "found_mean",
+  "attack_found_mean",
+  "misattributed_decoys",
+  "citation_precision_mean",
+  "g2_1_pass",
+] as const;
+const PACKET_REVERT_KEYS = [
+  "attempt_index",
+  "track",
+  "outcome",
+  "reason_code",
+  "probe_delta_found",
+] as const;
+const PACKET_PROVENANCE_KEYS = ["holdout_checked", "sealed", "holdout_reason_count"] as const;
+const REVERT_OUTCOMES: ReadonlySet<string> = new Set([
+  "promoted",
+  "reverted_probe",
+  "reverted_pass2",
+  "reverted_panel",
+  "rejected_validation",
+]);
+const PROPOSAL_TRACKS: ReadonlySet<string> = new Set(["playbook", "code_pr"]);
+
+/**
+ * Structural check of a diagnostics packet at the clean-room boundary: the
+ * exact `buildDiagnosticsPacket` shape and nothing else. Free-form keys (a
+ * host name as a `reason_code_counts` key, an extra `note` field) are refused
+ * whatever their spelling, so nothing outside the closed schema can reach a
+ * model even when it is absent from the leak-guard vocabulary.
+ */
+export function assertDiagnosticsPacketSchema(packet: unknown): void {
+  const fail = (at: string, detail: string): never => {
+    throw new PacketLeakError(at, "SCHEMA_VIOLATION", detail);
+  };
+  const exactRecord = (
+    value: unknown,
+    at: string,
+    keys: readonly string[],
+  ): Record<string, unknown> => {
+    if (!isPlainDataObject(value)) {
+      return fail(at, "expected a plain object");
+    }
+    const actual = Object.keys(value).sort(compareLexicographic);
+    const expected = [...keys].sort(compareLexicographic);
+    if (actual.length !== expected.length || actual.some((k, i) => k !== expected[i])) {
+      return fail(at, `keys must be exactly [${expected.join(", ")}]`);
+    }
+    return value;
+  };
+  const num = (value: unknown, at: string): void => {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      fail(at, "expected a finite number");
+    }
+  };
+  const bool = (value: unknown, at: string): void => {
+    if (typeof value !== "boolean") {
+      fail(at, "expected a boolean");
+    }
+  };
+  const list = (value: unknown, at: string): readonly unknown[] =>
+    Array.isArray(value) ? value : fail(at, "expected an array");
+
+  const root = exactRecord(packet, "$", PACKET_TOP_KEYS);
+  if (root.schema_version !== 1) {
+    fail("$.schema_version", "expected 1");
+  }
+  num(root.case_count, "$.case_count");
+  num(root.round_count, "$.round_count");
+  const aggregates = exactRecord(root.aggregates, "$.aggregates", PACKET_AGGREGATE_KEYS);
+  for (const key of PACKET_AGGREGATE_KEYS) {
+    (key === "g2_1_pass" ? bool : num)(aggregates[key], `$.aggregates.${key}`);
+  }
+  const counts = root.reason_code_counts;
+  if (!isPlainDataObject(counts)) {
+    fail("$.reason_code_counts", "expected a plain object");
+  } else {
+    for (const [key, value] of Object.entries(counts)) {
+      if (!DIAGNOSTIC_REASON_SET.has(key)) {
+        fail("$.reason_code_counts", "key is not a diagnostic reason code");
+      }
+      num(value, `$.reason_code_counts.${key}`);
+    }
+  }
+  const funnel = root.stage_citation_funnel;
+  if (!isPlainDataObject(funnel)) {
+    fail("$.stage_citation_funnel", "expected a plain object");
+  } else {
+    for (const [key, value] of Object.entries(funnel)) {
+      if (!GUIDANCE_STAGE_SET.has(key)) {
+        fail("$.stage_citation_funnel", "key is not a stage id");
+      }
+      const entry = exactRecord(value, `$.stage_citation_funnel.${key}`, PACKET_FUNNEL_KEYS);
+      for (const k of PACKET_FUNNEL_KEYS) {
+        num(entry[k], `$.stage_citation_funnel.${key}.${k}`);
+      }
+    }
+  }
+  list(root.rounds, "$.rounds").forEach((round, i) => {
+    const r = exactRecord(round, `$.rounds[${i}]`, PACKET_ROUND_KEYS);
+    for (const k of PACKET_ROUND_KEYS) {
+      (k === "g2_1_pass" ? bool : num)(r[k], `$.rounds[${i}].${k}`);
+    }
+  });
+  list(root.revert_ledger, "$.revert_ledger").forEach((entry, i) => {
+    const r = exactRecord(entry, `$.revert_ledger[${i}]`, PACKET_REVERT_KEYS);
+    num(r.attempt_index, `$.revert_ledger[${i}].attempt_index`);
+    num(r.probe_delta_found, `$.revert_ledger[${i}].probe_delta_found`);
+    if (typeof r.track !== "string" || !PROPOSAL_TRACKS.has(r.track)) {
+      fail(`$.revert_ledger[${i}].track`, "not a proposal track");
+    }
+    if (typeof r.outcome !== "string" || !REVERT_OUTCOMES.has(r.outcome)) {
+      fail(`$.revert_ledger[${i}].outcome`, "not a revert outcome");
+    }
+    if (typeof r.reason_code !== "string" || !DIAGNOSTIC_REASON_SET.has(r.reason_code)) {
+      fail(`$.revert_ledger[${i}].reason_code`, "not a diagnostic reason code");
+    }
+  });
+  exactRecord(root.provenance, "$.provenance", PACKET_PROVENANCE_KEYS);
+}
+
+/**
+ * Refuses packets without the exact diagnostics schema or without clean
+ * holdout provenance (e.g. hand-built or tampered).
+ */
 export function assertPacketHoldoutProvenance(
   subcommand: CoachSubcommand,
   packet: CleanDiagnosticsPacket,
@@ -1315,6 +1605,7 @@ export function assertPacketHoldoutProvenance(
       `'${subcommand}' refused: diagnostics packet lacks clean holdout provenance (fail closed)`,
     );
   }
+  assertDiagnosticsPacketSchema(packet);
 }
 
 function extractAllComparableCitations(text: string): Set<string> {
@@ -1550,6 +1841,7 @@ export function buildDiagnosticsPacket(
     },
   };
 
+  assertDiagnosticsPacketSchema(packet);
   assertCleanPacket(packet, leakGuard);
   return packet;
 }
@@ -2399,8 +2691,9 @@ export async function proposeCleanRoom(options: {
   readonly turnResult: CleanRoomWorkerTurnResult;
 }> {
   requireHoldoutClearance("propose", options.holdoutReasons);
+  const leakGuard = requireLeakGuard("propose", options.leakGuard);
   assertPacketHoldoutProvenance("propose", options.packet);
-  assertCleanPacket(options.packet, requireLeakGuard("propose", options.leakGuard));
+  assertCleanPacket(options.packet, leakGuard);
 
   const userPrompt = JSON.stringify({
     requested_track: options.trackPreference ?? "playbook",
@@ -2499,8 +2792,9 @@ export async function runCleanRoomThreeVerifierPanel(options: {
   readonly turnRunner?: CleanRoomTurnRunner;
   readonly spawnOptions?: SpawnZeroToolCleanRoomOptions;
 }): Promise<VerifierPanelResult> {
+  const leakGuard = requireLeakGuard("verifier-panel", options.leakGuard);
   assertPacketHoldoutProvenance("promote", options.packet);
-  assertCleanPacket(options.packet, requireLeakGuard("verifier-panel", options.leakGuard));
+  assertCleanPacket(options.packet, leakGuard);
   const minFoundGain = parseMinFoundGain(options.minFoundGain);
 
   const hardAudit = deterministicSafetyAudit({
@@ -2741,8 +3035,9 @@ export async function runPromotionPipeline(
   if (options.requireCleanGit && options.repoRoot) {
     assertCleanGitTree(options.repoRoot);
   }
+  const leakGuard = requireLeakGuard("promote", options.leakGuard);
   assertPacketHoldoutProvenance("promote", options.packet);
-  assertCleanPacket(options.packet, requireLeakGuard("promote", options.leakGuard));
+  assertCleanPacket(options.packet, leakGuard);
 
   const evalId = options.evalId ?? `coach-eval-${crypto.randomUUID()}`;
   const ts = new Date().toISOString();

@@ -28,6 +28,8 @@ const SECRET_KEY_NAMES = new Set([
   "sessiontoken",
   "authtoken",
   "privatekey",
+  "accesskey",
+  "secretaccesskey",
 ]);
 
 export function isSecretKeyName(key: string): boolean {
@@ -47,21 +49,41 @@ const SECRET_KEY_ALTERNATION = [
   `(?:access|refresh|id|session|auth)${SEP}token`,
   "token",
   `private${SEP}key`,
+  `(?:secret${SEP})?access${SEP}key`,
 ].join("|");
 
-/** `"password": "..."`, `"Authorization": "ApiKey ..."`, `{"cookie":"..."}` (JSON string values). */
+/**
+ * `"password": "..."`, `"Authorization": "ApiKey ..."`, `{"cookie":"..."}` (JSON string values),
+ * at any escape depth: `{\"api_key\":\"...\"}` inside a log line is the same pair with every quote
+ * preceded by one backslash run. The opening value quote's run (group 2) is the delimiter; the
+ * value ends at the next quote with exactly that run, so deeper-escaped quotes stay inside it.
+ *
+ * Linear: the key's run is anchored by a lookbehind (no restart inside a backslash run), and each
+ * value alternative starts on a distinct character class and consumes a maximal backslash run.
+ */
 const JSON_SECRET_KV_RE = new RegExp(
-  `("(?:${SECRET_KEY_ALTERNATION})"\\s*:\\s*")(?!\\[REDACTED)(?:[^"\\\\\\r\\n]|\\\\.)+(")`,
+  `((?<!\\\\)\\\\*"(?:${SECRET_KEY_ALTERNATION})\\\\*"\\s*:\\s*(\\\\*)")` +
+    `(?!\\[REDACTED)` +
+    `(?:[^"\\\\\\r\\n]|\\\\+(?=[^"\\\\\\r\\n])|(?!\\2")\\\\+")+` +
+    `((?<!\\\\)\\2")`,
   "gi",
 );
 
-/** `Authorization: Bearer ...`, `Cookie: a=b; c=d`, `X-Api-Key: ...` header lines. */
+/**
+ * `Authorization: Bearer ...`, `Cookie: a=b; c=d`, `X-Api-Key: ...` header lines. The value must
+ * start with a non-space so a backtracked `\s*` cannot step past an existing marker (idempotent).
+ */
 const HEADER_LINE_RE =
-  /(\b(?:proxy-)?authorization\s*:\s*|\b(?:set-)?cookie\s*:\s*|\bx-api-key\s*:\s*)(?!\[REDACTED)[^\r\n"'}]+/gi;
+  /(\b(?:proxy-)?authorization\s*:\s*|\b(?:set-)?cookie\s*:\s*|\bx-api-key\s*:\s*)(?!\[REDACTED)[^\s"'}][^\r\n"'}]*/gi;
 
-/** `password=...`, `access_token=...&`, `client_secret: ...`, `'api_key': '...'`. */
+/**
+ * `password=...`, `access_token=...&`, `client_secret: ...`, `'api_key': '...'`, and env-style
+ * names whose last segments are a credential keyword: `DB_PASSWORD=`, `export FOO_SECRET=`,
+ * `AWS_SECRET_ACCESS_KEY=`, `MY_API_KEY: ...`. The `[A-Za-z0-9]+_` prefix segments cannot contain
+ * `_`, so splitting is deterministic and the scan stays linear; `tokens observed` never matches.
+ */
 const KEY_VALUE_RE = new RegExp(
-  `(\\b(?:${SECRET_KEY_ALTERNATION})["']?\\s*[:=]\\s*["']?)(?!\\[REDACTED)[^\\s"'&,;}]+`,
+  `(\\b(?:[A-Za-z0-9]+_)*(?:${SECRET_KEY_ALTERNATION})["']?\\s*[:=]\\s*["']?)(?!\\[REDACTED)[^\\s"'&,;}]+`,
   "gi",
 );
 
@@ -94,7 +116,7 @@ export function scrubSecretText(input: string): string {
   }
   let out = input;
   out = out.replace(URL_USERINFO_RE, "$1[REDACTED_URL_CREDENTIALS]@");
-  out = out.replace(JSON_SECRET_KV_RE, "$1[REDACTED_SECRET]$2");
+  out = out.replace(JSON_SECRET_KV_RE, "$1[REDACTED_SECRET]$3");
   out = out.replace(HEADER_LINE_RE, "$1[REDACTED_SECRET]");
   out = out.replace(BEARER_RE, "Bearer [REDACTED_BEARER]");
   out = out.replace(APIKEY_RE, "ApiKey [REDACTED_API_KEY]");
@@ -105,16 +127,37 @@ export function scrubSecretText(input: string): string {
   return out;
 }
 
+/** How many levels of JSON-inside-a-string {@link scrubSecretValue} unwraps. */
+export const MAX_EMBEDDED_JSON_DEPTH = 8;
+
+const REDACTED_SECRET = "[REDACTED_SECRET]";
+const REDACTED_TOO_DEEP = "[REDACTED_TOO_DEEP]";
+/** Containers nested deeper than this are replaced, never walked (keeps recursion bounded). */
+export const MAX_CONTAINER_NESTING = 64;
+
 /**
- * Deep-scrubs a JSON-like value: string values under credential key names become
- * `[REDACTED_SECRET]`, and every other string goes through {@link scrubSecretText}.
+ * Deep-scrubs a JSON-like value:
+ * - every value under a credential key name becomes `[REDACTED_SECRET]`, whatever its type;
+ * - a string holding JSON (trimmed text starts with `{` or `[` and parses) is parsed, scrubbed
+ *   structurally and re-serialized, up to {@link MAX_EMBEDDED_JSON_DEPTH} levels deep;
+ * - every other string goes through {@link scrubSecretText}.
+ *
+ * Cost stays linear: each embedded level is parsed once, and nesting is capped.
  */
 export function scrubSecretValue<T>(value: T): T {
+  return scrubValueAt(value, 0, 0) as T;
+}
+
+function scrubValueAt(value: unknown, jsonDepth: number, nesting: number): unknown {
   if (typeof value === "string") {
-    return scrubSecretText(value) as unknown as T;
+    return scrubString(value, jsonDepth);
+  }
+  if (value !== null && typeof value === "object" && nesting >= MAX_CONTAINER_NESTING) {
+    // Fail closed rather than overflow the stack on pathologically deep input.
+    return REDACTED_TOO_DEEP;
   }
   if (Array.isArray(value)) {
-    return value.map((item) => scrubSecretValue(item)) as unknown as T;
+    return value.map((item) => scrubValueAt(item, jsonDepth, nesting + 1));
   }
   if (value !== null && typeof value === "object") {
     if (value instanceof Uint8Array || value instanceof Date) {
@@ -122,12 +165,39 @@ export function scrubSecretValue<T>(value: T): T {
     }
     const result: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      result[k] =
-        isSecretKeyName(k) && typeof v === "string" && v.length > 0
-          ? "[REDACTED_SECRET]"
-          : scrubSecretValue(v);
+      result[k] = isSecretKeyName(k) && isPresent(v) ? REDACTED_SECRET : scrubValueAt(v, jsonDepth, nesting + 1);
     }
-    return result as T;
+    return result;
   }
   return value;
+}
+
+function isPresent(v: unknown): boolean {
+  return v !== null && v !== undefined && v !== "";
+}
+
+function scrubString(text: string, jsonDepth: number): string {
+  if (jsonDepth < MAX_EMBEDDED_JSON_DEPTH) {
+    const embedded = parseEmbeddedJson(text);
+    if (embedded !== undefined) {
+      // Re-serialize the structurally scrubbed value, then sweep it as text as well.
+      return scrubSecretText(JSON.stringify(scrubValueAt(embedded, jsonDepth + 1, 0)));
+    }
+  }
+  return scrubSecretText(text);
+}
+
+function parseEmbeddedJson(text: string): object | undefined {
+  const trimmed = text.trim();
+  const first = trimmed[0];
+  const last = trimmed[trimmed.length - 1];
+  if (!((first === "{" && last === "}") || (first === "[" && last === "]"))) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return parsed !== null && typeof parsed === "object" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }

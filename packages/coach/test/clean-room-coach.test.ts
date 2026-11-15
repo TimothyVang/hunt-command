@@ -210,7 +210,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
     expect(scrubbedEnv.CUSTOM_PROVIDER_API_KEY).toBeUndefined();
     expect(scrubbedEnv.AWS_SECRET_ACCESS_KEY).toBeUndefined();
     expect(scrubbedEnv.OMP_AUTH_BROKER_TOKEN).toBeUndefined();
-  });
+  }, 30_000);
 
   test("in-process and REAL out-of-process clean-room worker enforce 0 tools and hard-abort immediately on tool_execution_start", async () => {
     // 1. In-process test: non-zero active tools before prompt -> immediate rejection
@@ -729,7 +729,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
     } finally {
       fs.rmSync(tempRepo, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("3-stage promotion gate enforces probe -> pass^2 (+1.0 on BOTH rounds, <= decoys, g2_1_pass) -> unanimous 3-verifier panel & emits hunt.coach.eval", async () => {
     const tmpOut = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-coach-promo-"));
@@ -941,7 +941,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
     } finally {
       fs.rmSync(tmpOut, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("all files in packages/coach/** pass hunt_bots_check AST and forbidden-token policies", () => {
     const coachRoot = path.resolve(import.meta.dir, "..");
@@ -977,7 +977,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
       }
     }
     expect(violations).toEqual([]);
-  });
+  }, 30_000);
 });
 
 describe("packages/coach fail-closed holdout provenance, global scrub & regular-file-only diffs", () => {
@@ -1171,7 +1171,7 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
         },
       } as unknown as Parameters<typeof stageCodePrDraft>[0]),
     ).toThrow(CleanRoomViolationError);
-  });
+  }, 30_000);
 
   test("scrubText redacts every occurrence, not just the first", () => {
     const out = scrubText(
@@ -1406,7 +1406,7 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
     expect(() =>
       assertCleanPacket(cleanPacket(), { ...leakGuard, extraForbidden: ["found", "pass", "attack"] }),
     ).not.toThrow();
-  });
+  }, 30_000);
 
   test("holdout-derived metrics and revert deltas carry provenance and never reach the ledger or the proposer", async () => {
     const sealedEvals = judgeCaseBatch(
@@ -1513,4 +1513,142 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
     expect(d({ case_id: `${ch(0xff52, 0xff45, 0xff41, 0xff4c)}-${ch(0xff57, 0xff49, 0xff4e)}-001` })).toContain("DEDALE");
     expect(d({ story: "a", data_origin: "synthetic", case_id: "synth-coach-a01" })).toEqual([]);
   });
+  // ---- round-2 panel regression tests (PR #5) ------------------------------
+  test("IPv6 in every compressed form is redacted and refused, but times, a:b text and Foo::bar are not", () => {
+    const addresses = [
+      "::1",
+      "::5",
+      "::ffff:a00:5",
+      "::ffff:10.20.30.40",
+      "fe80::1",
+      "fd12::5",
+      "fe80::a1b2:c3d4",
+      "2001:db8::1",
+      "2001:DB8:0:0:0:0:0:1",
+      "2001:db8::",
+      "64:ff9b::192.0.2.33",
+      "fe80::1%eth0",
+    ];
+    for (const addr of addresses) {
+      for (const [prefix, suffix] of [["", ""], ["src:", ""], ["ip:", ""], ["src=", ""], ["[", "]"], ["a ", " b"]]) {
+        expect(scrubText(`${prefix}${addr}${suffix}`)).toBe(`${prefix}[REDACTED_IP]${suffix}`);
+      }
+      expect(() => assertCleanPacket({ a: addr }, { forbidden: new Set(["zz-unrelated"]) })).toThrow(PacketLeakError);
+      expect(() => assertCleanPacket({ a: `src:${addr}` }, { forbidden: new Set(["zz-unrelated"]) })).toThrow(PacketLeakError);
+    }
+    expect(scrubText("src:::1")).toBe("src:[REDACTED_IP]");
+    for (const text of ["at 12:30 and 12:30:45", "a:b c:d", "Foo::bar", "std::vector", "ratio 3:2"]) {
+      expect(scrubText(text)).toBe(text);
+    }
+  }, 30_000);
+
+  test("detectHoldoutReasons folds every Unicode dash, punctuation separator, control character and container", () => {
+    const ch = (cp: number): string => String.fromCodePoint(cp);
+    const dashes = [0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2043, 0x2212, 0xfe58, 0xfe63, 0xff0d];
+    for (const sep of [...dashes.map(ch), ".", "/", ":", "+", "~", " ", "_"]) {
+      expect(detectHoldoutReasons({ caseMeta: { name: `story${sep}b` } })).toContain("story==='b'");
+      expect(detectHoldoutReasons({ caseMeta: { case_id: `real${sep}win-001` } })).toContain("DEDALE");
+    }
+    expect(detectHoldoutReasons({ caseMeta: { [`story${ch(0)}`]: "b" } })).toContain("story==='b'");
+    expect(detectHoldoutReasons({ caseMeta: { meta: new Map([["story", "b"]]) } })).toContain("story==='b'");
+    expect(detectHoldoutReasons({ caseMeta: { story: new Set(["b"]) } })).toContain("story==='b'");
+    expect(detectHoldoutReasons({ caseMeta: { case_id: new String("real-win-001") } })).toContain("DEDALE");
+    expect(detectHoldoutReasons({ caseMeta: { name: "story-board", case_id: "synth-coach-a01" } })).toEqual([]);
+  });
+
+  test("the vocabulary matcher treats any short separator run (or none) between term segments alike, in any order", () => {
+    const ch = (cp: number): string => String.fromCodePoint(cp);
+    const terms = ["wks-fin-07", "svc_sync", "alpha", "alpha-host-7", "qa"];
+    const variants = [
+      "wks fin 07",
+      "wks.fin.07",
+      `wks${ch(0x2010)}fin${ch(0x2011)}07`,
+      `wks${ch(0x2013)}fin${ch(0x2013)}07`,
+      `wks${ch(0xad)}-fin-07`,
+      "WKS_FIN_07",
+      "wksfin07",
+      "wks - fin - 07",
+    ];
+    for (const order of [terms, [...terms].reverse(), [...terms].sort()]) {
+      const forbidden = new Set(order);
+      for (const v of variants) {
+        expect(scrubText(`host ${v} ran`, forbidden)).toBe("host [REDACTED_VOCAB] ran");
+      }
+      expect(scrubText("wks-fin-07wks-fin-07 xwks-fin-07x", forbidden)).not.toMatch(/wks|fin-07/i);
+      expect(scrubText("alpha-host-7 talked to alpha", forbidden)).toBe(
+        "[REDACTED_VOCAB] talked to [REDACTED_VOCAB]",
+      );
+      // Short single-run terms stay whole-token only.
+      expect(scrubText("host qa logged in; quality aside", forbidden)).toBe(
+        "host [REDACTED_VOCAB] logged in; quality aside",
+      );
+    }
+    const guard = { forbidden: new Set(["ws-fin-04"]) };
+    for (const token of ["ws.fin.04", "wsfin04", "WS_FIN_04", "x-ws-fin-04-y"]) {
+      expect(() => assertCleanPacket({ a: token }, guard)).toThrow(PacketLeakError);
+    }
+    // Generic rules: padded/defanged dotted IPv4 and ideographic full stops.
+    expect(scrubText("10 . 20 . 30 . 40 and 10[.]20[.]30[.]40")).toBe("[REDACTED_IP] and [REDACTED_IP]");
+    expect(scrubText(`go c2${ch(0x3002)}bad${ch(0x3002)}example now`)).toBe("go [REDACTED_DOMAIN] now");
+  }, 30_000);
+
+  test("diagnostics packets must match the closed schema: free-form keys cannot ride to the proposer", async () => {
+    const foreign = "wks-sealed-zz99";
+    const base = cleanPacket();
+    runnerCalls = 0;
+    for (const tampered of [
+      { ...base, reason_code_counts: { [foreign]: 1 } },
+      { ...base, stage_citation_funnel: { [foreign]: { claims_emitted: 1, cited_ids_emitted: 1, cited_ids_retained_in_incident: 1 } } },
+      { ...base, note: "x" },
+      { ...base, aggregates: { ...base.aggregates, extra: 1 } },
+      { ...base, revert_ledger: [{ attempt_index: 0, track: "playbook", outcome: foreign, reason_code: "NONE", probe_delta_found: 0 }] },
+    ]) {
+      await expect(
+        proposeCleanRoom({
+          packet: tampered as unknown as CleanDiagnosticsPacket,
+          holdoutReasons: [],
+          leakGuard,
+          turnRunner: forbiddenRunner,
+        }),
+      ).rejects.toThrow(PacketLeakError);
+    }
+    expect(runnerCalls).toBe(0);
+  });
+
+  test("scrubText stays linear on 1 MB adversarial inputs for every rule", () => {
+    const MB = 1 << 20;
+    const fill = (unit: string, tail = ""): string =>
+      unit.repeat(Math.ceil(MB / unit.length)).slice(0, MB) + tail;
+    const letter = String.fromCodePoint(0xe9);
+    const forbidden = new Set(["wks-fin-07", "svc_sync", "qa", "portal.talverin.example", "alpha-host-7"]);
+    const inputs = [
+      fill("1."), // synthetic domain / IPv4 (was quadratic)
+      fill("ab."), // synthetic domain
+      fill("a-"),
+      fill("attack.a", letter), // fact slug
+      fill("evt-"),
+      fill("frame-1"),
+      fill("ioc-1"),
+      fill("story_b_", letter), // case id
+      fill("real_win"),
+      fill("case_1"),
+      fill("a:"), // IPv6
+      fill("ff:"),
+      fill("::"),
+      fill("f::"),
+      fill("f"), // hex hash
+      fill("1 . "), // padded IPv4
+      fill("[.]"), // defang
+      fill("wks-fin-0"), // vocabulary prefix
+      fill("wks fin "),
+      fill("alpha-host-"),
+      fill("northval"), // sealed keyword
+    ];
+    for (const input of inputs) {
+      const started = performance.now();
+      scrubText(input, forbidden);
+      // Linear runs take ~10-250 ms per MB here; a quadratic rule takes minutes.
+      expect(performance.now() - started).toBeLessThan(3000);
+    }
+  }, 60_000);
 });

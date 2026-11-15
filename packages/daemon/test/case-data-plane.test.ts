@@ -6,7 +6,9 @@ import type { ProfileId } from "@hunt-command/shared";
 import { EmbeddedHuntDataPlane } from "@hunt-command/data-plane";
 import {
   CaseDataPlanePort,
+  InMemoryTelemetrySink,
   RoleCapabilityAuthority,
+  buildSessionCustomTools,
   createCaseDirDataPlaneResolver,
   runHuntCli,
   type ModelRunnerPort,
@@ -18,6 +20,12 @@ import {
 
 const CASE_ID = "port-case-001";
 const EVENT_IDS = ["evt-port-1", "evt-port-2", "evt-port-3"];
+const LEAK = "NESTEDPORTLEAK";
+/** A JSON log line whose body is itself escaped JSON carrying credentials (2 levels deep). */
+const NESTED_LOG_LINE = JSON.stringify({
+  level: "info",
+  body: JSON.stringify({ request: { password: `${LEAK} two words`, token: [`${LEAK}tok`] }, path: "/login" }),
+});
 const tempDirs: string[] = [];
 let casesDir: string;
 
@@ -48,7 +56,7 @@ beforeAll(() => {
         "@timestamp": `2026-11-14T10:0${i + 1}:00Z`,
         event: { id, code: String(i + 1) },
         host: { name: `workstation-0${i + 1}` },
-        message: `synthetic event ${i + 1}`,
+        message: i === 2 ? NESTED_LOG_LINE : `synthetic event ${i + 1}`,
       }),
     ).join("\n") + "\n",
   );
@@ -180,6 +188,33 @@ describe("CaseDataPlanePort", () => {
     await expect(port.executeTool(token, "elastic_search", { case_id: "other-case", q: "" })).rejects.toMatchObject({
       errorCode: "case_mismatch",
     });
+  });
+
+  test("fenced session tool output redacts credentials in JSON nested inside a log line", async () => {
+    const resolver = createCaseDirDataPlaneResolver({ casesDir, cacheDir: makeTmpDir("hunt-port-cache-") });
+    try {
+      const dataPlane = await resolver.resolve(CASE_ID);
+      const tools = buildSessionCustomTools({
+        runId: "run-nested",
+        caseId: CASE_ID,
+        stepId: "evidence",
+        wave: "investigation",
+        profile: "framework-researcher",
+        syntheticOnly: true,
+        dataOrigin: "synthetic",
+        capabilityAuthority: new RoleCapabilityAuthority(),
+        dataPlane,
+        telemetry: new InMemoryTelemetrySink(),
+      });
+      const search = tools.find((t) => t.name === "elastic_search")!;
+      const res = await search.execute("tc-1", { q: "event.code:3", fields: "message" } as never, undefined, {} as never);
+      const text = (res.content[0] as { type: "text"; text: string }).text;
+      expect(text).toContain("/login");
+      expect(text).toContain("[REDACTED_SECRET]");
+      expect(text).not.toContain(LEAK);
+    } finally {
+      await resolver.close();
+    }
   });
 
   test("checks Watch page tools against the calling role", async () => {

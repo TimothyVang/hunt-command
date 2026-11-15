@@ -53,6 +53,101 @@ describe("shared credential scrubber", () => {
     expect(out.host).toBe("workstation-01");
   });
 
+  test("redacts credentials in JSON nested inside strings at any depth up to the cap", () => {
+    const M = "NESTEDLEAK";
+    const inner = JSON.stringify({ user: "a", password: `${M} two words`, access_token: `${M}at` });
+    let wrapped = inner;
+    const shapes: unknown[] = [];
+    // 1..MAX levels of JSON-in-a-string, plus JSON strings inside arrays.
+    for (let level = 1; level <= 8; level++) {
+      shapes.push({ message: wrapped });
+      wrapped = JSON.stringify({ body: wrapped });
+    }
+    shapes.push({ hits: [[inner]] }, [JSON.stringify([inner])]);
+    for (const shape of shapes) {
+      expect(JSON.stringify(scrubSecretValue(shape))).not.toContain(M);
+    }
+    // Non-credential content in an embedded document survives.
+    const out = scrubSecretValue({ message: JSON.stringify({ body: JSON.stringify({ host: "workstation-01", password: "x" }) }) });
+    expect(JSON.parse(JSON.parse(out.message).body)).toEqual({ host: "workstation-01", password: "[REDACTED_SECRET]" });
+  });
+
+  test("redacts credential-named keys whatever the value type", () => {
+    const M = "TYPEDLEAK";
+    const out = JSON.stringify(
+      scrubSecretValue({
+        password: [`${M}hunter2`],
+        client_secret: { value: `${M}cs` },
+        token: [`${M}123456`],
+        api_key: 1234567890123,
+        empty: { password: "" },
+      }),
+    );
+    expect(out).not.toContain(M);
+    expect(out).not.toContain("1234567890123");
+    expect(JSON.parse(out).password).toBe("[REDACTED_SECRET]");
+    expect(JSON.parse(out).empty).toEqual({ password: "" });
+  });
+
+  test("text that only looks like JSON is still scrubbed as text, and deep nesting stays linear", () => {
+    expect(scrubSecretValue("{not json password=synthTextPass}")).not.toContain("synthTextPass");
+    const deep = "[".repeat(200_000) + "]".repeat(200_000);
+    const started = performance.now();
+    scrubSecretValue({ message: deep });
+    let big = JSON.stringify({ password: "x", filler: "y".repeat(1024 * 1024) });
+    for (let i = 0; i < 8; i++) big = JSON.stringify({ body: big });
+    scrubSecretValue({ message: big });
+    expect(performance.now() - started).toBeLessThan(1_500);
+  });
+
+  test("redacts escaped JSON pairs after a text prefix, at any escape depth", () => {
+    const L = "ESCLEAK";
+    const cases = [
+      `log: {"body":"{\\"password\\":\\"${L} two words\\"}"}`,
+      `msg=accepted {\\"api_key\\":\\"${L}y\\"} done`,
+      `deep {\\\\\\"token\\\\\\":\\\\\\"${L}zz\\\\\\"}`,
+      // A deeper-escaped quote inside the value does not end it early.
+      `x {\\"password\\":\\"in \\\\\\"q\\\\\\" ${L}tail\\"} y`,
+      `{"password":"a\\"${L}b"}`,
+    ];
+    for (const input of cases) {
+      const out = scrubSecretText(input);
+      expect(out, input).not.toContain(L);
+      expect(out).toContain("[REDACTED_SECRET]");
+    }
+    // The text around the pair survives, including the closing escaped quote.
+    expect(scrubSecretText(`msg=ok {\\"api_key\\":\\"${L}\\",\\"user\\":\\"alice\\"} end`)).toBe(
+      `msg=ok {\\"api_key\\":\\"[REDACTED_SECRET]\\",\\"user\\":\\"alice\\"} end`,
+    );
+  });
+
+  test("redacts env-style credential names", () => {
+    const L = "ENVLEAK";
+    const cases = [
+      `DB_PASSWORD=${L}hunter2`,
+      `AWS_SECRET_ACCESS_KEY=${L}abc123`,
+      `GITHUB_TOKEN=${L}abc123`,
+      `MY_API_KEY: ${L}abc123`,
+      `export FOO_SECRET=${L}abc123`,
+      `env: {"SERVICE_PASSWORD": "${L}x"}`,
+    ];
+    for (const input of cases) {
+      expect(scrubSecretText(input), input).not.toContain(L);
+    }
+    for (const benign of ["input_tokens: 1200", "token_count: 5", "AWS_ACCESS_KEY_ID=AKID-not-secret", "secrets_manager_arn=arn"]) {
+      expect(scrubSecretText(benign)).toBe(benign);
+    }
+  });
+
+  test("is idempotent: scrubbing scrubbed text changes nothing", () => {
+    const once = scrubSecretText(cases.map(([, input]) => input).join("\n") + "\nCookie: a=b\nX-Api-Key: synthKey");
+    expect(scrubSecretText(once)).toBe(once);
+    const header = "Authorization:" + " ".repeat(1024 * 1024);
+    const started = performance.now();
+    scrubSecretText(header);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
   test("scrubs adversarial 1 MB inputs in linear time", () => {
     const MB = 1024 * 1024;
     const inputs = [
@@ -66,6 +161,10 @@ describe("shared credential scrubber", () => {
       '{"password":"'.repeat(MB / 13),
       "Bearer ".repeat(MB / 7),
       "a://".repeat(MB / 4),
+      `${"\\".repeat(MB)}"password":"x"`,
+      `"password":"${"\\".repeat(MB)}`,
+      `\\"password\\":\\"${"x\\\\\\\"".repeat(MB / 5)}`,
+      `${"A_".repeat(MB / 2)}PASSWORX=`,
     ];
     for (const input of inputs) {
       const started = performance.now();
@@ -73,6 +172,25 @@ describe("shared credential scrubber", () => {
       expect(performance.now() - started).toBeLessThan(500);
     }
   });
+
+  test("stays linear on repeated escaped-JSON and env-style key shapes", () => {
+    const MB = 1024 * 1024;
+    const prefixes = [
+      // Escaped JSON pairs at several escape depths, and env-style prefixed keys.
+      '\\"password\\":\\"', '\\\\\\"password\\\\\\":\\\\\\"', '"password":"x\\"', '\\"password\\":\\"x\\\\\\"',
+      "\\", "\\\\\\\\\\\\\\\\", '\\"', '\\\\\\"', "DB_PASSWORD=", "A_", "a_b_",
+    ];
+    for (const prefix of prefixes) {
+      for (const sep of ["", " ", ":", "=", "a"]) {
+        const unit = prefix + sep;
+        const input = unit.repeat(Math.ceil(MB / unit.length));
+        const started = performance.now();
+        scrubSecretText(input);
+        const ms = performance.now() - started;
+        expect(ms, `${JSON.stringify(unit)} x ${input.length} took ${Math.round(ms)}ms`).toBeLessThan(500);
+      }
+    }
+  }, 30_000);
 
   test("stays linear when any token prefix repeats with any separator", () => {
     const MB = 1024 * 1024;

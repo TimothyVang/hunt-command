@@ -27,6 +27,7 @@ async function raceRound(lockPath: string, contenders: number) {
     Bun.spawn([process.execPath, "-e", CHILD, LOCK_MODULE, lockPath, String(startAt)], {
       stdout: "pipe",
       stderr: "pipe",
+      windowsHide: true,
     }),
   );
   const results = await Promise.all(
