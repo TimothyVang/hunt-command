@@ -102,6 +102,15 @@ describe("@hunt-command/telemetry — Hot SQLite WAL, Cold Zstd, Scrubber, OTLP 
     expect(preview.includes("\uFFFD")).toBe(false);
   });
 
+  test("scrubs a 1 MB message in well under a second and redacts JSON-shaped credentials", () => {
+    const started = performance.now();
+    scrubSecrets("x".repeat(1024 * 1024));
+    expect(performance.now() - started).toBeLessThan(1_000);
+    const jwt = ["ey", "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aCJ9.c3ludGhzaWc"].join("");
+    const out = scrubSecrets(`{"password":"synthTelemetryPass","cookie":"sid=synthCookie"} ${jwt}`);
+    for (const secret of ["synthTelemetryPass", "synthCookie", jwt]) expect(out).not.toContain(secret);
+  });
+
   test("deduplicates multi-turn cached conversation prefixes to 0 extra bytes in cold Zstd blob store & detects tampering", () => {
     const blobsDir = path.join(tmpRoot, "cold-zstd", "blobs");
     const blobStore = new ContentAddressedZstdBlobStore(blobsDir);

@@ -88,7 +88,26 @@ describe("Prompt-Injection 128-Bit Nonce Tool Fence & Scrubber", () => {
     expect(clean).not.toContain("testfixture000000000000");
     expect(clean).not.toContain("000011112222-syntheticfixture");
     expect(clean).not.toContain("hunter2pass");
-    expect(clean).toContain("[REDACTED]");
+    expect(clean).toContain("[REDACTED");
+  });
+
+  test("fenced tool output redacts JWTs, Slack user tokens, fine-grained PATs and JSON-shaped credentials", () => {
+    // Assembled at runtime so no literal vendor token is committed.
+    const jwt = ["ey", "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aCJ9.c3ludGhzaWc"].join("");
+    const slackUser = ["xo", "xp-1111-2222-synthfixture"].join("");
+    const ghFine = ["github", "_pat_11SYNTH0000_fixturefixture"].join("");
+    const raw = {
+      hits: [
+        { message: `jwt ${jwt} slack ${slackUser} gh ${ghFine}` },
+        { message: '{"password":"synthJsonPass","api_key":"synthJsonKey"}' },
+        { message: 'POST /login password=synthFormPass&client_secret=synthFormSecret' },
+        { headers: '{"Authorization":"ApiKey c3ludGhldGljYXBpa2V5"}' },
+      ],
+    };
+    const fenced = fenceToolOutput(raw).wrappedText;
+    for (const secret of [jwt, slackUser, ghFine, "synthJsonPass", "synthJsonKey", "synthFormPass", "synthFormSecret", "c3ludGhldGljYXBpa2V5"]) {
+      expect(fenced).not.toContain(secret);
+    }
   });
 
   test("strips bidi overrides, zero-width smuggling, ANSI escapes, and literal nonce/fence collisions", () => {

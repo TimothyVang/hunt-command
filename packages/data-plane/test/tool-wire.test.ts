@@ -314,6 +314,21 @@ describe("role-scoped data-plane untrusted tool wire", () => {
     expect(Buffer.byteLength(fenceToolResult(result), "utf8")).toBeLessThanOrEqual(MAX_WIRE_BYTES);
   });
 
+  test("budgets and fences a 1 MB alphanumeric hit in well under a second", () => {
+    const started = performance.now();
+    const result = budgetElasticSearchResult({
+      case_id: "wire-case-001",
+      total: 1,
+      total_relation: "eq",
+      returned: 1,
+      hits: [{ "event.id": "evt-huge", "@timestamp": "2026-11-14T10:01:00Z", message: "x".repeat(1024 * 1024) }],
+      next_after: null,
+    }, () => "cursor-1");
+    const wire = fenceToolResult(result);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(Buffer.byteLength(wire, "utf8")).toBeLessThanOrEqual(MAX_WIRE_BYTES);
+  });
+
   test("retains the authorized Watch URL and title when an HTML preview is oversized", () => {
     const url = "http://127.0.0.1:1234/watch?view_key=synthetic-watch-key";
     const wire = fenceToolResult({
