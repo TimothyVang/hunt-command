@@ -163,6 +163,7 @@ const LiveStartResultSchema = z.object({
     payload_sha256: z.string(),
     opened_at: z.string(),
     expires_at: z.string(),
+    unknown_step_id: z.string().optional(),
   }).nullable(),
   snapshot: SnapshotSchema.nullable(),
   config: z.object({ scopeText: z.string(), followUps: z.number(), maxTotalTokens: z.number() }).passthrough(),
@@ -679,7 +680,18 @@ export class WorkbenchService {
     const run = checked as unknown as PersistedHuntRun;
     const metadata = CaseMetadataSchema.parse(await this.#deps.sidecar.request("case.metadata", { case_id: run.case_id }));
     if (metadata.case_id !== run.case_id) throw new Error("Daemon returned metadata for a different case.");
-    const handoffs = Object.values(run.reviewed_handoffs);
+    const handoffs = Object.values(run.reviewed_handoffs).filter(
+      (handoff) => checked.open_gate?.gate !== "scope" || handoff.step_id !== "scope",
+    );
+    const scopeHandoff = HandoffSchema.safeParse(run.results["scope"]?.handoff);
+    if (checked.open_gate?.gate === "scope" && scopeHandoff.success &&
+        scopeHandoff.data.step_id === "scope" && scopeHandoff.data.case_id === run.case_id) {
+      handoffs.push(scopeHandoff.data);
+    }
+    const unknownStepId = run.open_gate?.unknown_step_id;
+    const unverified = HandoffSchema.safeParse(unknownStepId ? run.results[unknownStepId]?.unverified_handoff : undefined);
+    const reconcileHandoff = unverified.success && unverified.data.step_id === unknownStepId &&
+      unverified.data.case_id === run.case_id ? unverified.data : undefined;
     const incidentHandoff = HandoffSchema.safeParse(run.results["incident"]?.handoff);
     if (checked.open_gate?.gate === "incident" && incidentHandoff.success && incidentHandoff.data.step_id === "incident") {
       const index = handoffs.findIndex((h) => h.step_id === incidentHandoff.data.step_id);
@@ -703,8 +715,7 @@ export class WorkbenchService {
     };
     let gate: ReturnType<typeof projectLiveGate> | null = null;
     if (checked.open_gate) {
-      // Scope text is part of hunt.status (the text the daemon digested); incident and reconcile
-      // context (citations, cited records, dispatch receipts) comes from hunt.gateContext.
+      // Incident and reconcile context comes from hunt.gateContext.
       let rawContext: unknown = null;
       if (checked.open_gate.gate !== "scope") {
         try {
@@ -716,7 +727,7 @@ export class WorkbenchService {
       if (checked.open_gate.gate === "incident" && (!incidentHandoff.success || incidentHandoff.data.step_id !== "incident")) {
         rawContext = new Error("The incident handoff is unavailable or invalid.");
       }
-      gate = projectLiveGate(run.run_id, checked.open_gate, handoffs, rawContext, run.config.scopeText);
+      gate = projectLiveGate(run.run_id, checked.open_gate, handoffs, rawContext, run.config.scopeText, reconcileHandoff);
     }
     const snapshot: WorkbenchSnapshot = {
       provenanceMode: "live_daemon",

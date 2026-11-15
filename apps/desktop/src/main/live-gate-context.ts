@@ -210,8 +210,8 @@ function citedReferences(handoffs: readonly Handoff[]) {
 
 /**
  * Builds the active gate prompt (and incident evidence) from `hunt.status`'s open gate plus the
- * `hunt.gateContext` result. `rawContext` is the RPC result, or the Error the RPC failed with. Scope
- * gates use `statusScopeText` (hunt.status `config.scopeText`, the text the scope digest covers).
+ * `hunt.gateContext` result. `rawContext` is the RPC result, or the Error the RPC failed with.
+ * Scope gates show both the operator's original text and the generated handoff.
  */
 export function projectLiveGate(
   runId: string,
@@ -219,6 +219,7 @@ export function projectLiveGate(
   handoffs: readonly Handoff[],
   rawContext: unknown,
   statusScopeText?: string,
+  reconcileHandoff?: Handoff,
 ): LiveGateProjection {
   const base: ActiveGatePrompt = {
     gate: openGate.gate,
@@ -239,8 +240,10 @@ export function projectLiveGate(
 
   if (openGate.gate === "scope") {
     const text = statusScopeText?.trim() ? statusScopeText : undefined;
+    const scopeHandoff = handoffs.find((h) => h.step_id === "scope");
     if (!text) return fail("hunt.status has no scope text for the open scope gate");
-    return { activeGate: { ...base, scopeText: text }, citationReceipt: null, evidenceCatalog: {}, events: [], citationStatus: new Map() };
+    if (!scopeHandoff) return fail("The scope handoff is unavailable or invalid.");
+    return { activeGate: { ...base, scopeText: text, scopeHandoff }, citationReceipt: null, evidenceCatalog: {}, events: [], citationStatus: new Map() };
   }
 
   if (rawContext instanceof Error) {
@@ -284,7 +287,8 @@ export function projectLiveGate(
     }
     // citation_source_unavailable: the reason itself is the context; show what could and could not be checked.
     if (reconcile.evidence_truncated) return fail("Reconcile evidence is truncated; the full decision context is unavailable.");
-    const projected = projectEvidence(handoffs, reconcile.evidence, reconcile.evidence_truncated ?? false, reconcile.citation_receipt.verified);
+    if (!reconcileHandoff) return fail("The unverified handoff for the affected step is unavailable.");
+    const projected = projectEvidence([reconcileHandoff], reconcile.evidence, reconcile.evidence_truncated ?? false, reconcile.citation_receipt.verified);
     if (projected.uncovered) {
       return fail(`gate context does not cover cited ids: ${projected.uncovered.slice(0, 5).join(", ")}`);
     }

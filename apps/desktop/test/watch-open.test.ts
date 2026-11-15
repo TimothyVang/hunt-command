@@ -179,7 +179,11 @@ describe("WorkbenchService live runs", () => {
   const run = (runId: string) => ({
     run_id: runId, case_id: input.caseId, data_origin: "synthetic", synthetic_only: true,
     wave: "scope", wave_index: 0, status: "awaiting_gate", reason_code: null,
-    step_states: {}, results: {}, reviewed_handoffs: {}, decisions: [],
+    step_states: {}, results: { scope: { step_id: "scope", wave: "scope", profile: "framework-coordinator",
+      status: "done", attempts: 1, finished_at: "2026-01-01T00:00:00Z", handoff: {
+        schema_version: 1, case_id: input.caseId, step_id: "scope", profile: "framework-coordinator",
+        claims: [], reviews: [], disposition: "review_ready", limitations: [], requested_decisions: [],
+      } } }, reviewed_handoffs: {}, decisions: [],
     token_ledger: { max_total_tokens: 100_000, consumed_total_tokens: 300, rejections_tokens: 0,
       actual_billed_usd: 0, shadow_api_usd: 0, cache_savings_usd: 0 },
     open_gate: { gate: "scope", payload_sha256: "a".repeat(64),
@@ -205,7 +209,8 @@ describe("WorkbenchService live runs", () => {
     const snapshot = await service.startRun(input);
     expect(snapshot).toMatchObject({ huntId: id, provenanceMode: "live_daemon", caseMetadata: metadata,
       runStatus: "awaiting_human_gate", activeGate: { payloadSha256: "a".repeat(64) },
-      events: [], handoffs: [], claims: [], snapshot: { entities: [], relations: [] } });
+      events: [], claims: [], snapshot: { entities: [], relations: [] } });
+    expect(snapshot.handoffs.map((handoff) => handoff.step_id)).toEqual(["scope"]);
     expect((await service.getWorkbenchState({ huntId: id })).huntId).toBe(id);
     expect((await service.listRuns()).some((item) => item.huntId === id && item.title === metadata.title)).toBe(true);
     expect(calls.filter((call) => call === "hunt.start")).toHaveLength(1);
