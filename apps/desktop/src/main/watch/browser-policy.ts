@@ -3,7 +3,8 @@
  *
  * TypeScript port of `framework/hunt_lab/browser_policy.py` hardened for Hunt Command v2 (#178 G1.3, #189):
  * - Pinned `127.0.0.1:<port>` loopback origins ONLY (`localhost`, `0.0.0.0`, `[::1]`, and remote hosts refused).
- * - Lab origin: read-only (`GET` only); `X-Hunt-Lab-Secret` injected ONLY on `labOrigin`, stripped everywhere else.
+ * - Lab origin: read-only (`GET` only), with Arkime route and search restrictions also enforced;
+ *   `X-Hunt-Lab-Secret` injected ONLY on `labOrigin`, stripped everywhere else.
  * - Kibana origin: Discover-only (`/app/discover`), `/internal/bsearch` pinned to `hunt-lab-case-events` +
  *   case time window (`ese`/`es` strategies only; ES|QL, SQL, EQL refused), value suggestions forced to `terms_agg`.
  * - Arkime origin: read-only sessions/spiview/spigraph/unique/connections, every `expression` wrapped in
@@ -173,6 +174,9 @@ export function createWatchScope(input: CreateWatchScopeInput): WatchScope {
       throw new Error(
         `WatchScope kibanaOrigin must be a pinned 127.0.0.1:<port> URL (got '${input.kibanaOrigin}')`,
       );
+    }
+    if (kibanaOrigin === labOrigin || kibanaOrigin === arkimeOrigin) {
+      throw new Error("WatchScope kibanaOrigin must be distinct from labOrigin and arkimeOrigin");
     }
   }
   const startSec = Math.floor(input.startSec);
@@ -577,15 +581,15 @@ export function decideWatchRequest(
     if (!source) {
       return { block: "origin_not_lab" };
     }
-    if (source === scope.labOrigin) {
-      return method === "GET" ? ALLOW_VERDICT : { block: "lab_read_only" };
-    }
     const parsedUrl = new URL(url);
     if (scope.kibanaOrigin !== null && source === scope.kibanaOrigin) {
       return decideKibanaRequest(scope, method, parsedUrl, body);
     }
-    if (source !== scope.arkimeOrigin) {
+    if (source !== scope.labOrigin && source !== scope.arkimeOrigin) {
       return { block: "origin_not_lab" };
+    }
+    if (source === scope.labOrigin && method !== "GET") {
+      return { block: "lab_read_only" };
     }
 
     let decodedPath: string;
@@ -599,7 +603,7 @@ export function decideWatchRequest(
     }
 
     const isSearchRoute = ARKIME_SEARCH_PREFIXES.some((prefix) =>
-      parsedUrl.pathname.startsWith(prefix),
+      decodedPath.startsWith(prefix),
     );
     const queryPairs = parseQueryPairs(parsedUrl.search);
     const searchKeySet = new Set<string>(SEARCH_KEYS);

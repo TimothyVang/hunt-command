@@ -6,6 +6,9 @@ import type { ProfileId } from "@hunt-command/shared";
 import { EmbeddedHuntDataPlane } from "@hunt-command/data-plane";
 import {
   CaseDataPlanePort,
+  DurableStateStore,
+  GateAuthority,
+  HuntWaveEngine,
   InMemoryTelemetrySink,
   RoleCapabilityAuthority,
   buildSessionCustomTools,
@@ -96,6 +99,69 @@ class SearchOnceRunner implements ModelRunnerPort {
 }
 
 describe("default serve data plane", () => {
+  test("case.metadata returns the resolved case metadata and propagates missing cases", async () => {
+    const runtimeDir = makeTmpDir("hunt-port-rt-");
+    const c = captureIo();
+    const code = await runHuntCli(["serve", "--runtime-dir", runtimeDir, "--cases-dir", casesDir], c.io, {
+      stdin: linesOf(
+        JSON.stringify({ jsonrpc: "2.0", id: "meta", method: "case.metadata", params: { case_id: CASE_ID } }),
+        JSON.stringify({ jsonrpc: "2.0", id: "missing", method: "case.metadata", params: { case_id: "missing-case" } }),
+      ),
+    });
+    expect(code).toBe(0);
+    const responses = c.out.join("").trim().split("\n").map((line) => JSON.parse(line));
+    expect(responses.find((r) => r.id === "meta").result).toMatchObject({
+      case_id: CASE_ID,
+      data_origin: "synthetic",
+      synthetic_only: true,
+      sources: ["events.jsonl"],
+    });
+    expect(responses.find((r) => r.id === "missing").error.error_code).toBe("not_found");
+  });
+
+  test("serve dispatches status and cancel while start is running and drains before shutdown", async () => {
+    const runtimeDir = makeTmpDir("hunt-port-rt-");
+    const running = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    class BlockingRunner extends SearchOnceRunner {
+      public override async runTurn(_request: ModelTurnRequest): Promise<StepTurnResult> {
+        running.resolve();
+        await released.promise;
+        return { status: "cancelled", reason_code: "global_stop", output_text: "" };
+      }
+    }
+    const out: string[] = [];
+    const io = {
+      writeStdout: (line: string) => {
+        out.push(line);
+        if (JSON.parse(line).id === "cancel") released.resolve();
+      },
+      writeStderr: (_line: string) => {},
+    };
+    async function* requests(): AsyncGenerator<string> {
+      yield JSON.stringify({ jsonrpc: "2.0", id: "start", method: "hunt.start", params: {
+        run_id: "hunt-concurrent", case_id: CASE_ID, scope: "Synthetic scope.",
+      } }) + "\n";
+      await running.promise;
+      yield [
+        { jsonrpc: "2.0", id: "status", method: "hunt.status", params: { run_id: "hunt-concurrent" } },
+        { jsonrpc: "2.0", id: "duplicate", method: "hunt.start", params: {
+          run_id: "hunt-concurrent", case_id: CASE_ID, scope: "Synthetic scope.",
+        } },
+        { jsonrpc: "2.0", id: "cancel", method: "hunt.cancel", params: { run_id: "hunt-concurrent" } },
+      ].map((request) => JSON.stringify(request)).join("\n") + "\n";
+    }
+    expect(await runHuntCli(["serve", "--runtime-dir", runtimeDir, "--cases-dir", casesDir], io, {
+      modelRunner: new BlockingRunner(),
+      stdin: requests(),
+    })).toBe(0);
+    const responses = out.map((line) => JSON.parse(line));
+    expect(responses.find((r) => r.id === "status").result.status).toBe("running");
+    expect(responses.find((r) => r.id === "cancel").result.status).toBe("cancelled");
+    expect(responses.find((r) => r.id === "duplicate").error.message).toContain("already exists");
+    expect(responses.find((r) => r.id === "start").result.status).toBe("cancelled");
+  });
+
   test("serve with no injected factory resolves <cases-dir>/<caseId> and runs hunt.start against it", async () => {
     const runtimeDir = makeTmpDir("hunt-port-rt-");
     const runner = new SearchOnceRunner();
@@ -146,6 +212,122 @@ describe("default serve data plane", () => {
         });
       }
     } finally {
+      await resolver.close();
+    }
+  });
+
+  test("rejects a case pack whose identity differs from the requested directory and retries after repair", async () => {
+    const root = makeTmpDir("hunt-port-mismatch-");
+    const requested = "requested-case";
+    const caseDir = path.join(root, requested);
+    fs.cpSync(path.join(casesDir, CASE_ID), caseDir, { recursive: true });
+    const resolver = createCaseDirDataPlaneResolver({ casesDir: root, cacheDir: makeTmpDir("hunt-port-cache-") });
+    try {
+      for (let i = 0; i < 2; i++) {
+        await expect(Promise.resolve().then(() => resolver.resolve(requested))).rejects.toMatchObject({
+          errorCode: "case_mismatch",
+        });
+      }
+      const caseJson = path.join(caseDir, "case.json");
+      const metadata = JSON.parse(fs.readFileSync(caseJson, "utf8"));
+      fs.writeFileSync(caseJson, JSON.stringify({ ...metadata, case_id: requested }));
+      const port = await resolver.resolve(requested);
+      expect(port.caseMetadata.case_id).toBe(requested);
+    } finally {
+      await resolver.close();
+    }
+  });
+
+  test("gate resume rejects a replaced case pack without recording the decision", async () => {
+    const root = makeTmpDir("hunt-port-resume-");
+    const caseDir = path.join(root, CASE_ID);
+    fs.cpSync(path.join(casesDir, CASE_ID), caseDir, { recursive: true });
+    const cacheDir = makeTmpDir("hunt-port-cache-");
+    const dbPath = path.join(root, "state.sqlite");
+    const decisionsDir = path.join(root, "decisions");
+    const runner: ModelRunnerPort = {
+      getPinnedModelForRole: () => ({ provider: "stub", model: "stub-model", fallback_providers: [] }),
+      preflightWave: async () => {},
+      runTurn: async (req) => ({
+        status: "completed",
+        output_text: JSON.stringify({
+          schema_version: 1,
+          case_id: req.caseId,
+          step_id: req.stepId,
+          profile: req.profile,
+          claims: [{
+            claim_id: `${req.stepId}:c1`,
+            kind: "observed",
+            statement: "Synthetic event observed.",
+            evidence_ids: ["events.jsonl"],
+            entity_ids: [],
+            contradicts: [],
+          }],
+          reviews: [],
+          disposition: "review_ready",
+          limitations: [],
+          requested_decisions: [],
+        }),
+        usage: {
+          input_tokens: 100,
+          output_tokens: 50,
+          cache_read_tokens: 0,
+          cache_write_tokens: 0,
+          total_tokens: 150,
+          turns: 1,
+          provider: "stub",
+          model: "stub-model",
+          billing_mode: "oauth_subscription",
+          actual_billed_usd: 0,
+          shadow_api_usd: 0,
+          cache_savings_usd: 0,
+        },
+      }),
+    };
+    const firstResolver = createCaseDirDataPlaneResolver({ casesDir: root, cacheDir });
+    const firstStore = new DurableStateStore(dbPath);
+    const firstGates = new GateAuthority({ stateStore: firstStore, decisionsDir });
+    const firstEngine = new HuntWaveEngine({ stateStore: firstStore, gateAuthority: firstGates, modelRunner: runner });
+    let parked: PersistedHuntRun;
+    try {
+      parked = await firstEngine.startHunt({
+        runId: "hunt-case-mismatch",
+        scopeText: "Synthetic scope.",
+        dataPlane: await firstResolver.resolve(CASE_ID),
+        followUps: 0,
+      });
+      expect(parked.open_gate?.gate).toBe("scope");
+    } finally {
+      firstStore.close();
+      await firstResolver.close();
+    }
+    const sessionAuthority = firstGates.sessionAuthority;
+
+    const caseJson = path.join(caseDir, "case.json");
+    const metadata = JSON.parse(fs.readFileSync(caseJson, "utf8"));
+    fs.writeFileSync(caseJson, JSON.stringify({ ...metadata, case_id: "different-case" }));
+    const resolver = createCaseDirDataPlaneResolver({ casesDir: root, cacheDir });
+    const store = new DurableStateStore(dbPath);
+    const gates = new GateAuthority({ stateStore: store, decisionsDir, sessionAuthority });
+    const engine = new HuntWaveEngine({ stateStore: store, gateAuthority: gates, modelRunner: runner, resolveDataPlane: resolver.resolve });
+    try {
+      await expect(engine.submitGateDecision({
+        decisionId: "decision-case-mismatch",
+        huntId: "hunt-case-mismatch",
+        gate: "scope",
+        action: "approve",
+        via: "cli",
+        operatorToken: sessionAuthority.issueToken("alice", "analyst"),
+        payloadSha256: parked.open_gate!.payload_sha256,
+        checkNote: "Scope verified.",
+      })).rejects.toMatchObject({ errorCode: "case_mismatch" });
+      const untouched = store.getRun("hunt-case-mismatch")!;
+      expect(untouched.status).toBe("awaiting_gate");
+      expect(untouched.open_gate?.gate).toBe("scope");
+      expect(untouched.decisions).toHaveLength(0);
+      expect(fs.existsSync(gates.decisionsLogPath)).toBe(false);
+    } finally {
+      store.close();
       await resolver.close();
     }
   });

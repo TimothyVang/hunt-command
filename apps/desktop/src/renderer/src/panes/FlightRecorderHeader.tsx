@@ -21,7 +21,6 @@ export interface FlightRecorderHeaderProps {
   onSelectWave: (waveNumber: number | null) => void;
   onToggleGantt: () => void;
   onSelectSpan: (span: GanttSpanRecord) => void;
-  onSwitchPresetRun: (huntId: string) => void;
   onGlobalStop: () => void;
   onExportReport: () => void;
   onRecordFilm: () => void;
@@ -53,7 +52,6 @@ export function FlightRecorderHeader({
   onSelectWave,
   onToggleGantt,
   onSelectSpan,
-  onSwitchPresetRun,
   onGlobalStop,
   onExportReport,
   onRecordFilm,
@@ -130,18 +128,6 @@ export function FlightRecorderHeader({
 
         {/* Live Telemetry Gauges + Global Stop */}
         <div className="flex items-center gap-2">
-          {!isFilmMode && (
-            <select
-              aria-label="Select Active Hunt Run"
-              value={workbench.huntId}
-              onChange={(e) => onSwitchPresetRun(e.target.value)}
-              className="rounded border border-slate-700 bg-slate-900 px-2 py-1 font-mono text-[11px] text-slate-200 focus:border-cyan-500 focus:outline-none"
-            >
-              <option value="hunt-20261115-nv01">nv01 · Gate 2 Incident (Synthetic)</option>
-              <option value="hunt-20261115-scope-work">nv01 · Gate 1 Scope (Work-Export)</option>
-              <option value="hunt-20261115-reconcile">nv01 · Reconcile Crash Recovery</option>
-            </select>
-          )}
 
           {/* Prompt-Cache Hit % Gauge */}
           <div

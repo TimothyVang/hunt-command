@@ -11,8 +11,13 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import {
   AuthenticatedGateDecisionSchema,
+  CaseMetadataSchema,
+  HUNT_WAVES,
+  HandoffSchema,
+  SnapshotSchema,
   type AuthenticatedGateDecision,
   type ProfileId,
   type RuntimePaths,
@@ -47,6 +52,7 @@ import type {
   WatchBrowserState,
   WorkbenchSnapshot,
 } from "../shared/workbench-types.ts";
+import type { PersistedHuntRun } from "../../../../packages/daemon/src/state-store.ts";
 import type { HuntDaemonSidecar } from "./daemon/daemon-sidecar.ts";
 import { exportCustomerReport } from "./export/report-exporter.ts";
 import { resolveFfmpegBinary } from "./film/cfr-editor.ts";
@@ -83,6 +89,7 @@ export interface WorkbenchServiceDeps {
   watchHandlers?: {
     getState: () => WatchBrowserState;
     setBounds: (bounds: { x: number; y: number; width: number; height: number } | null) => WatchBrowserState;
+    invalidate: () => void;
     navigate: (runId: string, role: ProfileId, url: string) => Promise<WatchBrowserState>;
     open: (input: WatchOpenInput) => Promise<WatchBrowserState>;
   };
@@ -131,10 +138,40 @@ function buildStepTranscriptText(snapshot: WorkbenchSnapshot, stepId: string): s
 
   return `${stripControlAndBidiChars(lines.join("\n"))}\n`;
 }
+const LiveStartResultSchema = z.object({
+  run_id: z.string().min(1),
+  case_id: z.string().min(1),
+  status: z.enum(["running", "awaiting_gate", "completed", "failed", "cancelled"]),
+  wave: z.enum(HUNT_WAVES),
+  wave_index: z.number().int().nonnegative(),
+  step_states: z.record(z.string()),
+  results: z.record(z.unknown()),
+  reviewed_handoffs: z.record(HandoffSchema),
+  decisions: z.array(AuthenticatedGateDecisionSchema),
+  token_ledger: z.object({
+    max_total_tokens: z.number(),
+    consumed_total_tokens: z.number(),
+    rejections_tokens: z.number(),
+    actual_billed_usd: z.number(),
+    shadow_api_usd: z.number(),
+    cache_savings_usd: z.number(),
+  }).passthrough(),
+  open_gate: z.object({
+    gate: z.enum(["scope", "incident", "reconcile"]),
+    payload_sha256: z.string(),
+    opened_at: z.string(),
+    expires_at: z.string(),
+  }).nullable(),
+  snapshot: SnapshotSchema.nullable(),
+  config: z.object({ scopeText: z.string(), followUps: z.number(), maxTotalTokens: z.number() }).passthrough(),
+}).passthrough();
+
 
 export class WorkbenchService {
   readonly #deps: WorkbenchServiceDeps;
   readonly #runs = new Map<string, WorkbenchSnapshot>();
+  readonly #liveRunIds = new Set<string>();
+  #selectionVersion = 0;
   #activeHuntId: string;
 
   constructor(deps: WorkbenchServiceDeps) {
@@ -172,13 +209,11 @@ export class WorkbenchService {
 
   async listRuns(): Promise<RunSummaryItem[]> {
     if (this.#deps.sidecar.isLiveReady) {
-      try {
-        const liveRuns = await this.#deps.sidecar.request<RunSummaryItem[]>("hunt.listRuns");
-        if (Array.isArray(liveRuns) && liveRuns.length > 0) {
-          return liveRuns;
-        }
-      } catch {
-        // Fall back to local state store if RPC method is unavailable.
+      const result = await this.#deps.sidecar.request<{ runs: unknown[] }>("hunt.list");
+      for (const raw of result.runs) {
+        const run = LiveStartResultSchema.parse(raw);
+        this.#liveRunIds.add(run.run_id);
+        await this.#liveSnapshot(raw);
       }
     }
 
@@ -193,6 +228,7 @@ export class WorkbenchService {
   }
 
   async getWorkbenchState(rawPayload?: unknown): Promise<WorkbenchSnapshot> {
+    const selection = ++this.#selectionVersion;
     const requestedHuntId =
       typeof rawPayload === "object" &&
       rawPayload !== null &&
@@ -201,19 +237,12 @@ export class WorkbenchService {
         ? (rawPayload as { huntId: string }).huntId
         : this.#activeHuntId;
 
-    if (this.#deps.sidecar.isLiveReady) {
-      try {
-        const liveSnap = await this.#deps.sidecar.request<WorkbenchSnapshot>("hunt.getWorkbenchState", {
-          huntId: requestedHuntId,
-        });
-        if (liveSnap && typeof liveSnap.huntId === "string") {
-          this.#runs.set(liveSnap.huntId, liveSnap);
-          this.#activeHuntId = liveSnap.huntId;
-          return this.#attachWatchState(liveSnap);
-        }
-      } catch {
-        // Fall through to cached/fixture run when daemon does not hold this huntId.
-      }
+    if (this.#liveRunIds.has(requestedHuntId) || !this.#runs.has(requestedHuntId)) {
+      const run = await this.#deps.sidecar.request("hunt.status", { run_id: requestedHuntId });
+      const snap = await this.#liveSnapshot(run);
+      if (snap.huntId !== requestedHuntId) throw new Error("Daemon returned a different run ID.");
+      if (selection === this.#selectionVersion) this.#selectHunt(snap.huntId);
+      return this.#attachWatchState(snap);
     }
 
     const snap =
@@ -221,7 +250,7 @@ export class WorkbenchService {
       this.#runs.get(this.#activeHuntId) ??
       buildFixtureWorkbenchSnapshot({ huntId: requestedHuntId });
     this.#runs.set(snap.huntId, snap);
-    this.#activeHuntId = snap.huntId;
+    if (selection === this.#selectionVersion) this.#selectHunt(snap.huntId);
     return this.#attachWatchState(snap);
   }
 
@@ -229,16 +258,41 @@ export class WorkbenchService {
     const parsed = StartRunInputSchema.parse(rawInput);
 
     if (this.#deps.sidecar.isLiveReady) {
-      try {
-        const started = await this.#deps.sidecar.request<WorkbenchSnapshot>("hunt.startRun", parsed);
-        if (started && typeof started.huntId === "string") {
-          this.#runs.set(started.huntId, started);
-          this.#activeHuntId = started.huntId;
-          return this.#attachWatchState(started);
-        }
-      } catch {
-        // Fall through to local Gate 1 scope run creation when daemon is in standby.
+      const metadata = CaseMetadataSchema.parse(await this.#deps.sidecar.request("case.metadata", { case_id: parsed.caseId }));
+      if (metadata.case_id !== parsed.caseId || metadata.data_origin !== parsed.dataOrigin) {
+        throw new Error("Selected data origin does not match the daemon case metadata.");
       }
+      const runId = randomUUID();
+      this.#liveRunIds.add(runId);
+      let response: unknown;
+      try {
+        response = await this.#deps.sidecar.request("hunt.start", {
+          run_id: runId,
+          case_id: parsed.caseId,
+          scope: parsed.scope,
+          follow_ups: parsed.followUps,
+          max_total_tokens: parsed.maxTotalTokens,
+        });
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes("timed out")) {
+          throw new Error(`Start failed or its outcome is unknown for hunt '${runId}': ${error instanceof Error ? error.message : String(error)}`);
+        }
+        try {
+          response = await this.#deps.sidecar.request("hunt.status", { run_id: runId });
+        } catch {
+          throw new Error(`Start outcome is unknown for hunt '${runId}'. Check this run ID before starting another hunt.`);
+        }
+      }
+      let snapshot: WorkbenchSnapshot;
+      try {
+        const started = LiveStartResultSchema.parse(response);
+        if (started.run_id !== runId) throw new Error("Daemon returned a different run ID.");
+        snapshot = await this.#liveSnapshot(response);
+      } catch (error) {
+        throw new Error(`Hunt '${runId}' may have started but its workbench could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.#selectHunt(runId);
+      return this.#attachWatchState(snapshot);
     }
 
     const newHuntId = `hunt-${Date.now().toString(36)}-${parsed.caseId.slice(0, 16)}`;
@@ -253,17 +307,16 @@ export class WorkbenchService {
       created.activeGate.scopeSummary.followUpCount = parsed.followUps;
     }
     this.#runs.set(newHuntId, created);
-    this.#activeHuntId = newHuntId;
+    this.#selectHunt(newHuntId);
     return this.#attachWatchState(created);
   }
 
   async globalStop(rawInput: unknown): Promise<WorkbenchSnapshot> {
     const parsed = GlobalStopInputSchema.parse(rawInput);
 
-    if (this.#deps.sidecar.isLiveReady) {
-      await this.#deps.sidecar
-        .request("hunt.globalStop", { huntId: parsed.huntId, reason: parsed.reason })
-        .catch(() => {});
+    if (this.#liveRunIds.has(parsed.huntId)) {
+      await this.#deps.sidecar.request("hunt.cancel", { run_id: parsed.huntId, reason: parsed.reason });
+      return await this.getWorkbenchState({ huntId: parsed.huntId });
     }
 
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
@@ -285,6 +338,26 @@ export class WorkbenchService {
   async submitGateDecision(rawInput: unknown): Promise<WorkbenchSnapshot> {
     const parsed = SubmitGateDecisionInputSchema.parse(rawInput);
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
+    if (current.provenanceMode === "live_daemon") {
+      if (!parsed.operatorToken?.trim()) throw new Error("An operator token is required for a live gate decision.");
+      try {
+        await this.#deps.sidecar.request("hunt.decideGate", {
+          hunt_id: parsed.huntId,
+          gate: parsed.gate,
+          action: parsed.action,
+          via: "desktop",
+          operator_token: parsed.operatorToken,
+          payload_sha256: parsed.payloadSha256,
+          check_note: parsed.checkNote,
+        });
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("timed out")) {
+          throw new Error(`Gate decision outcome is unknown for hunt '${parsed.huntId}'. Refresh the run before submitting again.`);
+        }
+        throw error;
+      }
+      return await this.getWorkbenchState({ huntId: parsed.huntId });
+    }
 
     if (!current.activeGate || current.activeGate.gate !== parsed.gate) {
       throw new Error(`No active '${parsed.gate}' gate is currently open for hunt '${parsed.huntId}'.`);
@@ -324,20 +397,6 @@ export class WorkbenchService {
       "utf8",
     );
 
-    if (this.#deps.sidecar.isLiveReady) {
-      try {
-        const liveNext = await this.#deps.sidecar.request<WorkbenchSnapshot>(
-          "hunt.submitGateDecision",
-          { decision },
-        );
-        if (liveNext && typeof liveNext.huntId === "string") {
-          this.#runs.set(liveNext.huntId, liveNext);
-          return this.#attachWatchState(liveNext);
-        }
-      } catch {
-        // Apply state transition locally if daemon RPC is in standby.
-      }
-    }
 
     let nextSnap: WorkbenchSnapshot;
     if (parsed.action === "reject") {
@@ -382,12 +441,8 @@ export class WorkbenchService {
     const parsed = InspectTranscriptInputSchema.parse(rawInput);
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
 
-    if (this.#deps.sidecar.isLiveReady) {
-      try {
-        return await this.#deps.sidecar.request<TranscriptPageSlice>("hunt.inspectTranscriptPage", parsed);
-      } catch {
-        // Fall back to deterministic step slice.
-      }
+    if (current.provenanceMode === "live_daemon") {
+      return await this.#deps.sidecar.request<TranscriptPageSlice>("hunt.inspectTranscriptPage", parsed);
     }
 
     const fullText = buildStepTranscriptText(current, parsed.stepId);
@@ -494,23 +549,13 @@ export class WorkbenchService {
 
   getWatchState(): WatchBrowserState {
     if (this.#deps.watchHandlers) {
-      return this.#deps.watchHandlers.getState();
+      const state = this.#deps.watchHandlers.getState();
+      if (state.runId === this.#activeHuntId) return state;
+      return this.#standbyWatchState(this.#activeHuntId);
     }
     const snap = this.#runs.get(this.#activeHuntId);
     return (
-      snap?.watchState ?? {
-        enabled: false,
-        runId: this.#activeHuntId,
-        role: "framework-researcher",
-        partition: `hunt-watch:${this.#activeHuntId}:framework-researcher`,
-        currentUrl: "about:blank",
-        title: "Watch Browser (Standby)",
-        loading: false,
-        allowedOrigins: [],
-        blockedRequestCount: 0,
-        lastBlockedReason: null,
-        cdpEndpointUrl: null,
-      }
+      snap?.watchState ?? this.#standbyWatchState(this.#activeHuntId)
     );
   }
 
@@ -519,11 +564,23 @@ export class WorkbenchService {
     if (!this.#deps.watchHandlers) {
       return this.getWatchState();
     }
-    return this.#deps.watchHandlers.setBounds(parsed.bounds);
+    if (parsed.bounds && (parsed.runId !== this.#activeHuntId ||
+      this.#deps.watchHandlers.getState().runId !== parsed.runId)) {
+      throw new Error("Watch bounds do not belong to the active hunt.");
+    }
+    this.#deps.watchHandlers.setBounds(parsed.bounds);
+    return this.getWatchState();
   }
 
   async openWatch(rawInput: unknown): Promise<WatchBrowserState> {
     const parsed = WatchOpenInputSchema.parse(rawInput);
+    if (parsed.runId !== this.#activeHuntId) {
+      throw new Error("Watch session does not belong to the active hunt.");
+    }
+    const current = this.#runs.get(this.#activeHuntId);
+    if (!current || parsed.caseId !== current.caseMetadata.case_id) {
+      throw new Error("Watch case does not match the active hunt.");
+    }
     if (!this.#deps.watchHandlers) {
       throw new Error("Watch Browser controller is not attached in headless test mode.");
     }
@@ -532,6 +589,9 @@ export class WorkbenchService {
 
   async navigateWatch(rawInput: unknown): Promise<WatchBrowserState> {
     const parsed = WatchNavigateInputSchema.parse(rawInput);
+    if (parsed.runId !== this.#activeHuntId) {
+      throw new Error("Watch session does not belong to the active hunt.");
+    }
     if (!this.#deps.watchHandlers) {
       throw new Error("Watch Browser controller is not attached in headless test mode.");
     }
@@ -595,13 +655,127 @@ export class WorkbenchService {
     return { deleted: true, ref: parsed.ref };
   }
 
-  #attachWatchState(snapshot: WorkbenchSnapshot): WorkbenchSnapshot {
-    if (!this.#deps.watchHandlers) {
-      return snapshot;
+  async #liveSnapshot(raw: unknown): Promise<WorkbenchSnapshot> {
+    const checked = LiveStartResultSchema.parse(raw);
+    const run = checked as unknown as PersistedHuntRun;
+    const metadata = CaseMetadataSchema.parse(await this.#deps.sidecar.request("case.metadata", { case_id: run.case_id }));
+    if (metadata.case_id !== run.case_id) throw new Error("Daemon returned metadata for a different case.");
+    const handoffs = Object.values(run.reviewed_handoffs);
+    const reviews = handoffs.flatMap((handoff) => handoff.reviews);
+    const waveNumber = (wave: string): 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 =>
+      Math.max(1, Math.min(8, HUNT_WAVES.indexOf(wave as typeof HUNT_WAVES[number]) + 1)) as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+    const receipt = run.citation_receipt;
+    const missingCount = receipt
+      ? receipt.missing_event_ids.length + receipt.missing_frame_ids.length + receipt.missing_ioc_ids.length + receipt.ambiguous_ids.length
+      : 0;
+    const citationReceipt = {
+      totalCited: receipt?.total_checked ?? 0,
+      verifiedCount: receipt ? Math.max(0, receipt.total_checked - missingCount - receipt.out_of_scope_ids.length) : 0,
+      unresolvedCount: missingCount,
+      outOfScopeCount: receipt?.out_of_scope_ids.length ?? 0,
+      allVerified: receipt?.verified ?? false,
+      entries: [],
+    };
+    const snapshot: WorkbenchSnapshot = {
+      provenanceMode: "live_daemon",
+      huntId: run.run_id,
+      runStatus: run.status === "awaiting_gate" ? "awaiting_human_gate" : run.status === "cancelled" ? "stopped" : run.status,
+      caseMetadata: metadata,
+      currentWaveNumber: waveNumber(run.wave),
+      mergeFallbackActive: false,
+      gauges: {
+        totalTokensUsed: run.token_ledger.consumed_total_tokens,
+        handoffRejectionTokens: run.token_ledger.rejections_tokens,
+        maxTotalTokens: run.token_ledger.max_total_tokens,
+        promptCacheHitRatio: 0,
+        cacheBelowTarget: false,
+        billingMode: Object.values(run.results).find((result) => result.usage)?.usage?.billing_mode ?? "oauth_subscription",
+        actualBilledUsd: run.token_ledger.actual_billed_usd,
+        shadowApiUsd: run.token_ledger.shadow_api_usd,
+        cacheSavingsUsd: run.token_ledger.cache_savings_usd,
+        cyberRefusalCount: Object.values(run.results).filter((result) => result.refusal?.refused).length,
+      },
+      steps: Object.values(run.results).map((result) => ({
+        stepId: result.step_id,
+        waveNumber: waveNumber(result.wave),
+        wave: result.wave,
+        profile: result.profile,
+        state: run.step_states[result.step_id] ?? "done",
+        ...(result.reason_code ? { reasonCode: result.reason_code } : {}),
+        model: result.usage?.model ?? "",
+        turnsUsed: result.usage?.turns ?? 0,
+        maxTurns: 0,
+        inputTokens: result.usage?.input_tokens ?? 0,
+        outputTokens: result.usage?.output_tokens ?? 0,
+        cacheReadTokens: result.usage?.cache_read_tokens ?? 0,
+        cacheWriteTokens: result.usage?.cache_write_tokens ?? 0,
+        totalTokens: result.usage?.total_tokens ?? 0,
+        ...(result.refusal ? { refusal: result.refusal } : {}),
+        endedAtIso: result.finished_at,
+      })),
+      ganttSpans: [],
+      activeGate: run.open_gate ? {
+        gate: checked.open_gate!.gate,
+        huntId: run.run_id,
+        openedAtIso: run.open_gate.opened_at,
+        expiresAtIso: run.open_gate.expires_at,
+        payloadSha256: run.open_gate.payload_sha256,
+        ...(run.open_gate.gate === "scope" ? { scopeText: run.config.scopeText } : {}),
+      } : null,
+      gateHistory: run.decisions,
+      claims: handoffs.flatMap((handoff) => handoff.claims.map((claim) => ({
+        claim,
+        stepId: handoff.step_id,
+        waveNumber: waveNumber(run.results[handoff.step_id]?.wave ?? run.wave),
+        profile: handoff.profile,
+        inlineCitations: [],
+        reviews: reviews.filter((review) => review.claim_ids.includes(claim.claim_id)),
+      }))),
+      limitations: handoffs.flatMap((handoff) => handoff.limitations.map((text) => ({
+        stepId: handoff.step_id, profile: handoff.profile, text,
+      }))),
+      handoffs,
+      snapshot: run.snapshot ?? { schema_version: 1, case_id: run.case_id, entities: [], relations: [] },
+      citationReceipt,
+      histogram: { bucketTimestampsSec: [], ecsEventCounts: [], networkFlowCounts: [], intervalSec: 60 },
+      events: [], arkimeFlows: [], packets: [], evidenceCatalog: {},
+      watchState: this.#standbyWatchState(run.run_id),
+    };
+    this.#liveRunIds.add(run.run_id);
+    this.#runs.set(run.run_id, snapshot);
+    return snapshot;
+  }
+
+  #selectHunt(huntId: string): void {
+    if (this.#activeHuntId !== huntId) {
+      this.#deps.watchHandlers?.invalidate();
+      this.#activeHuntId = huntId;
     }
+  }
+
+  #standbyWatchState(runId: string): WatchBrowserState {
+    return {
+      enabled: false,
+      runId,
+      role: "framework-researcher",
+      partition: `hunt-watch:${runId}:framework-researcher`,
+      currentUrl: "about:blank",
+      title: "Watch Browser (Standby)",
+      loading: false,
+      allowedOrigins: [],
+      blockedRequestCount: 0,
+      lastBlockedReason: null,
+      cdpEndpointUrl: null,
+    };
+  }
+
+  #attachWatchState(snapshot: WorkbenchSnapshot): WorkbenchSnapshot {
+    if (!this.#deps.watchHandlers) return snapshot;
     return {
       ...snapshot,
-      watchState: this.#deps.watchHandlers.getState(),
+      watchState: snapshot.huntId === this.#activeHuntId
+        ? this.getWatchState()
+        : this.#standbyWatchState(snapshot.huntId),
     };
   }
 }

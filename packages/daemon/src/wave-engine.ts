@@ -663,6 +663,9 @@ export class HuntWaveEngine {
     }
 
     const runId = input.runId?.trim() || `hunt-${crypto.randomUUID()}`;
+    if (this.stateStore.getRun(runId)) {
+      throw new Error(`Hunt run_id '${runId}' already exists`);
+    }
     const now = new Date().toISOString();
 
     const run: PersistedHuntRun = {
@@ -1049,7 +1052,9 @@ export class HuntWaveEngine {
             `${runId}:wave-${run.wave_index + 1}`,
             controller.signal,
           );
+          if (controller.signal.aborted) return this.cancelRun(runId, "global_stop");
         } catch (err) {
+          if (controller.signal.aborted) return this.cancelRun(runId, "global_stop");
           run.status = "failed";
           run.reason_code = "oauth_preflight_failed";
           this.stateStore.saveRun(run);
@@ -1246,6 +1251,9 @@ export class HuntWaveEngine {
       }
 
       return run;
+    } catch (err) {
+      if (controller.signal.aborted) return this.cancelRun(runId, "global_stop");
+      throw err;
     } finally {
       this.activeControllers.delete(runId);
     }
@@ -1682,6 +1690,7 @@ export class HuntWaveEngine {
           diagnostic: turnDiagnostic ?? null,
         });
       }
+      if (params.signal.aborted) return;
 
       if (turnStatus === "cancelled") {
         run.step_states[spec.stepId] = "stopped";

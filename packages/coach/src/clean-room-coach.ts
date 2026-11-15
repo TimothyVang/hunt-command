@@ -1140,24 +1140,12 @@ export function scrubText(
 }
 
 export interface AssertCleanPacketOptions extends BuildForbiddenSetOptions {
-  readonly forbidden?: ReadonlySet<string>;
+  readonly forbidden?: Iterable<string>;
 }
 
 /** A leak guard after `requireLeakGuard`: the resolved, non-empty forbidden vocabulary. */
 export interface ResolvedLeakGuard extends AssertCleanPacketOptions {
   readonly forbidden: ReadonlySet<string>;
-}
-
-function isStringIterable(value: unknown): value is Iterable<string> {
-  if (value === null || typeof value !== "object" || !(Symbol.iterator in value)) {
-    return false;
-  }
-  for (const item of value as Iterable<unknown>) {
-    if (typeof item !== "string") {
-      return false;
-    }
-  }
-  return true;
 }
 
 /**
@@ -1182,11 +1170,21 @@ export function requireLeakGuard(
   }
   // Shape-checked field by field below before any field is used.
   const guard = leakGuard as AssertCleanPacketOptions;
+  const terms: Partial<Record<"caseIds" | "eventsVocab" | "extraForbidden" | "forbidden", string[]>> = {};
   for (const key of ["caseIds", "eventsVocab", "extraForbidden", "forbidden"] as const) {
     const value = (guard as Record<string, unknown>)[key];
-    if (value !== undefined && !isStringIterable(value)) {
+    if (value === undefined) continue;
+    if (value === null || typeof value !== "object" || typeof (value as Iterable<unknown>)[Symbol.iterator] !== "function") {
       refuse(`'${key}' must be a collection of strings`);
     }
+    const collected: string[] = [];
+    for (const item of value as Iterable<unknown>) {
+      if (typeof item !== "string") {
+        refuse(`'${key}' must be a collection of strings`);
+      }
+      collected.push(item as string);
+    }
+    terms[key] = collected;
   }
   if (guard.truth !== undefined) {
     const truths = Array.isArray(guard.truth) ? guard.truth : [guard.truth];
@@ -1199,13 +1197,13 @@ export function requireLeakGuard(
     }
   }
   const forbidden = new Set<string>();
-  for (const term of guard.forbidden ?? []) {
+  for (const term of terms.forbidden ?? []) {
     const norm = term.trim().toLowerCase();
     if (norm.length >= MIN_FORBIDDEN_TERM_CHARS) {
       forbidden.add(norm);
     }
   }
-  for (const term of buildForbiddenSet(guard)) {
+  for (const term of buildForbiddenSet({ truth: guard.truth, ...terms })) {
     if (term.length >= MIN_FORBIDDEN_TERM_CHARS) {
       forbidden.add(term);
     }
@@ -3213,7 +3211,7 @@ export async function runPromotionPipeline(
     pass2: pass2Tuple,
     minFoundGain,
     frozenBrief: options.frozenBrief,
-    leakGuard: options.leakGuard,
+    leakGuard,
     modelPattern: options.modelPattern,
     repoRoot: options.repoRoot,
     turnRunner: options.verifierTurnRunner,

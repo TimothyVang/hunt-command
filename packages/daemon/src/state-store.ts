@@ -482,7 +482,8 @@ export class DurableStateStore {
           citation_receipt_json = excluded.citation_receipt_json,
           snapshot_json = excluded.snapshot_json,
           config_json = excluded.config_json,
-          updated_at = excluded.updated_at;`,
+          updated_at = excluded.updated_at
+        WHERE hunt_runs.status != 'cancelled' OR excluded.status = 'cancelled';`,
       )
       .run(
         run.run_id,

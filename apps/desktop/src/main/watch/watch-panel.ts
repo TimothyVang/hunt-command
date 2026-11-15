@@ -59,6 +59,8 @@ export class WatchBrowserController {
   #blockedRequestCount = 0;
   #lastBlockedReason: string | null = null;
   #resetPending = false;
+  #generation = 0;
+  #pending: Promise<void> = Promise.resolve();
 
   constructor(options: WatchBrowserControllerOptions) {
     this.#win = options.window;
@@ -101,6 +103,43 @@ export class WatchBrowserController {
     role: ProfileId,
     scope: WatchScope,
     initialUrl = "about:blank",
+  ): Promise<WatchBrowserState> {
+    const generation = ++this.#generation;
+    const operation = this.#pending.then(async () => {
+      if (generation !== this.#generation) {
+        throw new Error("Watch session was superseded.");
+      }
+      try {
+        const state = await this.#openFencedSession(runId, role, scope, initialUrl);
+        if (generation !== this.#generation) {
+          throw new Error("Watch session was superseded.");
+        }
+        return state;
+      } catch (error) {
+        await this.disposeViewOnly();
+        throw error;
+      }
+    });
+    this.#pending = operation.then(() => {}, () => {});
+    return operation;
+  }
+
+  invalidate(): void {
+    ++this.#generation;
+    this.setBounds(null);
+    const operation = this.#pending.then(async () => {
+      await this.disposeViewOnly();
+      this.#scope = null;
+      this.#emit();
+    });
+    this.#pending = operation.then(() => {}, () => {});
+  }
+
+  async #openFencedSession(
+    runId: string,
+    role: ProfileId,
+    scope: WatchScope,
+    initialUrl: string,
   ): Promise<WatchBrowserState> {
     if (!documentAllowed(scope, initialUrl)) {
       throw new Error(`Refusing Watch navigation outside pinned 127.0.0.1 scope: ${initialUrl}`);

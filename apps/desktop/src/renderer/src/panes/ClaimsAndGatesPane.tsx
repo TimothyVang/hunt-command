@@ -13,6 +13,7 @@ import { AuthorityGateCard } from "./AuthorityGateCard.tsx";
 
 export interface ClaimsAndGatesPaneProps {
   workbench: WorkbenchSnapshot;
+  switchingHunt: boolean;
   centerTab: CenterPaneTab;
   claimKindFilter: ClaimKind | "all";
   selectedClaimId: string | null;
@@ -25,7 +26,7 @@ export interface ClaimsAndGatesPaneProps {
   onSelectCitation: (citationId: string) => void;
   onSelectStep: (stepId: string) => void;
   onUpdateGateDraft: (patch: Partial<GateDraftFields>) => void;
-  onSubmitGateDecision: (action: "approve" | "reject") => void;
+  onSubmitGateDecision: (action: "approve" | "reject", operatorToken?: string) => void;
 }
 
 const CLAIM_KIND_BADGE: Record<ClaimKind, string> = {
@@ -37,6 +38,7 @@ const CLAIM_KIND_BADGE: Record<ClaimKind, string> = {
 
 export function ClaimsAndGatesPane({
   workbench,
+  switchingHunt,
   centerTab,
   claimKindFilter,
   selectedClaimId,
@@ -56,26 +58,31 @@ export function ClaimsAndGatesPane({
   const [watchUrlInput, setWatchUrlInput] = useState("http://127.0.0.1:18400/");
   const [watchError, setWatchError] = useState<string | null>(null);
   const watchViewportRef = useRef<HTMLDivElement | null>(null);
+  const currentHuntRef = useRef(workbench.huntId);
+  currentHuntRef.current = workbench.huntId;
+  const watchIsCurrent = !switchingHunt && workbench.watchState.enabled && workbench.watchState.runId === workbench.huntId;
 
   const handleWatchGo = () => {
+    if (switchingHunt) return;
+    const huntId = workbench.huntId;
     setWatchError(null);
-    if (!workbench.watchState.enabled) {
+    if (!watchIsCurrent) {
       const built = buildWatchOpenRequest(workbench, watchUrlInput);
       if (!built.ok) {
         setWatchError(built.error);
         return;
       }
       void invokeDesktop("watch:open", built.request).then((res) => {
-        if (!res.ok) setWatchError(res.error?.message ?? "Watch session could not be opened");
+        if (currentHuntRef.current === huntId && !res.ok) setWatchError(res.error?.message ?? "Watch session could not be opened");
       });
       return;
     }
     void invokeDesktop("watch:navigate", {
-      runId: workbench.watchState.runId,
+      runId: workbench.huntId,
       role: workbench.watchState.role,
       url: watchUrlInput,
     }).then((res) => {
-      if (!res.ok) setWatchError(res.error?.message ?? "Navigation blocked");
+      if (currentHuntRef.current === huntId && !res.ok) setWatchError(res.error?.message ?? "Navigation blocked");
     });
   };
 
@@ -86,6 +93,10 @@ export function ClaimsAndGatesPane({
       ),
     [workbench.citationReceipt.entries],
   );
+
+  useEffect(() => {
+    setWatchError(null);
+  }, [workbench.huntId]);
 
   useEffect(() => {
     setByteOffset(0);
@@ -111,8 +122,8 @@ export function ClaimsAndGatesPane({
 
   // Synchronize WebContentsView bounds only while the Watch tab is active.
   useEffect(() => {
-    if (centerTab !== "watch") {
-      void invokeDesktop("watch:setBounds", { bounds: null });
+    if (centerTab !== "watch" || !watchIsCurrent) {
+      void invokeDesktop("watch:setBounds", { runId: workbench.huntId, bounds: null });
       return;
     }
     const reportBounds = () => {
@@ -121,6 +132,7 @@ export function ClaimsAndGatesPane({
       const rect = el.getBoundingClientRect();
       if (rect.width >= 100 && rect.height >= 100) {
         void invokeDesktop("watch:setBounds", {
+          runId: workbench.huntId,
           bounds: {
             x: Math.round(rect.left),
             y: Math.round(rect.top),
@@ -134,9 +146,9 @@ export function ClaimsAndGatesPane({
     window.addEventListener("resize", reportBounds);
     return () => {
       window.removeEventListener("resize", reportBounds);
-      void invokeDesktop("watch:setBounds", { bounds: null });
+      void invokeDesktop("watch:setBounds", { runId: workbench.huntId, bounds: null });
     };
-  }, [centerTab]);
+  }, [centerTab, workbench.huntId, watchIsCurrent]);
 
   const filteredClaims =
     claimKindFilter === "all"
@@ -213,6 +225,8 @@ export function ClaimsAndGatesPane({
           <>
             {workbench.activeGate ? (
               <AuthorityGateCard
+                key={`${workbench.activeGate.huntId}:${workbench.activeGate.gate}:${workbench.activeGate.payloadSha256}`}
+                requiresToken={workbench.provenanceMode === "live_daemon"}
                 activeGate={workbench.activeGate}
                 caseMetadata={workbench.caseMetadata}
                 draft={gateDraft}
@@ -462,10 +476,11 @@ export function ClaimsAndGatesPane({
               <button
                 type="button"
                 onClick={handleWatchGo}
+                disabled={switchingHunt}
                 data-testid="watch-go"
                 className="rounded border border-cyan-500/50 bg-cyan-950/70 px-3 py-1 text-xs font-medium text-cyan-100 cursor-pointer"
               >
-                {workbench.watchState.enabled ? "Navigate (Pinned 127.0.0.1)" : "Open Fenced Session"}
+                {watchIsCurrent ? "Navigate (Pinned 127.0.0.1)" : "Open Fenced Session"}
               </button>
             </div>
             {watchError && (

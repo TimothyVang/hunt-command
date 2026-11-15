@@ -621,12 +621,17 @@ describe("8-Wave Hunt Engine, Merge Fallback, Capabilities, Durability & Budget"
     ).rejects.toThrow(/max_concurrent_hunts_exceeded/);
 
     // Global Stop on conc-1 aborts it immediately while others finish when released!
+    const staleRun = store.getRun("conc-1")!;
     const cancelled = engine.cancelRun("conc-1", "operator_emergency_stop");
     expect(cancelled.status).toBe("cancelled");
     expect(cancelled.reason_code).toBe("operator_emergency_stop");
+    store.saveRun(staleRun);
+    expect(store.getRun("conc-1")!.status).toBe("cancelled");
+    expect(store.getRun("conc-1")!.reason_code).toBe("operator_emergency_stop");
 
     releaseGate.resolve();
     await Promise.allSettled(inFlight);
+    expect(store.getRun("conc-1")!.status).toBe("cancelled");
     store.close();
   });
 });

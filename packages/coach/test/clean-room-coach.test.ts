@@ -1365,6 +1365,63 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
     expect(runnerCalls).toBe(0);
   });
 
+  test("one-shot guard vocabularies block packet leaks before the proposer runs", async () => {
+    const words = function* (word: string): Generator<string> {
+      yield word;
+    };
+    for (const key of ["caseIds", "eventsVocab", "extraForbidden", "forbidden"] as const) {
+      const word = `sensitive${key.toLowerCase()}`;
+      const guard = {
+        caseIds: ["anchorcase"],
+        extraForbidden: ["anchorextra"],
+        [key]: words(word),
+      } satisfies NonNullable<Parameters<typeof requireLeakGuard>[1]>;
+      const tampered = {
+        ...cleanPacket(),
+        reason_code_counts: { [word]: 1 },
+      } as unknown as CleanDiagnosticsPacket;
+      runnerCalls = 0;
+      await expect(proposeCleanRoom({
+        packet: tampered,
+        holdoutReasons: [],
+        leakGuard: guard,
+        turnRunner: forbiddenRunner,
+      })).rejects.toThrow(PacketLeakError);
+      expect(runnerCalls).toBe(0);
+    }
+
+    const malformed = function* (): Generator<unknown> {
+      yield "validword";
+      yield 42;
+    };
+    expect(() => requireLeakGuard("test", {
+      caseIds: ["anchorcase"],
+      eventsVocab: malformed() as Iterable<string>,
+    })).toThrow(CleanRoomViolationError);
+  });
+
+  test("promotion reuses a resolved one-shot guard for the verifier panel", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-coach-generator-"));
+    try {
+      const caseIds = function* (): Generator<string> {
+        yield "anchorcase";
+      };
+      const result = await runPromotionPipeline({
+        packet: cleanPacket(),
+        rawProposal: playbookProposal,
+        baseline,
+        holdoutReasons: [],
+        leakGuard: { caseIds: caseIds() },
+        ledgerPath: path.join(tmp, "ledger.json"),
+        verifierTurnRunner: approvingVerifier,
+        evaluateRound: async () => goodRound,
+      });
+      expect(result.promoted).toBe(true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   test("scrubText and assertCleanPacket are order-, case- and separator-independent and cover IPv6 and defanged forms", () => {
     expect(scrubText("alpha-host-7 talked to alpha", new Set(["alpha", "alpha-host-7"]))).toBe(
       "[REDACTED_VOCAB] talked to [REDACTED_VOCAB]",

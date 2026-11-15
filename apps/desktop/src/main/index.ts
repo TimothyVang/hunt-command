@@ -164,6 +164,7 @@ async function bootstrap(): Promise<void> {
     watchHandlers: {
       getState: () => watch.getState(),
       setBounds: (bounds) => watch.setBounds(bounds),
+      invalidate: () => watch.invalidate(),
       navigate: async (runId, role, url) => await watch.navigate(runId, role, url),
       open: async (input) => {
         const labOrigin = input.labOrigin;

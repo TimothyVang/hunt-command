@@ -4,6 +4,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { resolveRuntimeDir } from "@hunt-command/shared";
+import {
+  createCaseDirDataPlaneResolver,
+  DurableStateStore,
+  GateAuthority,
+  HuntDaemonRpcServer,
+  HuntWaveEngine,
+  InMemoryTelemetrySink,
+  type ModelRunnerPort,
+  type ModelTurnRequest,
+  type StepTurnResult,
+} from "../../../packages/daemon/src/index.ts";
 import {
   type DaemonProcess,
   HuntDaemonSidecar,
@@ -11,6 +23,7 @@ import {
 } from "../src/main/daemon/daemon-sidecar.ts";
 import { resolveDaemonLaunch, resolvePiNativesDir } from "../src/main/daemon/resolve-daemon.ts";
 import type { Logger } from "../src/main/logger.ts";
+import { WorkbenchService, type WorkbenchServiceDeps } from "../src/main/workbench-service.ts";
 
 const silentLog: Logger = {
   debug() {},
@@ -167,6 +180,105 @@ describe("hunt-daemon sidecar", () => {
     expect(killed).toBe(1);
     await sidecar.stop();
   });
+});
+
+test("live workbench uses the real daemon for metadata, authenticated gates, and stop", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hc-live-workbench-"));
+  const caseId = "integration-case";
+  const caseDir = path.join(root, "cases", caseId);
+  fs.mkdirSync(caseDir, { recursive: true });
+  fs.writeFileSync(path.join(caseDir, "case.json"), JSON.stringify({
+    case_id: caseId,
+    question: "Which host ran the process?",
+    data_origin: "synthetic",
+    time_range_utc: { start_inclusive: "2026-11-14T10:00:00Z", end_exclusive: "2026-11-14T11:00:00Z" },
+  }));
+  fs.writeFileSync(path.join(caseDir, "events.jsonl"), JSON.stringify({
+    "@timestamp": "2026-11-14T10:01:00Z", event: { id: "evt-1", code: "1" },
+    host: { name: "integration-host" }, message: "Process executed.",
+  }) + "\n");
+
+  const resolver = createCaseDirDataPlaneResolver({ casesDir: path.join(root, "cases"), cacheDir: path.join(root, "cache") });
+  const store = new DurableStateStore(path.join(root, "state.sqlite"));
+  const gates = new GateAuthority({ stateStore: store, decisionsDir: path.join(root, "decisions") });
+  const telemetry = new InMemoryTelemetrySink();
+  const runner: ModelRunnerPort = {
+    getPinnedModelForRole: () => ({ provider: "anthropic", model: "test-model", fallback_providers: [] }),
+    preflightWave: async () => {},
+    runTurn: async (req: ModelTurnRequest): Promise<StepTurnResult> => ({
+      status: "completed",
+      output_text: JSON.stringify({
+        schema_version: 1, case_id: req.caseId, step_id: req.stepId, profile: req.profile,
+        claims: [{
+          claim_id: `${req.stepId}:c1`, kind: req.stepId === "incident" ? "finding" : "observed",
+          statement: "The process was observed.", evidence_ids: ["events.jsonl"],
+          entity_ids: [], contradicts: [],
+        }],
+        reviews: [], disposition: "review_ready", limitations: [], requested_decisions: [],
+      }),
+      usage: {
+        input_tokens: 100, output_tokens: 50, cache_read_tokens: 0, cache_write_tokens: 0,
+        total_tokens: 150, turns: 1, provider: "anthropic", model: "test-model",
+        billing_mode: "oauth_subscription", actual_billed_usd: 0, shadow_api_usd: 0.001, cache_savings_usd: 0,
+      },
+    }),
+  };
+  const engine = new HuntWaveEngine({ stateStore: store, gateAuthority: gates, modelRunner: runner, telemetry, resolveDataPlane: resolver.resolve });
+  let child!: FakeChild;
+  const pending: Promise<unknown>[] = [];
+  const rpc = new HuntDaemonRpcServer({
+    engine,
+    resolveDataPlane: resolver.resolve,
+    writeLine: (line) => child.stdout.write(line),
+  });
+  const unsubscribe = telemetry.subscribe((event) => rpc.emitTelemetryEvent(event));
+  const sidecar = new HuntDaemonSidecar({
+    resolveLaunch: launch, runtimeRootDir: root, log: silentLog,
+    spawn: () => {
+      child = fakeChild((line) => { pending.push(rpc.handleLine(line)); });
+      return child;
+    },
+  });
+  try {
+    sidecar.start();
+    await waitFor(() => sidecar.isLiveReady);
+    const runtimePaths = resolveRuntimeDir(path.join(root, "runtime"), { repoRoot: path.resolve(import.meta.dir, "../../..") });
+    const service = new WorkbenchService({ runtimePaths, sidecar, vault: {} as WorkbenchServiceDeps["vault"] });
+    const started = await service.startRun({
+      caseId, dataOrigin: "synthetic", scope: "Investigate the process.", followUps: 0, maxTotalTokens: 100_000,
+    });
+    expect(started.provenanceMode).toBe("live_daemon");
+    expect(started.caseMetadata).toEqual((await resolver.resolve(caseId)).caseMetadata);
+    expect(started.runStatus).toBe("awaiting_human_gate");
+    expect(started.activeGate?.gate).toBe("scope");
+    expect(started.activeGate?.payloadSha256).toBe(store.getRun(started.huntId)!.open_gate!.payload_sha256);
+
+    const decision = {
+      huntId: started.huntId, gate: "scope", action: "approve", operatorName: "forged-name",
+      rbacRole: "incident_commander", checkNote: "Reviewed the scope.",
+      payloadSha256: started.activeGate!.payloadSha256,
+    };
+    await expect(service.submitGateDecision({ ...decision, operatorToken: "invalid-token" })).rejects.toThrow();
+    expect(store.getRun(started.huntId)!.decisions).toHaveLength(0);
+    const approved = await service.submitGateDecision({
+      ...decision, operatorToken: gates.sessionAuthority.issueToken("real-analyst", "analyst"),
+    });
+    expect(approved.activeGate?.gate).toBe("incident");
+    expect(approved.gateHistory[0]?.decided_by).toBe("real-analyst");
+    expect(approved.gateHistory[0]?.rbac_role).toBe("analyst");
+    const stopped = await service.globalStop({ huntId: started.huntId, reason: "operator_global_stop" });
+    expect(stopped.runStatus).toBe("stopped");
+    expect(stopped.activeGate).toBeNull();
+    expect(store.getRun(started.huntId)!.status).toBe("cancelled");
+    expect((await service.getWorkbenchState({ huntId: started.huntId })).runStatus).toBe("stopped");
+  } finally {
+    await sidecar.stop();
+    await Promise.allSettled(pending);
+    unsubscribe();
+    store.close();
+    await resolver.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 describe("resolveDaemonLaunch", () => {
