@@ -1,0 +1,333 @@
+#!/usr/bin/env bun
+import path from "node:path";
+import { resolveRuntimeDir } from "@hunt-command/shared";
+import { executeDriveGates } from "./drive-gates.ts";
+import {
+  GateAuthority,
+  OperatorSessionAuthority,
+  RBAC_ROLES,
+  loadOrCreateOperatorSessionSecret,
+  type RbacRole,
+} from "./gates.ts";
+import { OmpHunterPool } from "./omp-pool.ts";
+import { InMemoryTelemetrySink } from "./ports.ts";
+import { HuntDaemonRpcServer } from "./rpc-server.ts";
+import { acquireRuntimeLock, RuntimeLockHeldError, type RuntimeLockHandle } from "./runtime-lock.ts";
+import { DurableStateStore } from "./state-store.ts";
+import { HuntWaveEngine, type DataPlaneResolver } from "./wave-engine.ts";
+
+export interface CreateDaemonContextOptions {
+  readonly runtimeDir?: string;
+  readonly subscriptionOnly?: boolean;
+  readonly productionMode?: boolean;
+  readonly resolveDataPlane?: DataPlaneResolver;
+  /**
+   * Reconcile interrupted in-flight runs from a prior daemon crash. ONLY the single-instance
+   * `serve` process (holding the runtime lock) may set this; read-only commands never do.
+   */
+  readonly recoverOnStartup?: boolean;
+}
+
+export const RUNTIME_LOCK_FILE = "hunt-daemon.lock";
+export const OPERATOR_SESSION_SECRET_FILE = "operator-session.secret";
+
+export function runtimeLockPath(stateDir: string): string {
+  return path.join(stateDir, RUNTIME_LOCK_FILE);
+}
+
+export function createHuntDaemonRuntime(options?: CreateDaemonContextOptions) {
+  const paths = resolveRuntimeDir(options?.runtimeDir);
+  const stateStore = new DurableStateStore(paths.daemonStateDbPath);
+  const gateAuthority = new GateAuthority({
+    stateStore,
+    decisionsDir: paths.decisionsDir,
+    decisionsLogPath: paths.decisionsLogPath,
+    productionMode: options?.productionMode ?? true,
+    // Shared across processes on this runtime dir so locally issued operator tokens verify.
+    sessionAuthority: new OperatorSessionAuthority(
+      loadOrCreateOperatorSessionSecret(path.join(paths.stateDir, OPERATOR_SESSION_SECRET_FILE)),
+    ),
+  });
+  const telemetry = new InMemoryTelemetrySink();
+  const modelRunner = new OmpHunterPool({
+    subscriptionOnly: options?.subscriptionOnly ?? true,
+  });
+  const engine = new HuntWaveEngine({
+    stateStore,
+    gateAuthority,
+    modelRunner,
+    telemetry,
+    resolveDataPlane: options?.resolveDataPlane,
+  });
+
+  const recoveredRuns = options?.recoverOnStartup ? engine.recoverInFlightRunsOnStartup() : [];
+
+  return {
+    paths,
+    stateStore,
+    gateAuthority,
+    telemetry,
+    modelRunner,
+    engine,
+    recoveredRuns,
+  };
+}
+
+export interface RunHuntCliOptions {
+  /**
+   * Case data-plane factory for `serve` (`hunt.start`, `hunt.resume`, gate resumption).
+   * No default exists yet: `@hunt-command/data-plane` exposes `HuntDataPlane`, not the
+   * daemon's `HuntDataPlanePort`, so `serve` fails fast without one.
+   */
+  readonly resolveDataPlane?: DataPlaneResolver;
+  /** Input stream for `serve` (defaults to `process.stdin`). */
+  readonly stdin?: AsyncIterable<Uint8Array | Buffer | string>;
+}
+
+function parseCliFlags(args: readonly string[]): Record<string, string | boolean> {
+  const flags: Record<string, string | boolean> = {};
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]!;
+    if (!token.startsWith("--")) continue;
+    const key = token.slice(2);
+    const next = args[i + 1];
+    if (next !== undefined && !next.startsWith("--")) {
+      flags[key] = next;
+      i += 1;
+    } else {
+      flags[key] = true;
+    }
+  }
+  return flags;
+}
+
+export async function runHuntCli(
+  argv: readonly string[],
+  io: {
+    writeStdout: (text: string) => void;
+    writeStderr: (text: string) => void;
+  } = {
+    writeStdout: (t) => process.stdout.write(t),
+    writeStderr: (t) => process.stderr.write(t),
+  },
+  options: RunHuntCliOptions = {},
+): Promise<number> {
+  const subcommand = argv[0] ?? "help";
+  const flags = parseCliFlags(argv.slice(1));
+  const runtimeDir = typeof flags["runtime-dir"] === "string" ? flags["runtime-dir"] : undefined;
+
+  if (subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
+    io.writeStdout(
+      [
+        "Hunt Command Daemon CLI (@hunt-command/daemon)",
+        "Usage:",
+        "  hunt-daemon serve [--runtime-dir <dir>]",
+        "  hunt status --hunt-id <id> [--runtime-dir <dir>]",
+        "  hunt cancel --hunt-id <id> [--reason <text>] [--runtime-dir <dir>]",
+        "  hunt token --principal <id> --role <admin|analyst|reviewer|viewer> [--ttl-hours <n>] [--runtime-dir <dir>]",
+        "  hunt gates <status|approve|deny> --hunt-id <id> [--gate <name>] --token <operator-token> [--note <text>] [--digest <sha256>] [--runtime-dir <dir>]",
+        "",
+        "cancel and gates approve/deny refuse to run while hunt-daemon serves the same runtime dir.",
+        "",
+      ].join("\n"),
+    );
+    return 0;
+  }
+
+  if (subcommand === "serve") {
+    return serveDaemon(runtimeDir, flags, io, options);
+  }
+
+  const gateAction = subcommand === "gates" ? argv[1] : undefined;
+  const mutates = subcommand === "cancel" || (subcommand === "gates" && gateAction !== "status");
+
+  // Mutating commands take the same exclusive runtime lock as `serve`, so they can never
+  // race a live daemon's in-flight state. Read-only commands never take it and never mutate.
+  let lock: RuntimeLockHandle | null = null;
+  if (mutates) {
+    try {
+      lock = acquireRuntimeLock(runtimeLockPath(resolveRuntimeDir(runtimeDir).stateDir));
+    } catch (err) {
+      if (err instanceof RuntimeLockHeldError) {
+        io.writeStderr(
+          `${err.message}\nhunt-daemon is serving this runtime dir; send this action through its RPC instead.\n`,
+        );
+        return 1;
+      }
+      throw err;
+    }
+  }
+
+  let ctx: ReturnType<typeof createHuntDaemonRuntime>;
+  try {
+    ctx = createHuntDaemonRuntime({
+      runtimeDir,
+      productionMode: flags["non-prod"] !== true,
+      resolveDataPlane: options.resolveDataPlane,
+    });
+  } catch (err) {
+    lock?.release();
+    throw err;
+  }
+
+  try {
+    if (subcommand === "status") {
+      const huntId = typeof flags["hunt-id"] === "string" ? flags["hunt-id"] : "";
+      if (!huntId) {
+        io.writeStderr("Missing required --hunt-id <id>\n");
+        return 2;
+      }
+      const run = ctx.stateStore.getRun(huntId);
+      if (!run) {
+        io.writeStderr(`Unknown hunt '${huntId}'\n`);
+        return 1;
+      }
+      io.writeStdout(`${JSON.stringify(run, null, 2)}\n`);
+      return 0;
+    }
+
+    if (subcommand === "cancel") {
+      const huntId = typeof flags["hunt-id"] === "string" ? flags["hunt-id"] : "";
+      if (!huntId) {
+        io.writeStderr("Missing required --hunt-id <id>\n");
+        return 2;
+      }
+      const reason = typeof flags["reason"] === "string" ? flags["reason"] : "global_stop";
+      const cancelled = ctx.engine.cancelRun(huntId, reason);
+      io.writeStdout(`${JSON.stringify(cancelled, null, 2)}\n`);
+      return 0;
+    }
+
+    if (subcommand === "token") {
+      const principal = typeof flags["principal"] === "string" ? flags["principal"] : "";
+      const role = typeof flags["role"] === "string" ? flags["role"] : "";
+      if (!principal.trim() || !(RBAC_ROLES as readonly string[]).includes(role)) {
+        io.writeStderr(
+          `Usage: hunt token --principal <id> --role <${RBAC_ROLES.join("|")}> [--ttl-hours <n>]\n`,
+        );
+        return 2;
+      }
+      const ttlHours = typeof flags["ttl-hours"] === "string" ? Number(flags["ttl-hours"]) : 12;
+      if (!Number.isFinite(ttlHours) || ttlHours <= 0 || ttlHours > 24) {
+        io.writeStderr("--ttl-hours must be in (0, 24]\n");
+        return 2;
+      }
+      const token = ctx.gateAuthority.sessionAuthority.issueToken(
+        principal,
+        role as RbacRole,
+        Math.round(ttlHours * 60 * 60 * 1000),
+      );
+      io.writeStdout(`${token}\n`);
+      return 0;
+    }
+
+    if (subcommand === "gates") {
+      const actionRaw = gateAction;
+      if (
+        actionRaw !== "status" &&
+        actionRaw !== "approve" &&
+        actionRaw !== "reject" &&
+        actionRaw !== "deny"
+      ) {
+        io.writeStderr("Usage: hunt gates <status|approve|reject|deny> --hunt-id <id> ...\n");
+        return 2;
+      }
+      const gateFlags = parseCliFlags(argv.slice(2));
+      const huntId = typeof gateFlags["hunt-id"] === "string" ? gateFlags["hunt-id"] : "";
+      if (!huntId) {
+        io.writeStderr("Missing required --hunt-id <id>\n");
+        return 2;
+      }
+      const res = await executeDriveGates(ctx.engine, {
+        action: actionRaw,
+        huntId,
+        gate: typeof gateFlags["gate"] === "string" ? gateFlags["gate"] : undefined,
+        operatorToken: typeof gateFlags["token"] === "string" ? gateFlags["token"] : undefined,
+        checkNote: typeof gateFlags["note"] === "string" ? gateFlags["note"] : undefined,
+        payloadSha256: typeof gateFlags["digest"] === "string" ? gateFlags["digest"] : undefined,
+        automated: gateFlags["automated"] === true,
+        delegatedBy:
+          typeof gateFlags["delegated-by"] === "string" ? gateFlags["delegated-by"] : undefined,
+        delegationReason:
+          typeof gateFlags["reason"] === "string" ? gateFlags["reason"] : undefined,
+      });
+      io.writeStdout(`${JSON.stringify(res, null, 2)}\n`);
+      return res.ok ? 0 : 1;
+    }
+
+    io.writeStderr(`Unknown command '${subcommand}'\n`);
+    return 2;
+  } finally {
+    ctx.stateStore.close();
+    lock?.release();
+  }
+}
+
+async function serveDaemon(
+  runtimeDir: string | undefined,
+  flags: Record<string, string | boolean>,
+  io: { writeStdout: (text: string) => void; writeStderr: (text: string) => void },
+  options: RunHuntCliOptions,
+): Promise<number> {
+  if (!options.resolveDataPlane) {
+    io.writeStderr(
+      "hunt-daemon serve: no case data-plane factory is configured, so hunt.start/hunt.resume " +
+        "and gate resumption cannot work. Embed runHuntCli(argv, io, { resolveDataPlane }) with a " +
+        "HuntDataPlanePort factory; @hunt-command/data-plane has no HuntDataPlanePort adapter yet.\n",
+    );
+    return 2;
+  }
+
+  let lock: RuntimeLockHandle;
+  try {
+    lock = acquireRuntimeLock(runtimeLockPath(resolveRuntimeDir(runtimeDir).stateDir));
+  } catch (err) {
+    if (err instanceof RuntimeLockHeldError) {
+      io.writeStderr(`hunt-daemon serve: ${err.message}\n`);
+      return 1;
+    }
+    throw err;
+  }
+  const releaseOnExit = () => lock.release();
+  process.once("exit", releaseOnExit);
+
+  try {
+    // Only the lock-holding serve process reconciles interrupted in-flight runs.
+    const ctx = createHuntDaemonRuntime({
+      runtimeDir,
+      productionMode: flags["non-prod"] !== true,
+      resolveDataPlane: options.resolveDataPlane,
+      recoverOnStartup: true,
+    });
+    const resumable = ctx.engine.listResumableRuns();
+    if (ctx.recoveredRuns.length > 0 || resumable.length > 0) {
+      io.writeStderr(
+        `hunt-daemon serve: ${ctx.recoveredRuns.length} run(s) parked behind a reconcile gate; ` +
+          `${resumable.length} run(s) resumable via hunt.resume: ${resumable.map((r) => r.run_id).join(", ")}\n`,
+      );
+    }
+    const rpc = new HuntDaemonRpcServer({
+      engine: ctx.engine,
+      resolveDataPlane: options.resolveDataPlane,
+      writeLine: (line) => io.writeStdout(line),
+    });
+    const unsub = ctx.telemetry.subscribe((ev) => rpc.emitTelemetryEvent(ev));
+    try {
+      for await (const chunk of options.stdin ?? process.stdin) {
+        await rpc.handleChunk(chunk as Buffer);
+      }
+    } finally {
+      unsub();
+      ctx.stateStore.close();
+    }
+    return 0;
+  } finally {
+    process.removeListener("exit", releaseOnExit);
+    lock.release();
+  }
+}
+
+if (import.meta.main) {
+  const code = await runHuntCli(process.argv.slice(2));
+  process.exit(code);
+}
