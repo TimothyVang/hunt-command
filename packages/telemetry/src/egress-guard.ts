@@ -22,7 +22,11 @@ export const EGRESS_STATUS_ENUMS = [
 ] as const;
 export type EgressStatusEnum = (typeof EGRESS_STATUS_ENUMS)[number];
 
-const REASON_CODE_ENUM_RE = /^[a-z0-9_]{1,64}$/;
+export const EGRESS_REASON_CODES = ["awaiting_human_scope", "incident_threshold_met"] as const;
+export type EgressReasonCode = (typeof EGRESS_REASON_CODES)[number];
+
+// UUID v4 is random: unlike host-derived IDs or UUID v1, it carries no work identifier.
+const OPAQUE_HUNT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STRICT_UTC_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const NON_SYNTHETIC_FILM_BANNER = "NON-SYNTHETIC — OPERATOR LOCAL ONLY" as const;
 const NON_SYNTHETIC_MODAL_WARNING =
@@ -74,7 +78,7 @@ export interface RedactedWorkEgressCard {
   gate_kind: EgressGateKind;
   status_enum: EgressStatusEnum;
   opened_at_utc: string;
-  reason_code: string | null;
+  reason_code: EgressReasonCode | null;
   counters?: EgressTokenCostCounters;
 }
 
@@ -153,6 +157,7 @@ function looksLikeSensitiveIdentifier(id: string): boolean {
  * `summary`, `query_text`, `messages`, `statement`, `outputs_dir` paths, `case_id`, hostnames,
  * IPs, domains, and raw `evt-*`/`ioc-*`/`frame-*` payloads — emitting strictly allowlisted
  * `{ hunt_uuid, wave, gate_kind, status_enum, opened_at_utc, reason_code }` + aggregate counters.
+ * Non-synthetic hunt IDs must be UUID v4; reason codes must come from EGRESS_REASON_CODES.
  */
 export class EgressGuard {
   public static serialize(
@@ -164,10 +169,18 @@ export class EgressGuard {
       throw new EgressGuardError("invalid_data_origin", "Invalid or missing record.data_origin");
     }
 
-    if (!SAFE_ID_RE.test(record.hunt_uuid) || looksLikeSensitiveIdentifier(record.hunt_uuid)) {
+    // Fail-closed: BOTH provenance flags are required for synthetic-friendly identifiers.
+    const trulySynthetic =
+      parsedOrigin.data === "synthetic" && record.synthetic_only === true;
+    const validHuntUuid =
+      typeof record.hunt_uuid === "string" &&
+      (trulySynthetic
+        ? SAFE_ID_RE.test(record.hunt_uuid) && !looksLikeSensitiveIdentifier(record.hunt_uuid)
+        : record.hunt_uuid.length === 36 && OPAQUE_HUNT_UUID_RE.test(record.hunt_uuid));
+    if (!validHuntUuid) {
       throw new EgressGuardError(
         "invalid_hunt_uuid",
-        "hunt_uuid must be a safe opaque identifier without paths, IPs, or evidence prefixes",
+        "hunt_uuid must be an opaque UUID v4 for non-synthetic data, or a safe synthetic identifier",
       );
     }
 
@@ -196,22 +209,19 @@ export class EgressGuard {
       );
     }
 
-    let safeReasonCode: string | null = null;
+    let safeReasonCode: EgressReasonCode | null = null;
     if (record.reason_code !== undefined && record.reason_code !== null && record.reason_code !== "") {
-      if (!REASON_CODE_ENUM_RE.test(record.reason_code)) {
+      const registeredReasonCode = EGRESS_REASON_CODES.find((code) => code === record.reason_code);
+      if (registeredReasonCode === undefined) {
         throw new EgressGuardError(
           "invalid_reason_code",
-          "reason_code must be a fixed snake_case code ([a-z0-9_]{1,64}), never free text",
+          "reason_code must be a registered egress reason code, never free text",
         );
       }
-      safeReasonCode = record.reason_code;
+      safeReasonCode = registeredReasonCode;
     }
 
     const counters = normalizeCounters(record.counters);
-
-    // Fail-closed: BOTH data_origin === "synthetic" AND synthetic_only === true are required.
-    const trulySynthetic =
-      parsedOrigin.data === "synthetic" && record.synthetic_only === true;
 
     if (!trulySynthetic) {
       const allowlisted: RedactedWorkEgressCard = {

@@ -310,7 +310,7 @@ function createMockEsTransport(opts: MockClusterOptions = {}): {
             {
               _index: "logs-win-2026.11.01",
               _id: "shared-doc-42",
-              sort: [1731586000000000000, 10],
+              sort: ["2026-11-14T14:00:00.123456789Z", 10],
               _source: {
                 "@timestamp": "2026-11-14T14:00:00.123456789Z",
                 "event.id": "cluster-internal-id-must-be-stripped",
@@ -322,7 +322,7 @@ function createMockEsTransport(opts: MockClusterOptions = {}): {
             {
               _index: "logs-win-2026.11.02",
               _id: "shared-doc-42",
-              sort: [1731586001000000000, 11],
+              sort: ["2026-11-14T14:00:01.000000000Z", 11],
               _source: {
                 "@timestamp": "2026-11-14T14:00:01.000000000Z",
                 host: { name: "wkstn-02" },
@@ -734,7 +734,7 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
                 {
                   _index: "logs-win-2026.11.01",
                   _id: "doc-page-1",
-                  sort: [1731586000000000000, 5],
+                  sort: ["2026-11-14T14:00:00Z", 5],
                   _source: { "@timestamp": "2026-11-14T14:00:00Z", host: { name: "wkstn-01" } },
                 },
               ],
@@ -796,6 +796,220 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
     await dp.close();
     expect(deletedPits).toEqual(["stale-crashed-pit-000", "pit-gen-3"]);
     expect(fs.existsSync(activePitFile)).toBe(false);
+  });
+
+  for (const order of ["asc", "desc"] as const) {
+    test(`paginates adjacent date_nanos losslessly in ${order} order through JSON transport`, async () => {
+      // Raw numeric date_nanos values already collide at the JSON.parse boundary.
+      const rounded = JSON.parse("[1794664800123456789,1794664800123456790]") as number[];
+      expect(rounded[0]).toBe(rounded[1]);
+      expect(Number.isSafeInteger(rounded[0])).toBe(false);
+
+      const timestamps = [
+        "2026-11-14T14:00:00.123456789Z",
+        "2026-11-14T14:00:00.123456790Z",
+        "2026-11-14T14:00:00.123456791Z",
+      ];
+      const rows = timestamps.map((timestamp, index) => ({
+        _index: "logs-win-2026.11.01",
+        _id: `nano-${index}`,
+        sort: [timestamp, index + 10],
+        _source: { "@timestamp": timestamp, host: { name: "wkstn-01" } },
+      }));
+      if (order === "desc") rows.reverse();
+      const { transport, calls } = createMockEsTransport({
+        onSearch: (body) => {
+          expect(body.sort).toEqual([
+            { "@timestamp": { order, numeric_type: "date_nanos", format: "strict_date_optional_time_nanos" } },
+            { _shard_doc: order },
+          ]);
+          const after = body.search_after;
+          const index = after === undefined
+            ? 0
+            : rows.findIndex((row) => JSON.stringify(row.sort) === JSON.stringify(after)) + 1;
+          if (after !== undefined) expect(index).toBeGreaterThan(0);
+          return {
+            status: 200,
+            response: {
+              hits: {
+                total: { value: rows.length, relation: "eq" },
+                hits: rows.slice(index, index + 1),
+              },
+            },
+          };
+        },
+      });
+      const dp = await ConnectedHuntDataPlane.open({
+        config: makeValidConfig(),
+        caseDefinition: makeValidCase(),
+        environ: { HUNT_ELASTIC_API_KEY: TEST_API_KEY },
+        transport,
+        nowEpochMs: FIXED_NOW_MS,
+      });
+      try {
+        let after: string | undefined;
+        const seen: unknown[] = [];
+        for (const row of rows) {
+          const page = await dp.elasticSearch({ size: 1, sort: order, ...(after ? { after } : {}) });
+          expect(page.returned).toBe(1);
+          expect(page.next_after).toBeTruthy();
+          seen.push(page.hits[0]!["@timestamp"]);
+          const tuple = JSON.parse(Buffer.from(page.next_after!, "base64url").toString("utf8")) as unknown[];
+          expect(tuple.slice(0, 2)).toEqual(row.sort);
+          expect(Number.isSafeInteger(tuple[2])).toBe(true);
+          after = page.next_after!;
+        }
+        expect(seen).toEqual(rows.map((row) => row._source["@timestamp"]));
+        expect(new Set(seen).size).toBe(3);
+        const end = await dp.elasticSearch({ size: 1, sort: order, after });
+        expect(end.returned).toBe(0);
+        expect(end.next_after).toBeNull();
+        const searches = calls.filter((call) => call.url.includes("/_search?"));
+        expect(searches.map((call) => call.body!.search_after)).toEqual([
+          undefined,
+          ...rows.map((row) => row.sort),
+        ]);
+      } finally {
+        await dp.close();
+      }
+    });
+  }
+
+  test("rejects malformed date_nanos cursors and unsafe shard-doc or generation integers before transport", async () => {
+    const { transport, calls } = createMockEsTransport({
+      onSearch: () => ({
+        status: 200,
+        response: {
+          hits: {
+            total: { value: 1, relation: "eq" },
+            hits: [{
+              _index: "logs-win-2026.11.01",
+              _id: "safe-shard-doc",
+              sort: ["2026-11-14T14:00:00.123456789Z", Number.MAX_SAFE_INTEGER],
+              _source: { "@timestamp": "2026-11-14T14:00:00.123456789Z" },
+            }],
+          },
+        },
+      }),
+    });
+    const dp = await ConnectedHuntDataPlane.open({
+      config: makeValidConfig(),
+      caseDefinition: makeValidCase(),
+      environ: { HUNT_ELASTIC_API_KEY: TEST_API_KEY },
+      transport,
+      nowEpochMs: FIXED_NOW_MS,
+    });
+    try {
+      const page = await dp.elasticSearch({ size: 1 });
+      const valid = JSON.parse(Buffer.from(page.next_after!, "base64url").toString("utf8")) as [string, number, number];
+      const [timestamp, shardDoc, generation] = valid;
+      const malformed = [
+        [],
+        [timestamp, shardDoc],
+        [...valid, 0],
+        [1794664800123456789, shardDoc, generation],
+        [1794664800123, shardDoc, generation],
+        ["1794664800123456789", shardDoc, generation],
+        ["not-a-date", shardDoc, generation],
+        ["2026-02-30T14:00:00.123456789Z", shardDoc, generation],
+        ["2026-11-14T14:00:00.1234567890Z", shardDoc, generation],
+        [` ${timestamp}`, shardDoc, generation],
+        [timestamp, Number.MAX_SAFE_INTEGER + 1, generation],
+        [timestamp, -1, generation],
+        [timestamp, 1.5, generation],
+        [timestamp, "10", generation],
+        [timestamp, shardDoc, Number.MAX_SAFE_INTEGER + 1],
+        [timestamp, shardDoc, 1.5],
+        [timestamp, shardDoc, -1],
+        [timestamp, shardDoc, 0],
+        [timestamp, shardDoc, String(generation)],
+        [timestamp, shardDoc, null],
+      ];
+      const searchCount = calls.filter((call) => call.url.includes("/_search?")).length;
+      for (const tuple of malformed) {
+        const after = Buffer.from(JSON.stringify(tuple), "utf8").toString("base64url");
+        try {
+          await dp.elasticSearch({ size: 1, after });
+          throw new Error("Expected invalid_query");
+        } catch (err) {
+          expect(extractDataPlaneError(err)).toMatchObject({ statusCode: 400, errorCode: "invalid_query" });
+        }
+      }
+      const stale = Buffer.from(JSON.stringify([timestamp, shardDoc, generation + 1]), "utf8").toString("base64url");
+      try {
+        await dp.elasticSearch({ size: 1, after: stale });
+        throw new Error("Expected cursor_expired");
+      } catch (err) {
+        expect(extractDataPlaneError(err)).toMatchObject({ statusCode: 400, errorCode: "cursor_expired" });
+      }
+      expect(calls.filter((call) => call.url.includes("/_search?")).length).toBe(searchCount);
+      await dp.elasticSearch({ size: 1, after: page.next_after! });
+      expect(calls[calls.length - 1]!.body!.search_after).toEqual([timestamp, shardDoc]);
+    } finally {
+      await dp.close();
+    }
+  });
+
+  test("rejects malformed backend sort tuples across search, detectionTest, and event queries", async () => {
+    let sortTuple: unknown;
+    const { transport } = createMockEsTransport({
+      onSearch: (body) => {
+        expect(body.sort).toEqual([
+          { "@timestamp": { order: "asc", numeric_type: "date_nanos", format: "strict_date_optional_time_nanos" } },
+          { _shard_doc: "asc" },
+        ]);
+        return {
+          status: 200,
+          response: {
+            hits: {
+              total: { value: 2, relation: "eq" },
+              hits: [
+                { _index: "logs-win-2026.11.01", _id: "malformed", sort: sortTuple, _source: {} },
+                { _index: "logs-win-2026.11.01", _id: "valid-last", sort: ["2026-11-14T14:00:00Z", 1], _source: {} },
+              ],
+            },
+          },
+        };
+      },
+    });
+    const dp = await ConnectedHuntDataPlane.open({
+      config: makeValidConfig(),
+      caseDefinition: makeValidCase(),
+      environ: { HUNT_ELASTIC_API_KEY: TEST_API_KEY },
+      transport,
+      nowEpochMs: FIXED_NOW_MS,
+    });
+    try {
+      for (const tuple of [
+        undefined,
+        null,
+        [],
+        ["2026-11-14T14:00:00Z"],
+        ["2026-11-14T14:00:00Z", 0, 1],
+        [1794664800123456789, 0],
+        ["not-a-date", 0],
+        ["2026-11-14T14:00:00Z", Number.MAX_SAFE_INTEGER + 1],
+        ["2026-11-14T14:00:00Z", -1],
+        ["2026-11-14T14:00:00Z", 1.5],
+        ["2026-11-14T14:00:00Z", "0"],
+      ]) {
+        sortTuple = tuple;
+        for (const search of [
+          () => dp.elasticSearch({ size: 2 }),
+          () => dp.detectionTest({ name: "nano-validation", q: "" }),
+          () => dp.huntLabQuery({ dataset: "events" }),
+        ]) {
+          try {
+            await search();
+            throw new Error("Expected backend_not_ready");
+          } catch (err) {
+            expect(extractDataPlaneError(err)).toMatchObject({ statusCode: 503, errorCode: "backend_not_ready" });
+          }
+        }
+      }
+    } finally {
+      await dp.close();
+    }
   });
 
   test("mints F04 collision-proof sha256(_index + '\\0' + _id) citations, persists citations.jsonl, rewrites Lucene, blocks event.id escapes, refuses /regex/, and gates unsupported tools", async () => {

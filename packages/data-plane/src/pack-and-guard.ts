@@ -161,8 +161,7 @@ export function validateCasePack(
     throwDataPlaneError(400, "invalid_arguments", "case.json case_id must match [a-z0-9-]{3,64}");
   }
 
-  const rawOrigin =
-    caseObj.data_origin === undefined ? "synthetic" : caseObj.data_origin;
+  const rawOrigin = caseObj.data_origin;
   if (
     typeof rawOrigin !== "string" ||
     !(DATA_ORIGINS as readonly string[]).includes(rawOrigin)

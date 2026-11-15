@@ -878,7 +878,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     const t0 = performance.now();
     const pack = validateCasePack(caseDirOrJsonPath, options);
     const cacheDir = options.cacheDir
-      ? path.resolve(options.cacheDir)
+      ? resolveRuntimeDir(options.cacheDir).rootDir
       : path.join(resolveRuntimeDir().rootDir, "case-cache");
     fs.mkdirSync(cacheDir, { recursive: true });
 
@@ -988,7 +988,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     const t0 = performance.now();
     const pack = validateCasePack(caseDirOrJsonPath, options);
     const cacheDir = options.cacheDir
-      ? path.resolve(options.cacheDir)
+      ? resolveRuntimeDir(options.cacheDir).rootDir
       : path.join(resolveRuntimeDir().rootDir, "case-cache");
     fs.mkdirSync(cacheDir, { recursive: true });
 
@@ -1582,11 +1582,11 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
       .query(
         `SELECT p.row_json
          FROM packets p
-         WHERE ${compiledFilter.whereSql}
+         WHERE p.ts_ns >= ? AND p.ts_ns < ? AND (${compiledFilter.whereSql})
          ORDER BY p.frame_number ASC
          LIMIT ? OFFSET ?`,
       )
-      .all(...compiledFilter.params, length + 1, start) as Array<{ row_json: string }>;
+      .all(this.pack.startNs, this.pack.endNs, ...compiledFilter.params, length + 1, start) as Array<{ row_json: string }>;
 
     const rows: Array<Record<string, unknown>> = [];
     let byteBudget = 0;
@@ -1839,11 +1839,18 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     const srv = await this.ensureLocalHttpServer();
     const routePath =
       params.page === "lab_console" ? "/view" : `/watch/${params.page}`;
+    const url = new URL(routePath, srv.baseUrl);
+    url.searchParams.set("key", srv.secret);
+    for (const name of ["q", "host", "expression", "field"] as const) {
+      if (params[name] !== undefined) {
+        url.searchParams.set(name, params[name]);
+      }
+    }
 
     return {
       case_id: this.caseId,
       page: params.page,
-      url: `${srv.baseUrl}${routePath}`,
+      url: url.toString(),
       title: rendered.title,
       summary: rendered.summary,
       returned: rendered.returned,
@@ -1871,7 +1878,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
         .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'packets'")
         .get() !== null;
     const checkFrame = hasPacketsTable
-      ? this.db.query("SELECT 1 FROM packets WHERE frame_number = ? LIMIT 1")
+      ? this.db.query("SELECT 1 FROM packets WHERE frame_number = ? AND ts_ns >= ? AND ts_ns < ? LIMIT 1")
       : null;
 
     const uniqueCitations = [...new Set(citations)];
@@ -1888,7 +1895,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
         if (frameMatch) {
           const frameNum = Number.parseInt(frameMatch[1]!, 10);
           const canonicalFrame = `frame-${frameNum}`;
-          if (checkFrame && checkFrame.get(frameNum)) {
+          if (checkFrame && checkFrame.get(frameNum, this.pack.startNs, this.pack.endNs)) {
             if (!frameIds.includes(canonicalFrame)) {
               frameIds.push(canonicalFrame);
             }

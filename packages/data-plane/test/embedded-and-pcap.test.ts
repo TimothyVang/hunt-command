@@ -638,6 +638,89 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
     expect(okWork.syntheticOnly).toBe(false);
   });
 
+  test("requires an explicit valid data_origin even when the operator supplies an expectation", () => {
+    const originDir = path.join(tmpRoot, "origin-case");
+    fs.mkdirSync(originDir);
+    const caseJson = JSON.parse(fs.readFileSync(path.join(caseDir, "case.json"), "utf8"));
+    for (const origin of [undefined, null, "", "unknown", 1]) {
+      fs.writeFileSync(
+        path.join(originDir, "case.json"),
+        JSON.stringify({ ...caseJson, data_origin: origin }),
+      );
+      for (const options of [{}, { expectedDataOrigin: "synthetic" as const }]) {
+        try {
+          validateCasePack(originDir, options);
+          throw new Error("Expected missing or invalid origin to be refused");
+        } catch (err) {
+          expect(extractDataPlaneError(err)?.errorCode).toBe("origin_not_allowed");
+        }
+      }
+    }
+  });
+
+  test("fences custom cache paths inside Git repositories, worktrees and junction targets before creating them", async () => {
+    for (const marker of ["directory", "worktree"] as const) {
+      const repo = path.join(tmpRoot, `cache-fence-${marker}`);
+      fs.mkdirSync(repo);
+      if (marker === "directory") fs.mkdirSync(path.join(repo, ".git"));
+      else fs.writeFileSync(path.join(repo, ".git"), "gitdir: unrelated");
+      const alias = path.join(tmpRoot, `cache-alias-${marker}`);
+      fs.symlinkSync(repo, alias, process.platform === "win32" ? "junction" : "dir");
+      for (const parent of [repo, alias]) {
+        const forbidden = path.join(parent, "nested", "cache");
+        expect(() => EmbeddedHuntDataPlane.openSync(caseDir, { cacheDir: forbidden })).toThrow(
+          /inside.*Git|inside.*git/i,
+        );
+        await expect(EmbeddedHuntDataPlane.open(caseDir, { cacheDir: forbidden })).rejects.toThrow(
+          /inside.*Git|inside.*git/i,
+        );
+        expect(fs.existsSync(path.join(repo, "nested"))).toBe(false);
+      }
+    }
+  });
+
+  test("scopes packet pagination and frame citations to the nanosecond half-open window on cold and warm caches", async () => {
+    const scopedDir = path.join(tmpRoot, "packet-window-case");
+    fs.mkdirSync(scopedDir);
+    fs.writeFileSync(path.join(scopedDir, "case.json"), JSON.stringify({
+      case_id: "packet-window-case",
+      data_origin: "synthetic",
+      time_range_utc: {
+        start_inclusive: "2026-11-14T10:00:00.000000001Z",
+        end_exclusive: "2026-11-14T10:00:00.000000003Z",
+      },
+    }));
+    const data = buildEthIpv4Header([10, 0, 0, 1], [10, 0, 0, 2], 17, buildUdpSegment(1234, 4321, new Uint8Array()));
+    fs.writeFileSync(path.join(scopedDir, "traffic.pcap"), buildPcapNsFile(
+      [0, 1, 2, 3].map((tsNsSub) => ({
+        tsSec: Date.parse("2026-11-14T10:00:00Z") / 1000, tsNsSub, data,
+      })),
+    ));
+    for (const mode of ["async", "sync"] as const) {
+      const options = { cacheDir: path.join(cacheDir, mode) };
+      for (const warm of [false, true]) {
+        const dp = mode === "async"
+          ? await EmbeddedHuntDataPlane.open(scopedDir, options)
+          : EmbeddedHuntDataPlane.openSync(scopedDir, options);
+        try {
+          expect(dp.cacheHit).toBe(warm);
+          expect(dp.packetFields({}).rows.map((r) => r["frame.number"])).toEqual([2, 3]);
+          const first = dp.packetFields({ filter: "udp.dstport == 4321", length: 1 });
+          expect(first.rows.map((r) => r["frame.number"])).toEqual([2]);
+          expect(first.more).toBe(true);
+          const second = dp.packetFields({ start: 1, length: 1 });
+          expect(second.rows.map((r) => r["frame.number"])).toEqual([3]);
+          expect(second.more).toBe(false);
+          const citations = dp.verifyCitations(["frame-1", "frame-2", "frame-3", "frame-4"]);
+          expect(citations.resolved.frameIds).toEqual(["frame-2", "frame-3"]);
+          expect(citations.unresolved).toEqual(["frame-1", "frame-4"]);
+        } finally {
+          await dp.close();
+        }
+      }
+    }
+  });
+
   test("enforces closure-bound HMAC-SHA256 RoleCapabilityMint, ROLE_TOOL_OWNERSHIP (403), 405 read_only, and wire secret scrubbing", async () => {
     const dp = await EmbeddedHuntDataPlane.open(caseDir, { cacheDir });
     try {
@@ -1009,6 +1092,7 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
       path.join(pcapngDir, "case.json"),
       JSON.stringify({
         case_id: "pcapng-case-001",
+        data_origin: "synthetic",
         question: "Verify pcapng indexing",
         time_range_utc: {
           start_inclusive: "2026-11-14T10:00:00Z",
@@ -1138,7 +1222,22 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
         const res = await dp.labBrowser({ page, field: "tls.ja4" });
         expect(res.case_id).toBe("synth-case-001");
         expect(res.blocked_requests).toBe(0);
+        const opened = await fetch(res.url, { proxy: "", redirect: "error" });
+        expect(opened.status).toBe(200);
+        expect(opened.headers.get("content-type")).toContain("text/html");
+        const html = await opened.text();
+        expect(html).toContain(res.title);
+        const withoutKey = new URL(res.url);
+        withoutKey.searchParams.delete("key");
+        const refused = await fetch(withoutKey, { proxy: "", redirect: "error" });
+        expect(refused.status).toBe(401);
       }
+
+      const filtered = await dp.labBrowser({ page: "kibana_discover", q: "host.name:DC-01" });
+      const filteredPage = await fetch(filtered.url, { proxy: "", redirect: "error" });
+      const filteredHtml = await filteredPage.text();
+      expect(filteredHtml).toContain("evt-00003");
+      expect(filteredHtml).not.toContain("evt-00001");
 
       // 5. decideWatchRequest policy checks
       const scope = {

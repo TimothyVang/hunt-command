@@ -4,6 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { z } from "zod";
 import {
   exportOtlpLoopback,
   guardEgress,
@@ -35,6 +36,28 @@ function resolveExistingCaseDir(candidates: readonly string[]): string | null {
   return null;
 }
 
+function prepareSyntheticBenchmarkCase(sourceDir: string, caseId: string): string {
+  // Legacy benchmark manifests explicitly describe invented telemetry. Migrate only a test-owned copy.
+  const definition = z.object({
+    case_id: z.literal(caseId),
+    data_origin: z.literal("synthetic").optional(),
+    sources: z.array(z.object({
+      artifact: z.string(),
+      coverage: z.string().regex(/^(?:Invented|Selected invented) /),
+    })).nonempty(),
+  }).passthrough().parse(JSON.parse(fs.readFileSync(path.join(sourceDir, "case.json"), "utf8")));
+  const caseDir = makeTempDir(`hunt-bench-${caseId}-`);
+  for (const artifact of ["events.jsonl", "traffic.pcap", "intel.jsonl"]) {
+    const source = path.join(sourceDir, artifact);
+    if (fs.existsSync(source)) fs.copyFileSync(source, path.join(caseDir, artifact));
+  }
+  fs.writeFileSync(
+    path.join(caseDir, "case.json"),
+    JSON.stringify({ ...definition, data_origin: "synthetic" }),
+  );
+  return caseDir;
+}
+
 const DNS_LAB_DIR = resolveExistingCaseDir([
   "C:/Users/newbi/Desktop/bot-framework/hermes-hunt-bots/repo/runtime/cases/dns-lab-001/evidence",
   "C:/Users/newbi/Desktop/bot-framework/hermes-hunt-bots/repo/runtime/cases/dns-lab-001",
@@ -54,10 +77,11 @@ describe("Real Case Integration & Latency Benchmarks (dns-lab-001 & lab-med-001)
     }
 
     const cacheDir = makeTempDir("hunt-bench-dns-cache-");
+    const caseDir = prepareSyntheticBenchmarkCase(DNS_LAB_DIR, "dns-lab-001");
 
     // 1. Cold open benchmark
     const tCold0 = performance.now();
-    const dpCold = await EmbeddedHuntDataPlane.open(DNS_LAB_DIR, {
+    const dpCold = await EmbeddedHuntDataPlane.open(caseDir, {
       cacheDir,
     });
     const coldMs = performance.now() - tCold0;
@@ -88,7 +112,7 @@ describe("Real Case Integration & Latency Benchmarks (dns-lab-001 & lab-med-001)
 
     // 2. Warm attach benchmark (< 20ms)
     const tWarm0 = performance.now();
-    const dpWarm = await EmbeddedHuntDataPlane.open(DNS_LAB_DIR, {
+    const dpWarm = await EmbeddedHuntDataPlane.open(caseDir, {
       cacheDir,
     });
     const warmMs = performance.now() - tWarm0;
@@ -187,7 +211,7 @@ describe("Real Case Integration & Latency Benchmarks (dns-lab-001 & lab-med-001)
 
     // Rule 4 EgressGuard: strips all sensitive case content when !synthetic_only
     const guarded = guardEgress({
-      hunt_uuid: "hunt-work-001",
+      hunt_uuid: "0f5e4d3c-2b1a-4978-8abc-0123456789ab",
       data_origin: "work-export",
       synthetic_only: false,
       wave: "investigation",
@@ -230,10 +254,11 @@ describe("Real Case Integration & Latency Benchmarks (dns-lab-001 & lab-med-001)
     }
 
     const cacheDir = makeTempDir("hunt-bench-med-cache-");
+    const caseDir = prepareSyntheticBenchmarkCase(LAB_MED_DIR, "lab-med-001");
 
     // 1. Cold Worker indexing across 19.8 MB events.jsonl + 27.8 MB traffic.pcap + intel.jsonl
     const tCold0 = performance.now();
-    const dpCold = await EmbeddedHuntDataPlane.open(LAB_MED_DIR, {
+    const dpCold = await EmbeddedHuntDataPlane.open(caseDir, {
       cacheDir,
     });
     const coldMs = performance.now() - tCold0;
@@ -296,7 +321,7 @@ describe("Real Case Integration & Latency Benchmarks (dns-lab-001 & lab-med-001)
 
       // Threat intel lookup: read first indicator from intel.jsonl to verify exact match + ioc-* citation
       const firstIntelLine = fs
-        .readFileSync(path.join(LAB_MED_DIR, "intel.jsonl"), "utf8")
+        .readFileSync(path.join(caseDir, "intel.jsonl"), "utf8")
         .split(/\r?\n/)
         .find((l) => l.trim().length > 0)!;
       const parsedIntel = JSON.parse(firstIntelLine) as {
@@ -326,7 +351,7 @@ describe("Real Case Integration & Latency Benchmarks (dns-lab-001 & lab-med-001)
 
     // 2. Warm attach benchmark on 20,931-event + 45,836-packet SQLite snapshot (< 20ms!)
     const tWarm0 = performance.now();
-    const dpWarm = await EmbeddedHuntDataPlane.open(LAB_MED_DIR, {
+    const dpWarm = await EmbeddedHuntDataPlane.open(caseDir, {
       cacheDir,
     });
     const warmMs = performance.now() - tWarm0;

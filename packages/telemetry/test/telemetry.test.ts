@@ -551,7 +551,7 @@ describe("@hunt-command/telemetry — Hot SQLite WAL, Cold Zstd, Scrubber, OTLP 
     for (const origin of ["public-dataset", "work-export", "work-connected"] as const) {
       const card = guardEgress(
         {
-          hunt_uuid: "hunt-9f8e7d6c",
+          hunt_uuid: "0f5e4d3c-2b1a-4978-8abc-0123456789ab",
           data_origin: origin,
           synthetic_only: false,
           wave: "incident",
@@ -606,7 +606,7 @@ describe("@hunt-command/telemetry — Hot SQLite WAL, Cold Zstd, Scrubber, OTLP 
 
     // Even if a caller lies and passes synthetic_only: true while data_origin === "work-export", fail-closed!
     const spoofed = guardEgress({
-      hunt_uuid: "hunt-spoof-check",
+      hunt_uuid: "0f5e4d3c-2b1a-4978-8abc-0123456789ab",
       data_origin: "work-export",
       synthetic_only: true,
       wave: "investigation",
@@ -621,7 +621,7 @@ describe("@hunt-command/telemetry — Hot SQLite WAL, Cold Zstd, Scrubber, OTLP 
     // Reject free-text reason_code or sensitive hunt_uuid
     expect(() =>
       guardEgress({
-        hunt_uuid: "hunt-bad-reason",
+        hunt_uuid: "0f5e4d3c-2b1a-4978-8abc-0123456789ab",
         data_origin: "work-connected",
         synthetic_only: false,
         wave: "scope",
@@ -646,7 +646,7 @@ describe("@hunt-command/telemetry — Hot SQLite WAL, Cold Zstd, Scrubber, OTLP 
 
     // Notification blocks include explicit non-synthetic operator warning
     const block = EgressGuard.buildGateNotificationBlocks({
-      hunt_uuid: "hunt-notify-01",
+      hunt_uuid: "0f5e4d3c-2b1a-4978-8abc-0123456789ab",
       data_origin: "work-connected",
       synthetic_only: false,
       wave: "incident",
@@ -672,5 +672,122 @@ describe("@hunt-command/telemetry — Hot SQLite WAL, Cold Zstd, Scrubber, OTLP 
       allowWorkFilm: true,
     });
     expect(overriddenFilm.watermarkBanner).toBe("NON-SYNTHETIC — OPERATOR LOCAL ONLY");
+  });
+
+  test("rejects raw identifiers at every non-synthetic egress boundary", () => {
+    const record = {
+      hunt_uuid: "0f5e4d3c-2b1a-4978-8abc-0123456789ab",
+      data_origin: "work-connected",
+      synthetic_only: false,
+      wave: "scope",
+      gate_kind: "scope",
+      status_enum: "awaiting_approval",
+      opened_at_utc: "2026-11-14T20:18:00Z",
+      reason_code: "awaiting_human_scope",
+    } as const;
+    for (const data_origin of [
+      "synthetic",
+      "public-dataset",
+      "work-export",
+      "work-connected",
+    ] as const) {
+      for (const synthetic_only of [false, true]) {
+        if (data_origin === "synthetic" && synthetic_only) continue;
+        for (const hunt_uuid of [
+          "dc01",
+          "dc01.corp.local",
+          "evil-c2.example",
+          "analyst_alice",
+          "corp-ir-2026-99",
+          "evt-00001234",
+          "10.20.30.40",
+          "C:\\Users\\analyst\\case",
+          "0f5e4d3c2b1a49788abc0123456789ab",
+          "0f5e4d3c-2b1a-1978-8abc-0123456789ab",
+          "0f5e4d3c-2b1a-4978-7abc-0123456789ab",
+          "00000000-0000-0000-0000-000000000000",
+          "0f5e4d3c-2b1a-4978-8abc-0123456789ab\n",
+        ]) {
+          expect(() =>
+            guardEgress({ ...record, data_origin, synthetic_only, hunt_uuid }),
+          ).toThrow(/hunt_uuid must/);
+          expect(() =>
+            EgressGuard.buildGateNotificationBlocks({
+              ...record,
+              data_origin,
+              synthetic_only,
+              hunt_uuid,
+            }),
+          ).toThrow(/hunt_uuid must/);
+        }
+      }
+    }
+  });
+
+  test("serializes only registered reason codes with an opaque hunt UUID", () => {
+    const record = {
+      hunt_uuid: "0f5e4d3c-2b1a-4978-8abc-0123456789ab",
+      data_origin: "work-connected",
+      synthetic_only: false,
+      wave: "scope",
+      gate_kind: "scope",
+      status_enum: "awaiting_approval",
+      opened_at_utc: "2026-11-14T20:18:00Z",
+    } as const;
+    for (const reason_code of [
+      "dc01",
+      "analyst_alice",
+      "corp_ir_2026_99",
+      "sensitive_investigation",
+      "dc01.corp.local",
+      "incident_threshold_met_dc01",
+      "Host DC01 compromised at 10.0.0.1",
+    ]) {
+      expect(() => guardEgress({ ...record, reason_code })).toThrow(/registered/);
+      expect(() =>
+        EgressGuard.buildGateNotificationBlocks({ ...record, reason_code }),
+      ).toThrow(/registered/);
+    }
+    for (const reason_code of ["awaiting_human_scope", "incident_threshold_met"] as const) {
+      const block = EgressGuard.buildGateNotificationBlocks({ ...record, reason_code });
+      expect(block.payload).toEqual({
+        hunt_uuid: record.hunt_uuid,
+        wave: record.wave,
+        gate_kind: record.gate_kind,
+        status_enum: record.status_enum,
+        opened_at_utc: record.opened_at_utc,
+        reason_code,
+      });
+      expect(block.text).toContain(`hunt=${record.hunt_uuid}`);
+      expect(block.text).toContain(`reason=${reason_code}`);
+    }
+    for (const reason_code of [undefined, null, ""]) {
+      expect(guardEgress({ ...record, reason_code }).reason_code).toBeNull();
+    }
+  });
+
+  test("preserves friendly synthetic hunt IDs only with both synthetic provenance flags", () => {
+    const card = guardEgress(
+      {
+        hunt_uuid: "hunt-synthetic-lab",
+        data_origin: "synthetic",
+        synthetic_only: true,
+        wave: "scope",
+        gate_kind: "scope",
+        status_enum: "awaiting_approval",
+        opened_at_utc: "2026-11-14T20:18:00Z",
+        reason_code: "awaiting_human_scope",
+        case_id: "synthetic-case",
+        summary: "Invented lab host",
+      },
+      { includeSummaryOnSynthetic: true },
+    );
+    expect(card).toMatchObject({
+      hunt_uuid: "hunt-synthetic-lab",
+      synthetic_only: true,
+      case_id: "synthetic-case",
+      summary: "Invented lab host",
+      reason_code: "awaiting_human_scope",
+    });
   });
 });

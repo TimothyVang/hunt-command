@@ -62,6 +62,9 @@ const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const CASE_ID_RE = /^[a-z0-9-]{3,64}$/;
 const ERROR_TYPE_RE = /^[a-z_]{1,100}$/;
 const CITATION_FORM_RE = /^evt-\d{16}$/;
+const SORT_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:[0-5]\d:[0-5]\d(?:\.\d{1,9})?Z$/;
+
+type ConnectedSortTuple = [timestamp: string, shardDoc: number];
 
 // ============================================================================
 // Exact 139 Base Write Privileges & Actions + 16 Newer Probes (connected.py:87-152)
@@ -1514,6 +1517,15 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
       throwDataPlaneError(503, "backend_not_ready", "Partial Elasticsearch response");
     }
 
+    const hits = (value.hits as Record<string, unknown> | undefined)?.hits;
+    if (
+      Array.isArray(body.sort) &&
+      Array.isArray(hits) &&
+      hits.some((hit) => !ConnectedHuntDataPlane.isSortTuple(hit?.sort))
+    ) {
+      throwDataPlaneError(503, "backend_not_ready", "Invalid Elasticsearch sort tuple");
+    }
+
     if (this.generation === usedGen && typeof value.pit_id === "string" && value.pit_id.length > 0) {
       if (value.pit_id !== this.pit) {
         this.pit = value.pit_id;
@@ -1720,17 +1732,43 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
 
   private buildEsSort(order: "asc" | "desc"): Array<Record<string, unknown>> {
     return [
-      { "@timestamp": { order, numeric_type: "date_nanos" } },
+      { "@timestamp": { order, numeric_type: "date_nanos", format: "strict_date_optional_time_nanos" } },
       { _shard_doc: order },
     ];
   }
 
-  private encodeAfterToken(sortTuple: readonly unknown[]): string {
+  private static isSortTuple(value: unknown): value is ConnectedSortTuple {
+    if (
+      !Array.isArray(value) ||
+      value.length !== 2 ||
+      typeof value[0] !== "string" ||
+      !SORT_TIMESTAMP_RE.test(value[0]) ||
+      !Number.isSafeInteger(value[1]) ||
+      value[1] < 0
+    ) {
+      return false;
+    }
+    try {
+      parseTimestampNs(value[0]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private encodeAfterToken(sortTuple: unknown): string {
+    if (
+      !ConnectedHuntDataPlane.isSortTuple(sortTuple) ||
+      !Number.isSafeInteger(this.lastSearchGeneration) ||
+      this.lastSearchGeneration < 1
+    ) {
+      throwDataPlaneError(503, "backend_not_ready", "Invalid Elasticsearch cursor tuple");
+    }
     const payload = JSON.stringify([...sortTuple, this.lastSearchGeneration]);
     return Buffer.from(payload, "utf8").toString("base64url");
   }
 
-  private decodeAfterToken(token: string): [number, number] {
+  private decodeAfterToken(token: string): ConnectedSortTuple {
     if (typeof token !== "string" || !/^[A-Za-z0-9_-]{1,400}$/.test(token)) {
       throwDataPlaneError(400, "invalid_query", "Invalid after token");
     }
@@ -1743,14 +1781,16 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
     if (
       !Array.isArray(parsed) ||
       parsed.length !== 3 ||
-      parsed.some((item) => typeof item !== "number" || !Number.isInteger(item))
+      !ConnectedHuntDataPlane.isSortTuple(parsed.slice(0, 2)) ||
+      !Number.isSafeInteger(parsed[2]) ||
+      parsed[2] < 1
     ) {
       throwDataPlaneError(400, "invalid_query", "Invalid after token structure");
     }
     if (parsed[2] !== this.generation) {
       throwDataPlaneError(400, "cursor_expired", "Snapshot generation changed; cursor expired");
     }
-    return [parsed[0] as number, parsed[1] as number];
+    return [parsed[0] as string, parsed[1] as number];
   }
 
   private assertCaseParam(caseIdParam: string | undefined): void {
