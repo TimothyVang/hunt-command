@@ -4,9 +4,11 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Handoff, ProfileId } from "@hunt-command/shared";
 import {
-  GATE_CONTEXT_MAX_EVIDENCE,
+  GATE_CONTEXT_FIRST_PAGE,
+  GATE_CONTEXT_MAX_CITED,
   GateContextError,
   buildGateContext,
+  buildGateEvidencePage,
   runHuntCli,
   type CitationVerificationReceipt,
   type HuntDataPlanePort,
@@ -161,7 +163,11 @@ describe("hunt.gateContext over serve with the default case data plane", () => {
     expect(result).toMatchObject({ gate: "incident", payload_sha256: incidentSha });
     expect(result.scope).toBeUndefined();
     expect(result.incident.citation_receipt).toEqual(parked.citation_receipt as CitationVerificationReceipt);
-    expect(result.incident.evidence_truncated).toBe(false);
+    expect(result.incident.cited).toEqual([
+      { id: "evt-gc-1", kind: "evt", status: "verified" },
+      { id: "evt-gc-2", kind: "evt", status: "verified" },
+    ]);
+    expect(result.incident).toMatchObject({ evidence_total: 2, evidence_next_cursor: null });
     expect(result.incident.evidence.map((e: { id: string }) => e.id)).toEqual(["evt-gc-1", "evt-gc-2"]);
     const [e1, e2] = result.incident.evidence;
     expect(e1).toMatchObject({ kind: "evt", status: "verified", timestamp_iso: "2026-11-14T10:01:00Z" });
@@ -266,9 +272,19 @@ describe("buildGateContext", () => {
   });
   const withCited = (ids: string[]) =>
     baseRun({ results: { incident: { handoff: { claims: [statement(ids)], limitations: [] } } } as never });
+  const verifyAgainst = (records: readonly string[]) => async (r: { case_id: string; event_ids: readonly string[]; frame_ids: readonly string[]; ioc_ids: readonly string[] }) => {
+    const known = new Set(records);
+    const miss = (ids: readonly string[]) => ids.filter((id) => !known.has(id));
+    return {
+      verified: true, checked_at: "t", case_id: r.case_id, total_checked: 0,
+      missing_event_ids: miss(r.event_ids), missing_frame_ids: miss(r.frame_ids), missing_ioc_ids: miss(r.ioc_ids),
+      ambiguous_ids: [], out_of_scope_ids: [], source_status: "ok" as const,
+    };
+  };
   const plane = (records: string[]): HuntDataPlanePort =>
     ({
       caseMetadata: { case_id: "case-x", data_origin: "synthetic" },
+      verifyCitations: verifyAgainst(records),
       readCitedRecords: async (ids: readonly string[]) =>
         ids.filter((id) => records.includes(id)).map((id) => ({ id, kind: "evt", timestamp_iso: null, title: id, record: { a: 1 } })),
     }) as unknown as HuntDataPlanePort;
@@ -290,11 +306,63 @@ describe("buildGateContext", () => {
     expect(ctx.incident!.evidence.find((e) => e.id === "frame-9")).toMatchObject({ kind: "frame", title: "", fields: {}, timestamp_iso: null });
   });
 
-  test("caps evidence at 500 ids and says so", async () => {
-    const ids = Array.from({ length: GATE_CONTEXT_MAX_EVIDENCE + 20 }, (_, i) => `evt-${String(i).padStart(4, "0")}`);
-    const ctx = await buildGateContext({ run: withCited(ids), receipts: [], resolveDataPlane: () => plane(ids) });
-    expect(ctx.incident!.evidence).toHaveLength(GATE_CONTEXT_MAX_EVIDENCE);
-    expect(ctx.incident!.evidence_truncated).toBe(true);
+  test("1,200 cited ids: cited is complete and pages reassemble every record exactly once", async () => {
+    const ids = Array.from({ length: 1_200 }, (_, i) => `evt-${String(i).padStart(5, "0")}`);
+    const present = ids.filter((_, i) => i % 7 !== 0);
+    const run = withCited(ids);
+    const ctx = await buildGateContext({ run, receipts: [], resolveDataPlane: () => plane(present) });
+    const inc = ctx.incident!;
+    expect(inc.cited.map((c) => c.id)).toEqual(ids);
+    expect(inc.cited.filter((c) => c.status === "verified").map((c) => c.id)).toEqual(present);
+    expect(inc.cited.filter((c) => c.status === "unresolved")).toHaveLength(ids.length - present.length);
+    expect(inc.evidence).toHaveLength(GATE_CONTEXT_FIRST_PAGE);
+    expect(inc.evidence_total).toBe(1_200);
+    const seen = [...inc.evidence];
+    let cursor = inc.evidence_next_cursor;
+    let pages = 0;
+    while (cursor) {
+      const page = await buildGateEvidencePage({ run, cursor, limit: 333, resolveDataPlane: () => plane(present) });
+      expect(page).toMatchObject({ run_id: "hunt-x", gate: "incident", payload_sha256: run.open_gate!.payload_sha256, evidence_total: 1_200 });
+      expect(page.evidence.length).toBeLessThanOrEqual(333);
+      seen.push(...page.evidence);
+      cursor = page.evidence_next_cursor;
+      pages++;
+    }
+    expect(pages).toBe(Math.ceil((1_200 - GATE_CONTEXT_FIRST_PAGE) / 333));
+    expect(seen.map((e) => e.id)).toEqual(ids);
+    // Each page's statuses agree with `cited`, and verified records carry their fields.
+    expect(seen.map((e) => e.status)).toEqual(inc.cited.map((c) => c.status));
+    expect(seen.filter((e) => e.status === "verified").every((e) => e.fields.a === 1)).toBe(true);
+  });
+
+  test("evidence cursors are bound to the run, the gate and its digest", async () => {
+    const ids = Array.from({ length: 300 }, (_, i) => `evt-${String(i).padStart(5, "0")}`);
+    const run = withCited(ids);
+    const ctx = await buildGateContext({ run, receipts: [], resolveDataPlane: () => plane(ids) });
+    const cursor = ctx.incident!.evidence_next_cursor!;
+    const codeOf = async (p: Promise<unknown>) => p.then(() => "ok", (err) => (err instanceof GateContextError ? err.errorCode : "other"));
+    const page = (r: PersistedHuntRun, c: string) => buildGateEvidencePage({ run: r, cursor: c, limit: 50, resolveDataPlane: () => plane(ids) });
+
+    expect(await codeOf(page(run, cursor))).toBe("ok");
+    expect(await codeOf(page({ ...run, run_id: "hunt-other" }, cursor))).toBe("invalid_arguments");
+    expect(await codeOf(page({ ...run, open_gate: { ...run.open_gate!, payload_sha256: "ef".repeat(32) } }, cursor))).toBe("stale_cursor");
+    expect(await codeOf(page({ ...run, open_gate: { ...run.open_gate!, gate: "scope" } }, cursor))).toBe("stale_cursor");
+    expect(await codeOf(page({ ...run, status: "running", open_gate: null }, cursor))).toBe("no_open_gate");
+    expect(await codeOf(page(run, "gev1.not-json"))).toBe("invalid_arguments");
+    expect(await codeOf(page(run, "something-else"))).toBe("invalid_arguments");
+  });
+
+  test("more than 20,000 cited ids fails closed instead of truncating", async () => {
+    const ids = Array.from({ length: GATE_CONTEXT_MAX_CITED + 1 }, (_, i) => `evt-${String(i).padStart(6, "0")}`);
+    let error: unknown;
+    try {
+      await buildGateContext({ run: withCited(ids), receipts: [], resolveDataPlane: () => plane(ids) });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(GateContextError);
+    expect((error as GateContextError).errorCode).toBe("gate_context_unavailable");
+    expect((error as Error).message).toContain("20000");
   });
 
   test("fails closed: no open gate, wrong-case plane, unreadable plane, reconcile without receipts", async () => {
@@ -311,7 +379,7 @@ describe("buildGateContext", () => {
     expect(await codeOf(buildGateContext({ run: withCited(["evt-ok"]), receipts: [], resolveDataPlane: () => otherCase }))).toBe(
       "gate_context_unavailable",
     );
-    const noReader = { caseMetadata: { case_id: "case-x", data_origin: "synthetic" } } as unknown as HuntDataPlanePort;
+    const noReader = { caseMetadata: { case_id: "case-x", data_origin: "synthetic" }, verifyCitations: verifyAgainst(["evt-ok"]) } as unknown as HuntDataPlanePort;
     expect(await codeOf(buildGateContext({ run: withCited(["evt-ok"]), receipts: [], resolveDataPlane: () => noReader }))).toBe(
       "gate_context_unavailable",
     );
@@ -334,7 +402,8 @@ describe("buildGateContext", () => {
 
 describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () => {
   /** The real case data plane, except that citation verification reports its source unavailable. */
-  async function flakyPlane(readable: boolean): Promise<{ plane: HuntDataPlanePort; close: () => Promise<void> }> {
+  async function flakyPlane(readable: boolean): Promise<{ plane: HuntDataPlanePort; close: () => Promise<void>; recover: () => void }> {
+    let recovered = false;
     const { createCaseDirDataPlaneResolver } = await import("../src/index.ts");
     const resolver = createCaseDirDataPlaneResolver({ casesDir, cacheDir: makeTmpDir("hunt-gatectx-cache-") });
     const real = await resolver.resolve(CASE_ID);
@@ -342,7 +411,7 @@ describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () 
       caseMetadata: real.caseMetadata,
       capabilities: () => real.capabilities(),
       executeTool: (...a) => real.executeTool(...a),
-      verifyCitations: async (r) => ({
+      verifyCitations: async (r) => recovered ? real.verifyCitations(r) : ({
         verified: false,
         checked_at: new Date().toISOString(),
         case_id: r.case_id,
@@ -361,13 +430,13 @@ describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () 
             throw new Error("events index offline");
           },
     };
-    return { plane, close: () => resolver.close() };
+    return { plane, close: () => resolver.close(), recover: () => { recovered = readable; } };
   }
 
   for (const readable of [true, false]) {
     test(`opens the gate through serve and returns its context (source ${readable ? "back" : "still down"})`, async () => {
       runtimeDir = makeTmpDir("hunt-gatectx-csu-rt-");
-      const { plane, close } = await flakyPlane(readable);
+      const { plane, close, recover } = await flakyPlane(readable);
       try {
       const out: string[] = [];
       const code = await runHuntCli(
@@ -384,6 +453,7 @@ describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () 
       const parked = started.result as PersistedHuntRun;
       expect(parked.open_gate).toMatchObject({ gate: "reconcile", reason_code: "citation_source_unavailable", unknown_step_id: "scope" });
 
+      recover();
       const ctxOut: string[] = [];
       await runHuntCli(
         ["serve", "--runtime-dir", runtimeDir],
@@ -397,21 +467,123 @@ describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () 
       expect(reconcile.reason_code).toBe("citation_source_unavailable");
       expect(reconcile.citation_receipt).toMatchObject({ source_status: "unavailable" });
       expect(JSON.stringify(ctx.result)).not.toContain(LEAK);
-      expect(reconcile.evidence_truncated).toBe(false);
+      expect(reconcile).toMatchObject({ evidence_total: 2, evidence_next_cursor: null });
+      const status = readable ? "verified" : "unchecked";
+      expect(reconcile.cited).toEqual([
+        { id: "evt-gc-1", kind: "evt", status },
+        { id: "evt-gc-2", kind: "evt", status },
+      ]);
+      expect(reconcile.evidence.map((e: { id: string; status: string }) => [e.id, e.status])).toEqual([
+        ["evt-gc-1", status],
+        ["evt-gc-2", status],
+      ]);
       if (readable) {
         expect(reconcile.unavailable_sources).toEqual([]);
-        expect(reconcile.evidence.map((e: { id: string; status: string }) => [e.id, e.status])).toEqual([
-          ["evt-gc-1", "verified"],
-          ["evt-gc-2", "verified"],
-        ]);
         expect(reconcile.evidence[0].fields["host.name"]).toBe("workstation-01");
       } else {
         expect(reconcile.unavailable_sources).toEqual(["events"]);
-        expect(reconcile.evidence).toEqual([]);
+        expect(reconcile.evidence[0]).toMatchObject({ title: "", fields: {}, timestamp_iso: null });
       }
       } finally {
         await close();
       }
     });
   }
+});
+
+describe("paged incident evidence over the real serve binary", () => {
+  const PAGE_CASE = "gate-page-001";
+  const N = 250;
+  const ids = Array.from({ length: N }, (_, i) => `evt-p${String(i).padStart(4, "0")}`);
+
+  test("gateContext returns all statuses and a cursor; hunt.gateEvidencePage returns the rest", async () => {
+    const pageCases = makeTmpDir("hunt-gatepage-cases-");
+    const caseDir = path.join(pageCases, PAGE_CASE);
+    fs.mkdirSync(caseDir);
+    fs.writeFileSync(
+      path.join(caseDir, "case.json"),
+      JSON.stringify({
+        case_id: PAGE_CASE,
+        question: "Paged evidence case.",
+        data_origin: "synthetic",
+        time_range_utc: { start_inclusive: "2026-11-14T10:00:00Z", end_exclusive: "2026-11-14T11:00:00Z" },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(caseDir, "events.jsonl"),
+      ids.map((id, i) => JSON.stringify({
+        "@timestamp": `2026-11-14T10:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}Z`,
+        event: { id, code: "1" },
+        host: { name: `workstation-${i}` },
+        message: `event ${i}`,
+      })).join("\n") + "\n",
+    );
+    const chunk = (xs: string[], n: number) => Array.from({ length: Math.ceil(xs.length / n) }, (_, i) => xs.slice(i * n, i * n + n));
+    const pageRunner: ModelRunnerPort = {
+      ...runner,
+      runTurn: async (req) => {
+        const claims = req.stepId === "incident"
+          ? chunk(ids, 150).map((part, i) => ({
+              claim_id: `incident:c${i}`, kind: "finding" as const, statement: `Cited ${part.join(", ")}.`,
+              evidence_ids: ["events.jsonl"], entity_ids: [], contradicts: [],
+            }))
+          : [{ claim_id: `${req.stepId}:c1`, kind: "observed" as const, statement: `Saw ${ids[0]}.`, evidence_ids: ["events.jsonl"], entity_ids: [], contradicts: [] }];
+        const h: Handoff = { ...handoff(req.stepId, req.profile), case_id: PAGE_CASE, claims, limitations: [] };
+        const res = await runner.runTurn(req);
+        return { ...res, output_text: JSON.stringify(h) };
+      },
+    };
+    const rt = makeTmpDir("hunt-gatepage-rt-");
+    const serveRt = async (lines: string[], withRunner: boolean) => {
+      const out: string[] = [];
+      await runHuntCli(
+        ["serve", "--runtime-dir", rt, "--cases-dir", pageCases],
+        { writeStdout: (t) => void out.push(t), writeStderr: () => {} },
+        { ...(withRunner ? { modelRunner: pageRunner } : {}), stdin: linesOf(...lines) },
+      );
+      return out.join("").trim().split("\n").map((l) => JSON.parse(l) as RpcLine).filter((l) => l.id !== undefined);
+    };
+    const [started] = await serveRt([rpc("s", "hunt.start", { run_id: "hunt-page", case_id: PAGE_CASE, scope: "Paged scope.", follow_ups: 0 })], true);
+    expect(started!.error).toBeUndefined();
+    const tokenOut: string[] = [];
+    await runHuntCli(["token", "--principal", "alice", "--role", "analyst", "--runtime-dir", rt], {
+      writeStdout: (t) => void tokenOut.push(t), writeStderr: () => {},
+    });
+    const [decided] = await serveRt([rpc("d", "hunt.decideGate", {
+      hunt_id: "hunt-page", gate: "scope", action: "approve", operator_token: tokenOut.join("").trim(),
+      payload_sha256: (started!.result as PersistedHuntRun).open_gate!.payload_sha256, check_note: "Approved.",
+    })], true);
+    expect((decided!.result as PersistedHuntRun).open_gate?.gate).toBe("incident");
+
+    const binary = async (line: string): Promise<RpcLine> => {
+      const proc = Bun.spawn(
+        [process.execPath, path.join(import.meta.dir, "..", "src", "cli.ts"), "serve", "--runtime-dir", rt, "--cases-dir", pageCases],
+        { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true },
+      );
+      proc.stdin.write(`${line}\n`);
+      await proc.stdin.end();
+      const stdout = await new Response(proc.stdout).text();
+      expect(await proc.exited).toBe(0);
+      return stdout.trim().split("\n").map((l) => JSON.parse(l) as RpcLine).find((l) => l.id === "b")!;
+    };
+    const ctx = await binary(rpc("b", "hunt.gateContext", { run_id: "hunt-page" }));
+    expect(ctx.error).toBeUndefined();
+    const inc = ctx.result.incident;
+    expect(inc.cited.map((c: { id: string }) => c.id)).toEqual(ids);
+    expect(inc.cited.every((c: { status: string }) => c.status === "verified")).toBe(true);
+    expect(inc.evidence).toHaveLength(GATE_CONTEXT_FIRST_PAGE);
+    expect(inc.evidence_total).toBe(N);
+    expect(typeof inc.evidence_next_cursor).toBe("string");
+
+    const page = await binary(rpc("b", "hunt.gateEvidencePage", { run_id: "hunt-page", cursor: inc.evidence_next_cursor, limit: 500 }));
+    expect(page.error).toBeUndefined();
+    expect(page.result).toMatchObject({ run_id: "hunt-page", gate: "incident", evidence_total: N, evidence_next_cursor: null });
+    expect([...inc.evidence, ...page.result.evidence].map((e: { id: string }) => e.id)).toEqual(ids);
+    expect(page.result.evidence.at(-1).fields["host.name"]).toBe(`workstation-${N - 1}`);
+
+    const foreign = await binary(rpc("b", "hunt.gateEvidencePage", { run_id: "hunt-gc-1", cursor: inc.evidence_next_cursor, limit: 10 }));
+    expect(foreign.error!.error_code).toBe("hunt_not_found");
+    const bad = await binary(rpc("b", "hunt.gateEvidencePage", { run_id: "hunt-page", cursor: inc.evidence_next_cursor, limit: 501 }));
+    expect(bad.error!.error_code).toBe("invalid_arguments");
+  }, 120_000);
 });
