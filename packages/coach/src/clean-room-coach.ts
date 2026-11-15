@@ -640,6 +640,27 @@ export function enforceHoldoutPolicy(
   }
 }
 
+/**
+ * Fail-closed variant for the mutation paths (`propose` / `stage-pr` / `promote`):
+ * holdout provenance MUST be supplied explicitly. A missing or malformed
+ * `holdoutReasons` is refused rather than treated as "no holdout".
+ */
+export function requireHoldoutClearance(
+  subcommand: CoachSubcommand,
+  holdoutReasons: readonly string[] | undefined,
+): void {
+  if (
+    !Array.isArray(holdoutReasons) ||
+    holdoutReasons.some((r) => typeof r !== "string")
+  ) {
+    throw new CleanRoomViolationError(
+      "holdout_provenance_missing",
+      `'${subcommand}' refused: holdoutReasons must be supplied explicitly (fail closed)`,
+    );
+  }
+  enforceHoldoutPolicy(subcommand, holdoutReasons);
+}
+
 export function assertCleanGitTree(repoRoot: string): void {
   const res = spawnSync("git", ["status", "--porcelain"], {
     cwd: repoRoot,
@@ -818,21 +839,30 @@ const HEX_HASH_LEAK_RE = /\b(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})\b/i;
 const SEALED_KEYWORD_LEAK_RE =
   /(?:northvale|talverin|dedale|truth\.json|operator-only|story_b_holdout)/i;
 
+// Global copies used ONLY for `.replace` so every occurrence is redacted. The
+// non-global originals above stay in use for `.test` (no `lastIndex` state).
+const toGlobal = (re: RegExp): RegExp => new RegExp(re.source, `${re.flags}g`);
+const SCRUB_RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  [toGlobal(FACT_SLUG_RE), "[REDACTED_FACT]"],
+  [toGlobal(RAW_EVT_ID_RE), "[REDACTED_EVT]"],
+  [toGlobal(RAW_FRAME_ID_RE), "[REDACTED_FRAME]"],
+  [toGlobal(RAW_IOC_ID_RE), "[REDACTED_IOC]"],
+  [toGlobal(CASE_ID_LEAK_RE), "[REDACTED_CASE]"],
+  [toGlobal(SYNTH_DOMAIN_LEAK_RE), "[REDACTED_DOMAIN]"],
+  [toGlobal(IPV4_LEAK_RE), "[REDACTED_IP]"],
+  [toGlobal(IPV6_LEAK_RE), "[REDACTED_IP]"],
+  [toGlobal(HEX_HASH_LEAK_RE), "[REDACTED_HASH]"],
+  [toGlobal(SEALED_KEYWORD_LEAK_RE), "[REDACTED_SEALED]"],
+];
+
 export function scrubText(
   raw: string,
   forbidden?: ReadonlySet<string>,
 ): string {
   let out = raw;
-  out = out.replace(FACT_SLUG_RE, "[REDACTED_FACT]");
-  out = out.replace(RAW_EVT_ID_RE, "[REDACTED_EVT]");
-  out = out.replace(RAW_FRAME_ID_RE, "[REDACTED_FRAME]");
-  out = out.replace(RAW_IOC_ID_RE, "[REDACTED_IOC]");
-  out = out.replace(CASE_ID_LEAK_RE, "[REDACTED_CASE]");
-  out = out.replace(SYNTH_DOMAIN_LEAK_RE, "[REDACTED_DOMAIN]");
-  out = out.replace(IPV4_LEAK_RE, "[REDACTED_IP]");
-  out = out.replace(IPV6_LEAK_RE, "[REDACTED_IP]");
-  out = out.replace(HEX_HASH_LEAK_RE, "[REDACTED_HASH]");
-  out = out.replace(SEALED_KEYWORD_LEAK_RE, "[REDACTED_SEALED]");
+  for (const [re, replacement] of SCRUB_RULES) {
+    out = out.replace(re, replacement);
+  }
 
   if (forbidden && forbidden.size > 0) {
     for (const term of forbidden) {
@@ -847,6 +877,31 @@ export function scrubText(
 
 export interface AssertCleanPacketOptions extends BuildForbiddenSetOptions {
   readonly forbidden?: ReadonlySet<string>;
+}
+
+/**
+ * Fail closed when the case-specific leak guard is missing or empty: without
+ * truth / case ids / vocab / forbidden terms the packet check only covers the
+ * generic patterns, so the packet must not reach a clean-room model.
+ */
+export function requireLeakGuard(
+  where: string,
+  leakGuard: AssertCleanPacketOptions | undefined,
+): AssertCleanPacketOptions {
+  const hasAny =
+    isPlainObject(leakGuard) &&
+    (leakGuard.truth !== undefined ||
+      leakGuard.caseIds !== undefined ||
+      leakGuard.eventsVocab !== undefined ||
+      leakGuard.extraForbidden !== undefined ||
+      leakGuard.forbidden !== undefined);
+  if (!hasAny) {
+    throw new CleanRoomViolationError(
+      "leak_guard_missing",
+      `'${where}' refused: a non-empty leakGuard is required (fail closed)`,
+    );
+  }
+  return leakGuard as AssertCleanPacketOptions;
 }
 
 function inspectCleanStringToken(
@@ -1019,6 +1074,33 @@ export interface CleanDiagnosticsPacket {
   readonly stage_citation_funnel: Record<string, StageCitationFunnelEntry>;
   readonly rounds: readonly DiagnosticsRoundSummary[];
   readonly revert_ledger: readonly DiagnosticsRevertEntry[];
+  /** Holdout provenance: only packets built from non-sealed, non-holdout evaluations exist. */
+  readonly provenance: {
+    readonly holdout_checked: true;
+    readonly sealed: false;
+    readonly holdout_reason_count: 0;
+  };
+}
+
+/** Refuses packets without clean holdout provenance (e.g. hand-built or tampered). */
+export function assertPacketHoldoutProvenance(
+  subcommand: CoachSubcommand,
+  packet: CleanDiagnosticsPacket,
+): void {
+  const prov: unknown = isPlainObject(packet)
+    ? (packet as { provenance?: unknown }).provenance
+    : undefined;
+  if (
+    !isPlainObject(prov) ||
+    prov.holdout_checked !== true ||
+    prov.sealed !== false ||
+    prov.holdout_reason_count !== 0
+  ) {
+    throw new CleanRoomViolationError(
+      "packet_holdout_provenance_missing",
+      `'${subcommand}' refused: diagnostics packet lacks clean holdout provenance (fail closed)`,
+    );
+  }
 }
 
 function extractAllComparableCitations(text: string): Set<string> {
@@ -1064,6 +1146,10 @@ export interface CaseJudgeEvaluation {
   readonly review: CheckedReportWithScorer;
   readonly haltedSteps?: number;
   readonly rawReasons?: readonly string[];
+  /** Holdout reasons detected for this case at judge time (stamped by `judgeCaseBatch`). */
+  readonly holdoutReasons: readonly string[];
+  /** True when the case was judged under `sealedEval: true`. */
+  readonly sealed: boolean;
 }
 
 export interface BuildDiagnosticsPacketInput {
@@ -1075,7 +1161,7 @@ export interface BuildDiagnosticsPacketInput {
     readonly reason?: string;
     readonly probeDeltaFound?: number;
   }>;
-  readonly leakGuard?: AssertCleanPacketOptions;
+  readonly leakGuard: AssertCleanPacketOptions;
 }
 
 export function buildDiagnosticsPacket(
@@ -1083,6 +1169,30 @@ export function buildDiagnosticsPacket(
 ): CleanDiagnosticsPacket {
   if (input.rounds.length === 0) {
     throw new Error("buildDiagnosticsPacket requires at least one round");
+  }
+  const leakGuard = requireLeakGuard("buildDiagnosticsPacket", input.leakGuard);
+
+  // Fail closed on holdout provenance: every evaluation must carry the stamp from
+  // `judgeCaseBatch`, and none may come from a sealed or holdout case.
+  const sealedReasons = new Set<string>();
+  for (const evals of input.rounds) {
+    for (const ev of evals) {
+      if (!Array.isArray(ev.holdoutReasons) || typeof ev.sealed !== "boolean") {
+        throw new CleanRoomViolationError(
+          "evaluation_holdout_provenance_missing",
+          "buildDiagnosticsPacket refused: evaluation lacks holdout provenance (fail closed)",
+        );
+      }
+      for (const r of ev.holdoutReasons) {
+        sealedReasons.add(r);
+      }
+      if (ev.sealed) {
+        sealedReasons.add("sealed_eval");
+      }
+    }
+  }
+  if (sealedReasons.size > 0) {
+    throw new HoldoutSealedError("propose", [...sealedReasons].sort());
   }
 
   const reasonCounts: Partial<Record<DiagnosticReasonCode, number>> = {};
@@ -1207,9 +1317,14 @@ export function buildDiagnosticsPacket(
     stage_citation_funnel: sanitizedFunnel,
     rounds: roundSummaries,
     revert_ledger: revertLedger,
+    provenance: {
+      holdout_checked: true,
+      sealed: false,
+      holdout_reason_count: 0,
+    },
   };
 
-  assertCleanPacket(packet, input.leakGuard);
+  assertCleanPacket(packet, leakGuard);
   return packet;
 }
 
@@ -1274,6 +1389,37 @@ function stripDiffPrefix(headerPath: string): string {
   return unquoted;
 }
 
+const REGULAR_FILE_MODES: ReadonlySet<string> = new Set(["100644", "100755"]);
+const INDEX_LINE_MODE_RE = /^index [0-9a-f]+\.\.[0-9a-f]+ (\d+)\s*$/i;
+
+/**
+ * Track 2 diffs may only edit regular files: mode changes (`old mode` / `new mode`)
+ * are refused outright, and any created/deleted/indexed mode other than
+ * 100644/100755 (e.g. symlink 120000, gitlink 160000) is refused.
+ */
+function assertRegularFileModeLine(line: string): void {
+  if (line.startsWith("old mode ") || line.startsWith("new mode ")) {
+    throw new ProposalValidationError(
+      "file_mode_change_forbidden",
+      `Track 2 code_pr unified_diff must not change file modes: '${line}'`,
+    );
+  }
+  let mode: string | undefined;
+  if (line.startsWith("new file mode ")) {
+    mode = line.slice("new file mode ".length).trim();
+  } else if (line.startsWith("deleted file mode ")) {
+    mode = line.slice("deleted file mode ".length).trim();
+  } else {
+    mode = INDEX_LINE_MODE_RE.exec(line)?.[1];
+  }
+  if (mode !== undefined && !REGULAR_FILE_MODES.has(mode)) {
+    throw new ProposalValidationError(
+      "non_regular_file_mode_forbidden",
+      `Track 2 code_pr unified_diff may only touch regular files (100644/100755): '${line}'`,
+    );
+  }
+}
+
 export function extractUnifiedDiffPaths(
   unifiedDiff: string,
 ): AllowedCoachMutationFile[] {
@@ -1299,6 +1445,7 @@ export function extractUnifiedDiffPaths(
   let sawHunk = false;
 
   for (const line of lines) {
+    assertRegularFileModeLine(line);
     if (line.startsWith("@@ ")) {
       sawHunk = true;
       continue;
@@ -1552,6 +1699,14 @@ export function validateProposal(
   };
 }
 
+function isSymlinkPath(abs: string): boolean {
+  try {
+    return fs.lstatSync(abs).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 const DRAFT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 
 export interface StagedCodePrDraft {
@@ -1567,9 +1722,9 @@ export function stageCodePrDraft(options: {
   readonly draftId: string;
   readonly proposal: CodePrProposal;
   readonly baseRef?: string;
-  readonly holdoutReasons?: readonly string[];
+  readonly holdoutReasons: readonly string[];
 }): StagedCodePrDraft {
-  enforceHoldoutPolicy("stage-pr", options.holdoutReasons ?? []);
+  requireHoldoutClearance("stage-pr", options.holdoutReasons);
 
   if (!DRAFT_ID_RE.test(options.draftId)) {
     throw new ProposalValidationError(
@@ -1682,6 +1837,18 @@ export function stageCodePrDraft(options: {
     }
 
     const uniqueObserved = [...new Set(observedPaths)].sort();
+    for (const rel of uniqueObserved) {
+      const abs = path.join(worktreePath, rel);
+      if (!fs.existsSync(abs) && !isSymlinkPath(abs)) {
+        continue; // deleted by the diff
+      }
+      if (!fs.lstatSync(abs).isFile()) {
+        throw new ProposalValidationError(
+          "non_regular_file_in_draft",
+          `Track 2 draft produced a non-regular file (symlink/dir) at '${rel}'`,
+        );
+      }
+    }
     if (uniqueObserved.length === 0) {
       throw new ProposalValidationError(
         "noop_code_pr_diff",
@@ -1784,6 +1951,7 @@ export function judgeCaseBatch(
   }
 
   const allReasons = new Set<string>();
+  const perCaseReasons: string[][] = [];
   for (const c of cases) {
     validateTruth(c.truth);
     const reasons = detectHoldoutReasons({
@@ -1791,6 +1959,7 @@ export function judgeCaseBatch(
       truth: c.truth,
       eventsVocab: c.caseEvents.vocabulary,
     });
+    perCaseReasons.push(reasons);
     for (const r of reasons) {
       allReasons.add(r);
     }
@@ -1801,7 +1970,8 @@ export function judgeCaseBatch(
     sealedEval: options?.sealedEval,
   });
 
-  const evaluations: CaseJudgeEvaluation[] = cases.map((c) => {
+  const sealed = options?.sealedEval === true;
+  const evaluations: CaseJudgeEvaluation[] = cases.map((c, idx) => {
     const score = scoreReport(c.truth, c.report);
     const review = checkReport(c.report, c.truth, c.caseEvents);
     return {
@@ -1809,6 +1979,8 @@ export function judgeCaseBatch(
       review,
       haltedSteps: c.haltedSteps ?? 0,
       rawReasons: c.rawReasons ?? [],
+      holdoutReasons: perCaseReasons[idx] ?? [],
+      sealed,
     };
   });
 
@@ -1857,8 +2029,8 @@ export type CleanRoomTurnRunner = (params: {
 
 export async function proposeCleanRoom(options: {
   readonly packet: CleanDiagnosticsPacket;
-  readonly holdoutReasons?: readonly string[];
-  readonly leakGuard?: AssertCleanPacketOptions;
+  readonly holdoutReasons: readonly string[];
+  readonly leakGuard: AssertCleanPacketOptions;
   readonly frozenBrief?: string;
   readonly trackPreference?: "playbook" | "code_pr";
   readonly modelPattern?: string;
@@ -1869,8 +2041,9 @@ export async function proposeCleanRoom(options: {
   readonly proposal: CoachProposal;
   readonly turnResult: CleanRoomWorkerTurnResult;
 }> {
-  enforceHoldoutPolicy("propose", options.holdoutReasons ?? []);
-  assertCleanPacket(options.packet, options.leakGuard);
+  requireHoldoutClearance("propose", options.holdoutReasons);
+  assertPacketHoldoutProvenance("propose", options.packet);
+  assertCleanPacket(options.packet, requireLeakGuard("propose", options.leakGuard));
 
   const userPrompt = JSON.stringify({
     requested_track: options.trackPreference ?? "playbook",
@@ -1963,13 +2136,14 @@ export async function runCleanRoomThreeVerifierPanel(options: {
   readonly pass2: readonly [RoundEvalMetrics, RoundEvalMetrics];
   readonly minFoundGain?: number;
   readonly frozenBrief?: string;
-  readonly leakGuard?: AssertCleanPacketOptions;
+  readonly leakGuard: AssertCleanPacketOptions;
   readonly modelPattern?: string;
   readonly repoRoot?: string;
   readonly turnRunner?: CleanRoomTurnRunner;
   readonly spawnOptions?: SpawnZeroToolCleanRoomOptions;
 }): Promise<VerifierPanelResult> {
-  assertCleanPacket(options.packet, options.leakGuard);
+  assertPacketHoldoutProvenance("promote", options.packet);
+  assertCleanPacket(options.packet, requireLeakGuard("verifier-panel", options.leakGuard));
   const minFoundGain = options.minFoundGain ?? DEFAULT_MIN_FOUND_GAIN;
 
   const hardAudit = deterministicSafetyAudit({
@@ -2164,8 +2338,8 @@ export interface RunPromotionPipelineOptions {
   readonly baseline: RoundEvalMetrics;
   readonly minFoundGain?: number;
   readonly frozenBrief?: string;
-  readonly holdoutReasons?: readonly string[];
-  readonly leakGuard?: AssertCleanPacketOptions;
+  readonly holdoutReasons: readonly string[];
+  readonly leakGuard: AssertCleanPacketOptions;
   readonly repoRoot?: string;
   readonly requireCleanGit?: boolean;
   readonly evaluateRound: (params: {
@@ -2204,11 +2378,12 @@ export interface PromotionPipelineResult {
 export async function runPromotionPipeline(
   options: RunPromotionPipelineOptions,
 ): Promise<PromotionPipelineResult> {
-  enforceHoldoutPolicy("promote", options.holdoutReasons ?? []);
+  requireHoldoutClearance("promote", options.holdoutReasons);
   if (options.requireCleanGit && options.repoRoot) {
     assertCleanGitTree(options.repoRoot);
   }
-  assertCleanPacket(options.packet, options.leakGuard);
+  assertPacketHoldoutProvenance("promote", options.packet);
+  assertCleanPacket(options.packet, requireLeakGuard("promote", options.leakGuard));
 
   const evalId = options.evalId ?? `coach-eval-${crypto.randomUUID()}`;
   const ts = new Date().toISOString();

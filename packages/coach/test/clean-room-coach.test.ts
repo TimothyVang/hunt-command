@@ -35,11 +35,15 @@ import {
   ProposalValidationError,
   readCoachLedger,
   runPromotionPipeline,
+  scrubText,
   spawnZeroToolCleanRoomTurn,
   stageCodePrDraft,
   validateCoachMutationPath,
   validateProposal,
+  type CaseJudgeEvaluation,
+  type CleanDiagnosticsPacket,
   type CleanRoomAgentSessionLike,
+  type CleanRoomTurnRunner,
   type CodePrProposal,
   type CoachEvalTelemetryRecord,
   type PlaybookProposal,
@@ -681,6 +685,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
         repoRoot: tempRepo,
         draftId: "cand-01",
         proposal: validCodePr,
+        holdoutReasons: [],
       });
       try {
         expect(staged.touchedFiles).toEqual([promptRel]);
@@ -717,25 +722,31 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
         all_g2_1_pass: true,
       };
 
-      const packet = buildDiagnosticsPacket({
-        rounds: [
-          judgeCaseBatch([
-            {
-              caseId: "synth-coach-a01",
-              truth: SYNTH_STORY_A_TRUTH,
-              report: {
-                claims: [
-                  {
-                    claim_id: "incident:c1",
-                    statement: "ws-mkt-03 saw evt-000111.",
-                  },
-                ],
-                limitations: [],
+      const judgedTrain = judgeCaseBatch([
+        {
+          caseId: "synth-coach-a01",
+          truth: SYNTH_STORY_A_TRUTH,
+          report: {
+            claims: [
+              {
+                claim_id: "incident:c1",
+                statement: "ws-mkt-03 saw evt-000111.",
               },
-              caseEvents: SYNTH_STORY_A_EVENTS,
-            },
-          ]).evaluations,
-        ],
+            ],
+            limitations: [],
+          },
+          caseEvents: SYNTH_STORY_A_EVENTS,
+        },
+      ]);
+      const holdoutReasons = judgedTrain.holdoutReasons;
+      const leakGuard = {
+        truth: SYNTH_STORY_A_TRUTH,
+        caseIds: ["synth-coach-a01"],
+        eventsVocab: SYNTH_STORY_A_EVENTS.vocabulary,
+      };
+      const packet = buildDiagnosticsPacket({
+        rounds: [judgedTrain.evaluations],
+        leakGuard,
       });
 
       const candidateProposal: PlaybookProposal = {
@@ -752,6 +763,8 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
       const probeFail = await runPromotionPipeline({
         evalId: "eval-probe-fail",
         packet,
+        holdoutReasons,
+        leakGuard,
         rawProposal: candidateProposal,
         baseline,
         ledgerPath,
@@ -776,6 +789,8 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
       const pass2Fail = await runPromotionPipeline({
         evalId: "eval-pass2-fail",
         packet,
+        holdoutReasons,
+        leakGuard,
         rawProposal: candidateProposal,
         baseline,
         ledgerPath,
@@ -797,6 +812,8 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
       const splitPanelFail = await runPromotionPipeline({
         evalId: "eval-panel-split",
         packet,
+        holdoutReasons,
+        leakGuard,
         rawProposal: candidateProposal,
         baseline,
         ledgerPath,
@@ -835,6 +852,8 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
       // 4. Full 3-stage promotion success using REAL out-of-process clean-room proposer + 3 clean-room verifiers!
       const proposed = await proposeCleanRoom({
         packet,
+        holdoutReasons,
+        leakGuard,
         repoRoot: WORKTREE_REPO_ROOT,
         spawnOptions: {
           allowTestSimulation: true,
@@ -846,6 +865,8 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
       const promoted = await runPromotionPipeline({
         evalId: "eval-full-promote",
         packet,
+        holdoutReasons,
+        leakGuard,
         rawProposal: proposed.proposal,
         baseline,
         repoRoot: WORKTREE_REPO_ROOT,
@@ -929,5 +950,290 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
       }
     }
     expect(violations).toEqual([]);
+  });
+});
+
+describe("packages/coach fail-closed holdout provenance, global scrub & regular-file-only diffs", () => {
+  const storyAReport = {
+    claims: [{ claim_id: "incident:c1", statement: "ws-mkt-03 saw evt-000111." }],
+    limitations: [],
+  };
+  const leakGuard = {
+    truth: SYNTH_STORY_A_TRUTH,
+    caseIds: ["synth-coach-a01"],
+    eventsVocab: SYNTH_STORY_A_EVENTS.vocabulary,
+  };
+  const baseline: RoundEvalMetrics = {
+    round_index: 0,
+    case_count: 1,
+    mean_found: 1,
+    mean_attack_found: 1,
+    misattributed_decoys_total: 0,
+    mean_citation_precision: 1,
+    all_g2_1_pass: true,
+  };
+  const cleanPacket = (): CleanDiagnosticsPacket =>
+    buildDiagnosticsPacket({
+      rounds: [
+        judgeCaseBatch([
+          {
+            caseId: "synth-coach-a01",
+            truth: SYNTH_STORY_A_TRUTH,
+            report: storyAReport,
+            caseEvents: SYNTH_STORY_A_EVENTS,
+          },
+        ]).evaluations,
+      ],
+      leakGuard,
+    });
+  let runnerCalls = 0;
+  const forbiddenRunner: CleanRoomTurnRunner = async () => {
+    runnerCalls += 1;
+    throw new Error("clean-room runner must not be reached");
+  };
+
+  test("Story B evaluation judged with sealedEval:true is stamped and can never be packed for the proposer", async () => {
+    const sealedB = judgeCaseBatch(
+      [
+        {
+          caseId: "synth-coach-b01",
+          caseMeta: { story: "b" },
+          truth: SYNTH_STORY_A_TRUTH,
+          report: storyAReport,
+          caseEvents: SYNTH_STORY_A_EVENTS,
+        },
+      ],
+      { subcommand: "judge", sealedEval: true },
+    );
+    expect(sealedB.evaluations[0]?.sealed).toBe(true);
+    expect(sealedB.evaluations[0]?.holdoutReasons).toContain("story==='b'");
+    expect(() =>
+      buildDiagnosticsPacket({ rounds: [sealedB.evaluations], leakGuard }),
+    ).toThrow(HoldoutSealedError);
+
+    // Mixing one sealed round in with a clean round is still refused.
+    const clean = judgeCaseBatch([
+      {
+        caseId: "synth-coach-a01",
+        truth: SYNTH_STORY_A_TRUTH,
+        report: storyAReport,
+        caseEvents: SYNTH_STORY_A_EVENTS,
+      },
+    ]);
+    expect(clean.evaluations[0]?.sealed).toBe(false);
+    expect(clean.evaluations[0]?.holdoutReasons).toEqual([]);
+    expect(() =>
+      buildDiagnosticsPacket({
+        rounds: [clean.evaluations, sealedB.evaluations],
+        leakGuard,
+      }),
+    ).toThrow(HoldoutSealedError);
+
+    // A non-holdout case judged under sealedEval:true is sealed too.
+    const sealedA = judgeCaseBatch(
+      [
+        {
+          caseId: "synth-coach-a01",
+          truth: SYNTH_STORY_A_TRUTH,
+          report: storyAReport,
+          caseEvents: SYNTH_STORY_A_EVENTS,
+        },
+      ],
+      { sealedEval: true },
+    );
+    expect(() =>
+      buildDiagnosticsPacket({ rounds: [sealedA.evaluations], leakGuard }),
+    ).toThrow(HoldoutSealedError);
+
+    // Evaluations without the judge-time provenance stamp are refused.
+    const unstamped = clean.evaluations.map((ev) => {
+      const { holdoutReasons: _r, sealed: _s, ...rest } = ev;
+      return rest;
+    }) as unknown as CaseJudgeEvaluation[];
+    expect(() =>
+      buildDiagnosticsPacket({ rounds: [unstamped], leakGuard }),
+    ).toThrow(CleanRoomViolationError);
+
+    // Missing / empty leak guard is refused.
+    expect(() =>
+      buildDiagnosticsPacket({
+        rounds: [clean.evaluations],
+      } as unknown as Parameters<typeof buildDiagnosticsPacket>[0]),
+    ).toThrow(CleanRoomViolationError);
+    expect(() =>
+      buildDiagnosticsPacket({ rounds: [clean.evaluations], leakGuard: {} }),
+    ).toThrow(CleanRoomViolationError);
+
+    // A hand-built packet without provenance cannot reach the proposer.
+    const { provenance: _p, ...noProvenance } = cleanPacket();
+    runnerCalls = 0;
+    await expect(
+      proposeCleanRoom({
+        packet: noProvenance as unknown as CleanDiagnosticsPacket,
+        holdoutReasons: [],
+        leakGuard,
+        turnRunner: forbiddenRunner,
+      }),
+    ).rejects.toThrow(CleanRoomViolationError);
+    await expect(
+      proposeCleanRoom({
+        packet: cleanPacket(),
+        holdoutReasons: ["story==='b'"],
+        leakGuard,
+        turnRunner: forbiddenRunner,
+      }),
+    ).rejects.toThrow(HoldoutSealedError);
+    expect(runnerCalls).toBe(0);
+  });
+
+  test("omitting holdoutReasons or leakGuard no longer bypasses propose / promote / stage-pr", async () => {
+    const packet = cleanPacket();
+    runnerCalls = 0;
+    await expect(
+      proposeCleanRoom({
+        packet,
+        leakGuard,
+        turnRunner: forbiddenRunner,
+      } as unknown as Parameters<typeof proposeCleanRoom>[0]),
+    ).rejects.toThrow(CleanRoomViolationError);
+    await expect(
+      proposeCleanRoom({
+        packet,
+        holdoutReasons: [],
+        turnRunner: forbiddenRunner,
+      } as unknown as Parameters<typeof proposeCleanRoom>[0]),
+    ).rejects.toThrow(CleanRoomViolationError);
+    expect(runnerCalls).toBe(0);
+
+    let evalCalls = 0;
+    const evaluateRound = async (): Promise<RoundEvalMetrics> => {
+      evalCalls += 1;
+      return baseline;
+    };
+    await expect(
+      runPromotionPipeline({
+        packet,
+        leakGuard,
+        rawProposal: {},
+        baseline,
+        evaluateRound,
+      } as unknown as Parameters<typeof runPromotionPipeline>[0]),
+    ).rejects.toThrow(CleanRoomViolationError);
+    await expect(
+      runPromotionPipeline({
+        packet,
+        holdoutReasons: [],
+        rawProposal: {},
+        baseline,
+        evaluateRound,
+      } as unknown as Parameters<typeof runPromotionPipeline>[0]),
+    ).rejects.toThrow(CleanRoomViolationError);
+    expect(evalCalls).toBe(0);
+
+    const promptRel = ALLOWED_COACH_MUTATION_FILES[0];
+    expect(() =>
+      stageCodePrDraft({
+        repoRoot: path.join(os.tmpdir(), "hunt-coach-never-created"),
+        draftId: "cand-02",
+        proposal: {
+          track: "code_pr",
+          title: "noop",
+          files: [promptRel],
+          unified_diff: `--- a/${promptRel}\n+++ b/${promptRel}\n@@ -1 +1 @@\n-a\n+b\n`,
+        },
+      } as unknown as Parameters<typeof stageCodePrDraft>[0]),
+    ).toThrow(CleanRoomViolationError);
+  });
+
+  test("scrubText redacts every occurrence, not just the first", () => {
+    const out = scrubText(
+      "saw evt-000111 then evt-000222 from 10.0.0.1 and 192.168.1.20 at frame-1 and frame-2",
+    );
+    expect(out).not.toMatch(/evt-\d/);
+    expect(out).not.toMatch(/\b\d{1,3}(?:\.\d{1,3}){3}\b/);
+    expect(out).not.toMatch(/frame-\d/);
+    expect(out.match(/\[REDACTED_EVT\]/g)).toHaveLength(2);
+    expect(out.match(/\[REDACTED_IP\]/g)).toHaveLength(2);
+    expect(out.match(/\[REDACTED_FRAME\]/g)).toHaveLength(2);
+    // Stateless across calls (no lastIndex carry-over).
+    expect(scrubText("evt-000333")).toBe("[REDACTED_EVT]");
+    expect(scrubText("evt-000333")).toBe("[REDACTED_EVT]");
+  });
+
+  test("code_pr diffs creating symlinks or changing file modes at allowlisted paths are rejected", () => {
+    const rel = ALLOWED_COACH_MUTATION_FILES[1];
+    const symlinkDiff = [
+      `diff --git a/${rel} b/${rel}`,
+      "new file mode 120000",
+      "index 0000000..1b2c3d4",
+      "--- /dev/null",
+      `+++ b/${rel}`,
+      "@@ -0,0 +1 @@",
+      "+../../../../outside-target.ts",
+      "\\ No newline at end of file",
+    ].join("\n");
+    const variants: ReadonlyArray<string> = [
+      symlinkDiff,
+      [
+        `diff --git a/${rel} b/${rel}`,
+        "old mode 100644",
+        "new mode 120000",
+        `--- a/${rel}`,
+        `+++ b/${rel}`,
+        "@@ -1 +1 @@",
+        "-a",
+        "+b",
+      ].join("\n"),
+      [
+        `diff --git a/${rel} b/${rel}`,
+        "old mode 100644",
+        "new mode 100755",
+        `--- a/${rel}`,
+        `+++ b/${rel}`,
+        "@@ -1 +1 @@",
+        "-a",
+        "+b",
+      ].join("\n"),
+      [
+        `diff --git a/${rel} b/${rel}`,
+        "index 1a2b3c4..5d6e7f8 120000",
+        `--- a/${rel}`,
+        `+++ b/${rel}`,
+        "@@ -1 +1 @@",
+        "-a",
+        "+b",
+      ].join("\n"),
+      [
+        `diff --git a/${rel} b/${rel}`,
+        "deleted file mode 120000",
+        "index 1a2b3c4..0000000",
+        `--- a/${rel}`,
+        "+++ /dev/null",
+        "@@ -1 +0,0 @@",
+        "-a",
+      ].join("\n"),
+    ];
+    for (const unified_diff of variants) {
+      expect(() =>
+        validateProposal({ track: "code_pr", title: "mode", unified_diff }),
+      ).toThrow(ProposalValidationError);
+    }
+
+    // Regular-file creation (100644) remains allowed.
+    expect(() =>
+      validateProposal({
+        track: "code_pr",
+        title: "regular",
+        unified_diff: [
+          `diff --git a/${rel} b/${rel}`,
+          "new file mode 100644",
+          "index 0000000..1b2c3d4",
+          "--- /dev/null",
+          `+++ b/${rel}`,
+          "@@ -0,0 +1 @@",
+          '+export const PERSONA_HINT = "x";',
+        ].join("\n"),
+      }),
+    ).not.toThrow();
   });
 });
