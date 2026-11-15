@@ -1814,6 +1814,8 @@ export class HuntWaveEngine {
             attempts: attempt,
             usage: turnUsage,
             diagnostic: citationCheck.errorMessage,
+            unverified_handoff: validated.handoff,
+            citation_receipt: citationCheck.receipt,
             finished_at: new Date().toISOString(),
           };
           this.stateStore.saveRun(run);

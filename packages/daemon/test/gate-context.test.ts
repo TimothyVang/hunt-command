@@ -278,7 +278,7 @@ describe("buildGateContext", () => {
       "gate_context_unavailable",
     );
     const reconcileRun = baseRun({
-      open_gate: { gate: "reconcile", wave: "analysis", requires_human: true, payload_sha256: "cd".repeat(32), opened_at: "t", expires_at: "t", check_note_cleared: true, unknown_step_id: "scope", reason_code: "citation_source_unavailable" } as never,
+      open_gate: { gate: "reconcile", wave: "analysis", requires_human: true, payload_sha256: "cd".repeat(32), opened_at: "t", expires_at: "t", check_note_cleared: true, unknown_step_id: "scope", reason_code: "previous_dispatch_unknown" } as never,
     });
     expect(await codeOf(buildGateContext({ run: reconcileRun, receipts: [] }))).toBe("gate_context_unavailable");
     const ctx = await buildGateContext({
@@ -288,8 +288,92 @@ describe("buildGateContext", () => {
         { execution_id: "hunt-other:scope", run_id: "hunt-other", step_id: "scope", session_id: "s2", input_id: "i2", fingerprint: "f", status: "previous_dispatch_unknown", reason_code: "previous_dispatch_unknown", output_text: null, usage: null, refusal: null, diagnostic: null, reserved_at: "2026-11-14T10:00:00Z", finished_at: null },
       ],
     });
-    expect(ctx.reconcile!.receipts).toEqual([
+    expect(ctx.reconcile).toEqual({ reason_code: "previous_dispatch_unknown", receipts: [
       { execution_id: "hunt-x:scope", session_id: "s1", input_id: "i1", step_id: "scope", profile: "framework-coordinator", reserved_at: "2026-11-14T10:00:00Z", reason_code: "previous_dispatch_unknown" },
-    ]);
+    ] });
   });
+});
+
+describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () => {
+  /** The real case data plane, except that citation verification reports its source unavailable. */
+  async function flakyPlane(readable: boolean): Promise<{ plane: HuntDataPlanePort; close: () => Promise<void> }> {
+    const { createCaseDirDataPlaneResolver } = await import("../src/index.ts");
+    const resolver = createCaseDirDataPlaneResolver({ casesDir, cacheDir: makeTmpDir("hunt-gatectx-cache-") });
+    const real = await resolver.resolve(CASE_ID);
+    const plane: HuntDataPlanePort = {
+      caseMetadata: real.caseMetadata,
+      capabilities: () => real.capabilities(),
+      executeTool: (...a) => real.executeTool(...a),
+      verifyCitations: async (r) => ({
+        verified: false,
+        checked_at: new Date().toISOString(),
+        case_id: r.case_id,
+        total_checked: 0,
+        missing_event_ids: [],
+        missing_frame_ids: [],
+        missing_ioc_ids: [],
+        ambiguous_ids: [],
+        out_of_scope_ids: [],
+        source_status: "unavailable",
+        diagnostic: `events index offline password=${LEAK}`,
+      }),
+      readCitedRecords: readable
+        ? (ids, signal) => real.readCitedRecords!(ids, signal)
+        : async () => {
+            throw new Error("events index offline");
+          },
+    };
+    return { plane, close: () => resolver.close() };
+  }
+
+  for (const readable of [true, false]) {
+    test(`opens the gate through serve and returns its context (source ${readable ? "back" : "still down"})`, async () => {
+      runtimeDir = makeTmpDir("hunt-gatectx-csu-rt-");
+      const { plane, close } = await flakyPlane(readable);
+      try {
+      const out: string[] = [];
+      const code = await runHuntCli(
+        ["serve", "--runtime-dir", runtimeDir],
+        { writeStdout: (t) => void out.push(t), writeStderr: () => {} },
+        {
+          modelRunner: runner,
+          resolveDataPlane: () => plane,
+          stdin: linesOf(rpc("s", "hunt.start", { run_id: "hunt-csu", case_id: CASE_ID, scope: "Scope.", follow_ups: 0 })),
+        },
+      );
+      expect(code).toBe(0);
+      const started = out.join("").trim().split("\n").map((l) => JSON.parse(l) as RpcLine).find((l) => l.id === "s")!;
+      const parked = started.result as PersistedHuntRun;
+      expect(parked.open_gate).toMatchObject({ gate: "reconcile", reason_code: "citation_source_unavailable", unknown_step_id: "scope" });
+
+      const ctxOut: string[] = [];
+      await runHuntCli(
+        ["serve", "--runtime-dir", runtimeDir],
+        { writeStdout: (t) => void ctxOut.push(t), writeStderr: () => {} },
+        { resolveDataPlane: () => plane, stdin: linesOf(rpc("g", "hunt.gateContext", { run_id: "hunt-csu" })) },
+      );
+      const ctx = ctxOut.join("").trim().split("\n").map((l) => JSON.parse(l) as RpcLine).find((l) => l.id === "g")!;
+      expect(ctx.error).toBeUndefined();
+      expect(ctx.result).toMatchObject({ gate: "reconcile", payload_sha256: parked.open_gate!.payload_sha256 });
+      const reconcile = ctx.result.reconcile;
+      expect(reconcile.reason_code).toBe("citation_source_unavailable");
+      expect(reconcile.citation_receipt).toMatchObject({ source_status: "unavailable" });
+      expect(JSON.stringify(ctx.result)).not.toContain(LEAK);
+      expect(reconcile.evidence_truncated).toBe(false);
+      if (readable) {
+        expect(reconcile.unavailable_sources).toEqual([]);
+        expect(reconcile.evidence.map((e: { id: string; status: string }) => [e.id, e.status])).toEqual([
+          ["evt-gc-1", "verified"],
+          ["evt-gc-2", "verified"],
+        ]);
+        expect(reconcile.evidence[0].fields["host.name"]).toBe("workstation-01");
+      } else {
+        expect(reconcile.unavailable_sources).toEqual(["events"]);
+        expect(reconcile.evidence).toEqual([]);
+      }
+      } finally {
+        await close();
+      }
+    });
+  }
 });

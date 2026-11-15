@@ -47,8 +47,23 @@ export interface GateContext {
     readonly evidence: GateContextEvidence[];
     readonly evidence_truncated: boolean;
   };
-  readonly reconcile?: { readonly receipts: GateContextReconcileReceipt[] };
+  readonly reconcile?: GateContextReconcile;
 }
+
+/** Tagged by `reason_code`: why the step became unknown decides what the operator must see. */
+export type GateContextReconcile =
+  | {
+      readonly reason_code: "previous_dispatch_unknown";
+      readonly receipts: GateContextReconcileReceipt[];
+    }
+  | {
+      readonly reason_code: "citation_source_unavailable";
+      readonly citation_receipt: CitationVerificationReceipt;
+      /** Source kinds that could not be read while building this context (then evidence is []). */
+      readonly unavailable_sources: Array<"events" | "packets" | "intel">;
+      readonly evidence: GateContextEvidence[];
+      readonly evidence_truncated: boolean;
+    };
 
 export type GateContextErrorCode = "no_open_gate" | "gate_context_unavailable";
 
@@ -140,91 +155,32 @@ function kindOf(id: string): "evt" | "frame" | "ioc" {
   return id.startsWith("evt-") ? "evt" : id.startsWith("frame-") ? "frame" : "ioc";
 }
 
-/**
- * Read-only decision context for a run's open gate. Never mutates run or gate state; reads the
- * run's own durable state and, for an incident gate, the records of the run's own case.
- */
-export async function buildGateContext(params: {
-  readonly run: PersistedHuntRun;
-  readonly receipts: readonly DispatchReceiptRow[];
-  readonly resolveDataPlane?: (caseId: string) => Promise<HuntDataPlanePort> | HuntDataPlanePort;
-}): Promise<GateContext> {
-  const { run } = params;
-  const gate = run.open_gate;
-  if (run.status !== "awaiting_gate" || !gate) {
-    throw new GateContextError("no_open_gate", `Hunt '${run.run_id}' has no open gate`);
-  }
-  const base = { run_id: run.run_id, case_id: run.case_id, payload_sha256: gate.payload_sha256 };
 
-  if (gate.gate === "scope") {
-    return { ...base, gate: "scope", scope: { scope_text: clean(run.config.scopeText, 64 * 1024) } };
-  }
+type Resolver = (caseId: string) => Promise<HuntDataPlanePort> | HuntDataPlanePort;
 
-  if (gate.gate === RECONCILE_GATE) {
-    const receipts = params.receipts
-      .filter(
-        (r) =>
-          r.run_id === run.run_id &&
-          r.step_id === gate.unknown_step_id &&
-          r.status === "previous_dispatch_unknown",
-      )
-      .map((r): GateContextReconcileReceipt => {
-        const profile = profileForRunStep(run, r.step_id);
-        if (!profile) {
-          throw new GateContextError("gate_context_unavailable", `Step '${r.step_id}' is not in hunt '${run.run_id}'`);
-        }
-        return {
-          execution_id: r.execution_id,
-          session_id: r.session_id,
-          input_id: r.input_id,
-          step_id: r.step_id,
-          profile,
-          reserved_at: r.reserved_at,
-          reason_code: "previous_dispatch_unknown",
-        };
-      });
-    if (receipts.length === 0) {
-      throw new GateContextError(
-        "gate_context_unavailable",
-        `Reconcile gate on hunt '${run.run_id}' (${gate.reason_code ?? "unknown"}) has no previous_dispatch_unknown receipt`,
-      );
-    }
-    return { ...base, gate: "reconcile", reconcile: { receipts } };
-  }
+/** Kind of case source behind a citation kind, as reported in `unavailable_sources`. */
+const SOURCE_OF_KIND = { evt: "events", frame: "packets", ioc: "intel" } as const;
+export type EvidenceSourceKind = (typeof SOURCE_OF_KIND)[keyof typeof SOURCE_OF_KIND];
 
-  if (gate.gate !== "incident") {
-    throw new GateContextError("gate_context_unavailable", `Gate '${gate.gate}' has no decision context`);
-  }
-  const receipt = run.citation_receipt;
-  if (!receipt) {
-    throw new GateContextError("gate_context_unavailable", `Incident gate on hunt '${run.run_id}' has no citation receipt`);
-  }
-  const handoffs = [
-    ...(run.results["incident"]?.handoff ? [run.results["incident"].handoff] : []),
-    ...Object.values(run.reviewed_handoffs),
-  ];
-  const allIds = citedIds(handoffs);
-  const ids = allIds.slice(0, GATE_CONTEXT_MAX_EVIDENCE);
+async function readRecords(run: PersistedHuntRun, ids: readonly string[], resolve?: Resolver) {
+  if (!resolve) throw new Error("no data plane resolver is configured");
+  const dataPlane = await resolve(run.case_id);
+  assertDataPlaneBindsRun(run, dataPlane);
+  if (!dataPlane.readCitedRecords) throw new Error("the case data plane cannot read cited records");
+  return dataPlane.readCitedRecords(ids);
+}
 
-  let records: CitedEvidenceRecord[];
-  try {
-    if (!params.resolveDataPlane) throw new Error("no data plane resolver is configured");
-    const dataPlane = await params.resolveDataPlane(run.case_id);
-    assertDataPlaneBindsRun(run, dataPlane);
-    if (!dataPlane.readCitedRecords) throw new Error("the case data plane cannot read cited records");
-    records = await dataPlane.readCitedRecords(ids);
-  } catch (err) {
-    throw new GateContextError(
-      "gate_context_unavailable",
-      `Cited evidence for hunt '${run.run_id}' is unavailable: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
+/** One evidence entry per id: receipt status first, then whether the case holds the record. */
+function toEvidence(
+  ids: readonly string[],
+  records: readonly CitedEvidenceRecord[],
+  receipt: CitationVerificationReceipt,
+): GateContextEvidence[] {
   const byId = new Map(records.filter((r) => ids.includes(r.id)).map((r) => [r.id, r]));
   const missing = new Set([...receipt.missing_event_ids, ...receipt.missing_frame_ids, ...receipt.missing_ioc_ids]);
   const outOfScope = new Set(receipt.out_of_scope_ids);
   const ambiguous = new Set(receipt.ambiguous_ids);
-
-  const evidence = ids.map((id): GateContextEvidence => {
+  return ids.map((id): GateContextEvidence => {
     const rec = byId.get(id);
     const status: GateContextEvidence["status"] = outOfScope.has(id)
       ? "out_of_scope"
@@ -245,13 +201,113 @@ export async function buildGateContext(params: {
       fields: flattenEvidenceFields(rec.record),
     };
   });
+}
 
+function unavailable(run: PersistedHuntRun, what: string, err?: unknown): GateContextError {
+  const why = err === undefined ? "" : `: ${err instanceof Error ? err.message : String(err)}`;
+  return new GateContextError("gate_context_unavailable", `${what} for hunt '${run.run_id}' is unavailable${why}`);
+}
+
+/**
+ * Read-only decision context for a run's open gate. Never mutates run or gate state; reads the
+ * run's own durable state and, for incident and citation reconcile gates, its own case's records.
+ */
+export async function buildGateContext(params: {
+  readonly run: PersistedHuntRun;
+  readonly receipts: readonly DispatchReceiptRow[];
+  readonly resolveDataPlane?: Resolver;
+}): Promise<GateContext> {
+  const { run } = params;
+  const gate = run.open_gate;
+  if (run.status !== "awaiting_gate" || !gate) {
+    throw new GateContextError("no_open_gate", `Hunt '${run.run_id}' has no open gate`);
+  }
+  const base = { run_id: run.run_id, case_id: run.case_id, payload_sha256: gate.payload_sha256 };
+
+  if (gate.gate === "scope") {
+    return { ...base, gate: "scope", scope: { scope_text: clean(run.config.scopeText, 64 * 1024) } };
+  }
+
+  if (gate.gate === RECONCILE_GATE) {
+    const stepId = gate.unknown_step_id;
+    const result = stepId ? run.results[stepId] : undefined;
+    const reason = gate.reason_code ?? result?.reason_code;
+
+    if (reason === "citation_source_unavailable") {
+      const handoff = result?.unverified_handoff;
+      const receipt = result?.citation_receipt;
+      if (!handoff || !receipt) {
+        throw unavailable(run, `The unverified handoff and receipt of step '${String(stepId)}'`);
+      }
+      const allIds = citedIds([handoff]);
+      const ids = allIds.slice(0, GATE_CONTEXT_MAX_EVIDENCE);
+      // The source may still be down: then no id can be checked and every cited kind is reported.
+      let checkedIds: string[] = ids;
+      let records: CitedEvidenceRecord[] = [];
+      let unavailableSources: EvidenceSourceKind[] = [];
+      try {
+        records = await readRecords(run, ids, params.resolveDataPlane);
+      } catch {
+        checkedIds = [];
+        unavailableSources = [...new Set(ids.map((id) => SOURCE_OF_KIND[kindOf(id)]))].sort();
+      }
+      return {
+        ...base,
+        gate: "reconcile",
+        reconcile: {
+          reason_code: "citation_source_unavailable",
+          citation_receipt: scrubSecretValue(receipt),
+          unavailable_sources: unavailableSources,
+          evidence: toEvidence(checkedIds, records, receipt),
+          evidence_truncated: allIds.length > ids.length,
+        },
+      };
+    }
+
+    const receipts = params.receipts
+      .filter((r) => r.run_id === run.run_id && r.step_id === stepId && r.status === "previous_dispatch_unknown")
+      .map((r): GateContextReconcileReceipt => {
+        const profile = profileForRunStep(run, r.step_id);
+        if (!profile) throw unavailable(run, `Step '${r.step_id}'`);
+        return {
+          execution_id: r.execution_id,
+          session_id: r.session_id,
+          input_id: r.input_id,
+          step_id: r.step_id,
+          profile,
+          reserved_at: r.reserved_at,
+          reason_code: "previous_dispatch_unknown",
+        };
+      });
+    if (receipts.length === 0) {
+      throw unavailable(run, `The reconcile context (${reason ?? "unknown"})`);
+    }
+    return { ...base, gate: "reconcile", reconcile: { reason_code: "previous_dispatch_unknown", receipts } };
+  }
+
+  if (gate.gate !== "incident") {
+    throw new GateContextError("gate_context_unavailable", `Gate '${gate.gate}' has no decision context`);
+  }
+  const receipt = run.citation_receipt;
+  if (!receipt) throw unavailable(run, "The incident citation receipt");
+  const handoffs = [
+    ...(run.results["incident"]?.handoff ? [run.results["incident"].handoff] : []),
+    ...Object.values(run.reviewed_handoffs),
+  ];
+  const allIds = citedIds(handoffs);
+  const ids = allIds.slice(0, GATE_CONTEXT_MAX_EVIDENCE);
+  let records: CitedEvidenceRecord[];
+  try {
+    records = await readRecords(run, ids, params.resolveDataPlane);
+  } catch (err) {
+    throw unavailable(run, "Cited evidence", err);
+  }
   return {
     ...base,
     gate: "incident",
     incident: {
       citation_receipt: scrubSecretValue(receipt),
-      evidence,
+      evidence: toEvidence(ids, records, receipt),
       evidence_truncated: allIds.length > ids.length,
     },
   };
