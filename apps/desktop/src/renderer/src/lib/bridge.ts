@@ -49,9 +49,9 @@ function previewFixture<T>(channel: InvokeChannel, payload?: unknown): IpcResult
     return {
       ok: true,
       data: [
-        { huntId: "hunt-20261115-nv01", caseId: "nv01", runStatus: "awaiting_human_gate" },
-        { huntId: "hunt-20261115-scope-work", caseId: "nv01", runStatus: "awaiting_human_gate" },
-        { huntId: "hunt-20261115-reconcile", caseId: "nv01", runStatus: "awaiting_human_gate" },
+        { huntId: "hunt-20261115-nv01", caseId: "northvale-lab-001", title: "Northvale Scheduled Task & C2 DNS/TLS Beaconing Investigation", metadataAvailable: true, runStatus: "awaiting_human_gate" },
+        { huntId: "hunt-20261115-scope-work", caseId: "northvale-lab-001", title: "Northvale Scheduled Task & C2 DNS/TLS Beaconing Investigation", metadataAvailable: true, runStatus: "awaiting_human_gate" },
+        { huntId: "hunt-20261115-reconcile", caseId: "northvale-lab-001", title: "Northvale Scheduled Task & C2 DNS/TLS Beaconing Investigation", metadataAvailable: true, runStatus: "awaiting_human_gate" },
       ] as unknown as T,
     };
   }

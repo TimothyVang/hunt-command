@@ -57,6 +57,7 @@ const DEFAULT_ROLE: GateDraftFields["rbacRole"] = "lead_hunter";
 
 export class WorkbenchStore {
   #state: WorkbenchUiState;
+  #snapshotVersion = 0;
   readonly #listeners = new Set<() => void>();
 
   constructor(initialSnapshot?: WorkbenchSnapshot) {
@@ -88,6 +89,8 @@ export class WorkbenchStore {
 
   getState = (): WorkbenchUiState => this.#state;
 
+  getSnapshotVersion = (): number => this.#snapshotVersion;
+
   subscribe = (listener: () => void): (() => void) => {
     this.#listeners.add(listener);
     return () => {
@@ -96,6 +99,7 @@ export class WorkbenchStore {
   };
 
   setWorkbenchSnapshot(nextSnapshot: WorkbenchSnapshot): void {
+    this.#snapshotVersion++;
     const prevGateKey = this.#state.workbench.activeGate
       ? buildGateDraftKey(this.#state.workbench.activeGate)
       : null;

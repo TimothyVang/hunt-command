@@ -15,6 +15,7 @@ import { z } from "zod";
 import {
   AuthenticatedGateDecisionSchema,
   CaseMetadataSchema,
+  DATA_ORIGINS,
   extractInlineCitations,
   HUNT_WAVES,
   HandoffSchema,
@@ -74,7 +75,8 @@ import type { SecretVault } from "./secret-vault.ts";
 export interface RunSummaryItem {
   huntId: string;
   caseId: string;
-  title: string;
+  title: string | null;
+  metadataAvailable: boolean;
   dataOrigin: WorkbenchSnapshot["caseMetadata"]["data_origin"];
   runStatus: WorkbenchSnapshot["runStatus"];
   openGate: "scope" | "incident" | "reconcile" | null;
@@ -151,6 +153,14 @@ function buildStepTranscriptText(snapshot: WorkbenchSnapshot, stepId: string): s
 
   return `${stripControlAndBidiChars(lines.join("\n"))}\n`;
 }
+const LiveRunSummarySchema = z.object({
+  run_id: z.string().min(1),
+  case_id: z.string().min(1),
+  data_origin: z.enum(DATA_ORIGINS),
+  status: z.enum(["running", "awaiting_gate", "completed", "failed", "cancelled"]),
+  open_gate: z.object({ gate: z.enum(["scope", "incident", "reconcile"]) }).nullable(),
+});
+
 const LiveStartResultSchema = z.object({
   run_id: z.string().min(1),
   case_id: z.string().min(1),
@@ -187,6 +197,7 @@ export class WorkbenchService {
   readonly #liveRunIds = new Set<string>();
   /** Cited-record paging per run (F18); holds the opaque cursor, which never reaches the renderer. */
   readonly #evidencePaging = new Map<string, GateEvidencePaging>();
+  readonly #gateMutations = new Set<string>();
   #selectionVersion = 0;
   #activeHuntId: string;
 
@@ -224,23 +235,52 @@ export class WorkbenchService {
   }
 
   async listRuns(): Promise<RunSummaryItem[]> {
+    let liveRuns: RunSummaryItem[] = [];
     if (this.#deps.sidecar.isLiveReady) {
       const result = await this.#deps.sidecar.request<{ runs: unknown[] }>("hunt.list");
-      for (const raw of result.runs) {
-        const run = LiveStartResultSchema.parse(raw);
+      const runs = result.runs.map((raw) => LiveRunSummarySchema.parse(raw));
+      const metadataByCase = new Map<string, Promise<string | null>>();
+      for (const run of runs) {
         this.#liveRunIds.add(run.run_id);
-        await this.#liveSnapshot(raw);
+        if (!metadataByCase.has(run.case_id)) {
+          metadataByCase.set(run.case_id, (async () => {
+            try {
+              const metadata = CaseMetadataSchema.parse(
+                await this.#deps.sidecar.request("case.metadata", { case_id: run.case_id }),
+              );
+              return metadata.case_id === run.case_id ? metadata.title : null;
+            } catch {
+              return null;
+            }
+          })());
+        }
       }
+      liveRuns = await Promise.all(runs.map(async (run) => {
+        const title = await metadataByCase.get(run.case_id)!;
+        return {
+          huntId: run.run_id,
+          caseId: run.case_id,
+          title,
+          metadataAvailable: title !== null,
+          dataOrigin: run.data_origin,
+          runStatus: run.status === "awaiting_gate" ? "awaiting_human_gate" : run.status === "cancelled" ? "stopped" : run.status,
+          openGate: run.open_gate?.gate ?? null,
+        };
+      }));
     }
 
-    return [...this.#runs.values()].map((snap) => ({
-      huntId: snap.huntId,
-      caseId: snap.caseMetadata.case_id,
-      title: snap.caseMetadata.title,
-      dataOrigin: snap.caseMetadata.data_origin,
-      runStatus: snap.runStatus,
-      openGate: snap.activeGate?.gate ?? null,
-    }));
+    const snapshots = [...this.#runs.values()]
+      .filter((snap) => !this.#deps.sidecar.isLiveReady || !this.#liveRunIds.has(snap.huntId))
+      .map((snap) => ({
+        huntId: snap.huntId,
+        caseId: snap.caseMetadata.case_id,
+        title: snap.caseMetadata.title,
+        metadataAvailable: true,
+        dataOrigin: snap.caseMetadata.data_origin,
+        runStatus: snap.runStatus,
+        openGate: snap.activeGate?.gate ?? null,
+      }));
+    return [...snapshots, ...liveRuns];
   }
 
   async getWorkbenchState(rawPayload?: unknown): Promise<WorkbenchSnapshot> {
@@ -331,8 +371,15 @@ export class WorkbenchService {
     const parsed = GlobalStopInputSchema.parse(rawInput);
 
     if (this.#liveRunIds.has(parsed.huntId)) {
-      await this.#deps.sidecar.request("hunt.cancel", { run_id: parsed.huntId, reason: parsed.reason });
-      return await this.getWorkbenchState({ huntId: parsed.huntId });
+      if (this.#gateMutations.has(parsed.huntId)) throw new Error("A gate decision or stop is already in progress.");
+      this.#gateMutations.add(parsed.huntId);
+      this.#evidencePaging.delete(parsed.huntId);
+      try {
+        await this.#deps.sidecar.request("hunt.cancel", { run_id: parsed.huntId, reason: parsed.reason });
+        return await this.getWorkbenchState({ huntId: parsed.huntId });
+      } finally {
+        this.#gateMutations.delete(parsed.huntId);
+      }
     }
 
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
@@ -367,23 +414,30 @@ export class WorkbenchService {
           throw new Error("Gate 2 incident citations are not all verified, so approval is disabled.");
         }
       }
+      if (this.#gateMutations.has(parsed.huntId)) throw new Error("A gate decision or stop is already in progress.");
+      this.#gateMutations.add(parsed.huntId);
+      this.#evidencePaging.delete(parsed.huntId);
       try {
-        await this.#deps.sidecar.request("hunt.decideGate", {
-          hunt_id: parsed.huntId,
-          gate: parsed.gate,
-          action: parsed.action,
-          via: "desktop",
-          operator_token: parsed.operatorToken,
-          payload_sha256: parsed.payloadSha256,
-          check_note: parsed.checkNote,
-        });
-      } catch (error) {
-        if (error instanceof Error && error.message.includes("timed out")) {
-          throw new Error(`Gate decision outcome is unknown for hunt '${parsed.huntId}'. Refresh the run before submitting again.`);
+        try {
+          await this.#deps.sidecar.request("hunt.decideGate", {
+            hunt_id: parsed.huntId,
+            gate: parsed.gate,
+            action: parsed.action,
+            via: "desktop",
+            operator_token: parsed.operatorToken,
+            payload_sha256: parsed.payloadSha256,
+            check_note: parsed.checkNote,
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message.includes("timed out")) {
+            throw new Error(`Gate decision outcome is unknown for hunt '${parsed.huntId}'. Refresh the run before submitting again.`);
+          }
+          throw error;
         }
-        throw error;
+        return await this.getWorkbenchState({ huntId: parsed.huntId });
+      } finally {
+        this.#gateMutations.delete(parsed.huntId);
       }
-      return await this.getWorkbenchState({ huntId: parsed.huntId });
     }
 
     if (!current.activeGate || current.activeGate.gate !== parsed.gate) {
@@ -471,17 +525,20 @@ export class WorkbenchService {
    */
   async loadMoreGateEvidence(rawInput: unknown): Promise<WorkbenchSnapshot> {
     const parsed = GateEvidencePageInputSchema.parse(rawInput);
+    if (this.#gateMutations.has(parsed.huntId)) throw new Error("The gate is changing; refresh before loading evidence.");
     const paging = this.#evidencePaging.get(parsed.huntId);
     const current = this.#runs.get(parsed.huntId);
     if (!paging || !current?.activeGate || current.activeGate.payloadSha256 !== paging.payloadSha256) {
       throw new Error("No paged gate evidence is open for this hunt; refresh the gate.");
     }
     if (paging.nextCursor === null) return this.#attachWatchState(current);
+    const cursor = paging.nextCursor;
+    const loaded = paging.loaded;
     let raw: unknown;
     try {
       raw = await this.#deps.sidecar.request("hunt.gateEvidencePage", {
         run_id: parsed.huntId,
-        cursor: paging.nextCursor,
+        cursor,
         limit: EVIDENCE_PAGE_LIMIT,
       });
     } catch (error) {
@@ -491,6 +548,10 @@ export class WorkbenchService {
           ? `The gate changed since its evidence was loaded (${message}). Refresh the gate before loading more records.`
           : `Loading more evidence failed: ${message}`,
       );
+    }
+    if (this.#gateMutations.has(parsed.huntId) || this.#runs.get(parsed.huntId) !== current ||
+        this.#evidencePaging.get(parsed.huntId) !== paging || paging.loaded !== loaded || paging.nextCursor !== cursor) {
+      throw new Error("The gate changed while evidence was loading; refresh the gate.");
     }
     const page = projectEvidencePage(raw, paging);
     const handoffs = current.activeGate.gate === "reconcile" ? [] : current.handoffs;

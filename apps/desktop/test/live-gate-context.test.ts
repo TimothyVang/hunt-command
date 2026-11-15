@@ -706,6 +706,79 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
     }
   }, 120_000);
 
+  test("a delayed evidence page cannot restore a decided gate", async () => {
+    const { h, huntId } = await bulkIncidentGate();
+    const pageReady = Promise.withResolvers<void>();
+    const releasePage = Promise.withResolvers<void>();
+    try {
+      const snapshot = await h.service.getWorkbenchState({ huntId });
+      const original = h.sidecar.request.bind(h.sidecar);
+      Object.assign(h.sidecar, { request: async (method: string, params?: Record<string, unknown>) => {
+        const result = await original(method, params);
+        if (method === "hunt.gateEvidencePage") {
+          pageReady.resolve();
+          await releasePage.promise;
+        }
+        return result;
+      } });
+      const loading = h.service.loadMoreGateEvidence({ huntId });
+      await pageReady.promise;
+      const decided = await h.service.submitGateDecision({
+        huntId, gate: "incident", action: "approve", operatorName: "x", rbacRole: "incident_commander",
+        checkNote: "Checked the evidence.", payloadSha256: snapshot.activeGate!.payloadSha256,
+        operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
+      });
+      expect(decided.activeGate).toBeNull();
+      releasePage.resolve();
+      await expect(loading).rejects.toThrow(/changed|stale/i);
+      const after = await h.service.getWorkbenchState({ huntId });
+      expect(after.runStatus).toBe("completed");
+      expect(after.activeGate).toBeNull();
+    } finally {
+      releasePage.resolve();
+      await h.close();
+    }
+  }, 120_000);
+
+  test("a page is rejected while an already-applied gate decision response is pending", async () => {
+    const { h, huntId } = await bulkIncidentGate();
+    const pageReady = Promise.withResolvers<void>();
+    const decisionReady = Promise.withResolvers<void>();
+    const releasePage = Promise.withResolvers<void>();
+    const releaseDecision = Promise.withResolvers<void>();
+    try {
+      const snapshot = await h.service.getWorkbenchState({ huntId });
+      const original = h.sidecar.request.bind(h.sidecar);
+      Object.assign(h.sidecar, { request: async (method: string, params?: Record<string, unknown>) => {
+        const result = await original(method, params);
+        if (method === "hunt.gateEvidencePage") {
+          pageReady.resolve();
+          await releasePage.promise;
+        } else if (method === "hunt.decideGate") {
+          decisionReady.resolve();
+          await releaseDecision.promise;
+        }
+        return result;
+      } });
+      const loading = h.service.loadMoreGateEvidence({ huntId }).then(() => null, (error: unknown) => error);
+      await pageReady.promise;
+      const deciding = h.service.submitGateDecision({
+        huntId, gate: "incident", action: "approve", operatorName: "x", rbacRole: "incident_commander",
+        checkNote: "Checked the evidence.", payloadSha256: snapshot.activeGate!.payloadSha256,
+        operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
+      });
+      await decisionReady.promise;
+      releasePage.resolve();
+      expect(await loading).toBeInstanceOf(Error);
+      releaseDecision.resolve();
+      expect((await deciding).activeGate).toBeNull();
+    } finally {
+      releasePage.resolve();
+      releaseDecision.resolve();
+      await h.close();
+    }
+  }, 120_000);
+
   test("F18: Load more pages every one of 1,200 records in cited order and a refresh keeps them", async () => {
     const { h, ids, huntId } = await bulkIncidentGate();
     try {

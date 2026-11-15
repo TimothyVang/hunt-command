@@ -6,7 +6,7 @@ import type {
   StartRunInput,
 } from "../../shared/ipc.ts";
 import type { WatchBrowserState, WorkbenchSnapshot } from "../../shared/workbench-types.ts";
-import { listRuns, selectRun, startRun } from "./lib/run-actions.ts";
+import { listRuns, loadGateEvidencePage, selectRun, startRun } from "./lib/run-actions.ts";
 import { invokeDesktop, subscribeDesktopEvent } from "./lib/bridge.ts";
 import { scopeWatchSnapshot } from "./lib/watch-open.ts";
 import { AttackGraphLineagePane } from "./panes/AttackGraphLineagePane.tsx";
@@ -178,15 +178,17 @@ export function App() {
     });
   };
 
-  const handleLoadMoreEvidence = async (): Promise<string | null> => {
-    const huntId = ui.workbench.huntId;
+  const handleLoadMoreEvidence = (): Promise<string | null> => {
+    const snapshot = workbenchStore.getState().workbench;
+    const selection = selectionVersion.current;
+    const snapshotVersion = workbenchStore.getSnapshotVersion();
     const requestVersion = watchVersion.current;
-    const res = await invokeDesktop<WorkbenchSnapshot>("hunt:gateEvidencePage", { huntId });
-    if (res.ok && res.data) {
-      if (selectedHunt.current === res.data.huntId) applySnapshot(res.data, requestVersion);
-      return null;
-    }
-    return res.error?.message ?? "Could not load more evidence.";
+    return loadGateEvidencePage(
+      snapshot,
+      () => selection === selectionVersion.current && selectedHunt.current === snapshot.huntId,
+      () => snapshotVersion === workbenchStore.getSnapshotVersion(),
+      (page) => applySnapshot(page, requestVersion),
+    );
   };
 
   const handleGlobalStop = () => {

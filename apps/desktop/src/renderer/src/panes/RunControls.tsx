@@ -5,6 +5,8 @@ import type { StartRunInput } from "../../../shared/ipc.ts";
 export interface RunOption {
   huntId: string;
   caseId: string;
+  title: string | null;
+  metadataAvailable: boolean;
   runStatus: string;
 }
 
@@ -35,7 +37,7 @@ export function RunControls({ runs, selectedHuntId, busy, error, onStart, onSele
           <select aria-label="Select Active Hunt Run" className={field} value={selectedHuntId ?? ""} onChange={(e) => e.target.value && onSelect(e.target.value)} disabled={busy}>
             <option value="">Select a run</option>
             {selectedHuntId && !runs.some((run) => run.huntId === selectedHuntId) && <option value={selectedHuntId}>{selectedHuntId}</option>}
-            {runs.map((run) => <option key={run.huntId} value={run.huntId}>{run.caseId} · {run.huntId} · {run.runStatus}</option>)}
+            {runs.map((run) => <option key={run.huntId} value={run.huntId}>{run.caseId} · {run.metadataAvailable && run.title !== null ? run.title : "Case metadata unavailable"} · {run.huntId} · {run.runStatus}</option>)}
           </select>
         </label>
         <button type="button" className={field} onClick={onRefresh} disabled={busy}>Refresh runs</button>

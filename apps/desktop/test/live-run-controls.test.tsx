@@ -4,11 +4,12 @@ import { buildFixtureWorkbenchSnapshot } from "../src/shared/fixture-workbench.t
 import { AuthorityGateCard } from "../src/renderer/src/panes/AuthorityGateCard.tsx";
 import { projectLiveGate } from "../src/main/live-gate-context.ts";
 import { RunControls } from "../src/renderer/src/panes/RunControls.tsx";
-import { listRuns, selectRun, startRun } from "../src/renderer/src/lib/run-actions.ts";
+import { listRuns, loadGateEvidencePage, selectRun, startRun } from "../src/renderer/src/lib/run-actions.ts";
+import { WorkbenchStore } from "../src/renderer/src/state/workbench-store.ts";
 
 describe("live run controls", () => {
   test("offers all supported start fields and live run selection", () => {
-    const html = renderToStaticMarkup(<RunControls runs={[{ huntId: "live-123", caseId: "case-42", runStatus: "running" }]}
+    const html = renderToStaticMarkup(<RunControls runs={[{ huntId: "live-123", caseId: "case-42", title: "Case title", metadataAvailable: true, runStatus: "running" }, { huntId: "live-456", caseId: "case-43", title: null, metadataAvailable: false, runStatus: "running" }]}
       selectedHuntId="live-123" busy={false} error={null} onStart={() => {}} onSelect={() => {}} onRefresh={() => {}} />);
     expect(html).toContain("Case ID");
     expect(html).toContain("Scope");
@@ -16,6 +17,9 @@ describe("live run controls", () => {
     expect(html).toContain("work-connected");
     expect(html).toContain("Token limit");
     expect(html).toContain("Follow-ups");
+    expect(html).toContain("Case title");
+    expect(html).toContain("Case metadata unavailable");
+    expect(html).toContain("live-456");
     expect(html).toContain("live-123");
     expect(html).toContain("Refresh runs");
   });
@@ -115,9 +119,88 @@ describe("live run controls", () => {
     expect(JSON.stringify(projection.activeGate)).not.toContain("cursor-1");
   });
 
+  test("F19: delayed evidence pages cannot replace newer workbench or selection state", async () => {
+    const snapshot = buildFixtureWorkbenchSnapshot();
+    const globals = globalThis as unknown as { window?: unknown };
+    const previous = globals.window;
+    const store = new WorkbenchStore(snapshot);
+    let selection = 0;
+    let resolvePage!: (result: unknown) => void;
+    globals.window = { huntWorkbench: { invoke: () => {
+      const deferred = Promise.withResolvers<unknown>();
+      resolvePage = deferred.resolve;
+      return deferred.promise;
+    } } };
+    const request = () => {
+      const current = store.getState().workbench;
+      const version = store.getSnapshotVersion();
+      const selected = selection;
+      return loadGateEvidencePage(current, () => selected === selection,
+        () => version === store.getSnapshotVersion(), (page) => store.setWorkbenchSnapshot(page));
+    };
+    try {
+      const page = { ...snapshot };
+      const pendingDecision = request();
+      const decided = { ...snapshot, activeGate: null };
+      store.setWorkbenchSnapshot(decided);
+      resolvePage({ ok: true, data: page });
+      expect(await pendingDecision).toContain("workbench changed");
+      expect(store.getState().workbench).toBe(decided);
+
+      const pendingChangedGate = request();
+      const changed = { ...snapshot, activeGate: snapshot.activeGate && { ...snapshot.activeGate, payloadSha256: "b".repeat(64) } };
+      store.setWorkbenchSnapshot(changed);
+      store.setWorkbenchSnapshot(decided);
+      resolvePage({ ok: true, data: page });
+      expect(await pendingChangedGate).toContain("workbench changed");
+      expect(store.getState().workbench).toBe(decided);
+
+      const pendingCursor = request();
+      const paged = { ...snapshot, activeGate: snapshot.activeGate && {
+        ...snapshot.activeGate, evidencePaging: { loaded: 20, total: 30, hasMore: true },
+      } };
+      store.setWorkbenchSnapshot(paged);
+      resolvePage({ ok: true, data: page });
+      expect(await pendingCursor).toContain("workbench changed");
+      expect(store.getState().workbench).toBe(paged);
+
+      const pendingSwitch = request();
+      selection += 2;
+      resolvePage({ ok: true, data: page });
+      expect(await pendingSwitch).toBeNull();
+      expect(store.getState().workbench).toBe(paged);
+
+      const pendingSuccess = request();
+      resolvePage({ ok: true, data: page });
+      expect(await pendingSuccess).toBeNull();
+      expect(store.getState().workbench).toBe(page);
+    } finally {
+      if (previous === undefined) delete globals.window;
+      else globals.window = previous;
+    }
+  });
+
+  test("F19: current evidence-page failures are surfaced, including rejected bridge calls", async () => {
+    const snapshot = buildFixtureWorkbenchSnapshot();
+    const globals = globalThis as unknown as { window?: unknown };
+    const previous = globals.window;
+    const apply = () => { throw new Error("A failed page must not be applied"); };
+    try {
+      globals.window = { huntWorkbench: { invoke: async () => ({ ok: false, error: { message: "Page expired" } }) } };
+      expect(await loadGateEvidencePage(snapshot, () => true, () => true, apply)).toBe("Page expired");
+      globals.window = { huntWorkbench: { invoke: async () => { throw new Error("Bridge failed"); } } };
+      expect(await loadGateEvidencePage(snapshot, () => true, () => true, apply)).toBe("Bridge failed");
+      globals.window = { huntWorkbench: { invoke: async () => ({ ok: true, data: { ...snapshot, huntId: "other" } }) } };
+      expect(await loadGateEvidencePage(snapshot, () => true, () => true, apply)).toContain("different hunt");
+    } finally {
+      if (previous === undefined) delete globals.window;
+      else globals.window = previous;
+    }
+  });
+
   test("routes start, list and selection to the desktop bridge and returns its snapshots", async () => {
     const snapshot = { ...buildFixtureWorkbenchSnapshot(), huntId: "live-123", provenanceMode: "live_daemon" as const };
-    const runs = [{ huntId: "live-123", caseId: "case-42", runStatus: "running" }];
+    const runs = [{ huntId: "live-123", caseId: "case-42", title: "Case title", metadataAvailable: true, runStatus: "running" }];
     const calls: Array<[string, unknown]> = [];
     const globals = globalThis as unknown as { window?: unknown };
     const previous = globals.window;

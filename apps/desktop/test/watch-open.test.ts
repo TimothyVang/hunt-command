@@ -260,6 +260,40 @@ describe("WorkbenchService live runs", () => {
     expect(unavailable.claims[0]?.inlineCitations[0]?.status).toBe("unresolved");
   });
 
+  test("lists every persisted hunt when a case pack is unavailable without loading full snapshots", async () => {
+    const missing = { ...run("hunt-missing"), case_id: "case-missing", status: "running", open_gate: null };
+    const available = run("hunt-available");
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const service = makeService(true, async (method, params) => {
+      calls.push({ method, params });
+      if (method === "hunt.list") return { runs: [missing, available] };
+      if (method === "case.metadata") {
+        if (params && typeof params === "object" && "case_id" in params && params.case_id === missing.case_id) {
+          throw new Error("case pack unavailable");
+        }
+        return metadata;
+      }
+      if (method === "hunt.status") {
+        return params && typeof params === "object" && "run_id" in params && params.run_id === missing.run_id
+          ? missing : available;
+      }
+      throw new Error(`unexpected ${method}`);
+    });
+
+    const items = await service.listRuns();
+    expect(items.find((item) => item.huntId === missing.run_id)).toMatchObject({
+      caseId: missing.case_id, title: null, dataOrigin: "synthetic", metadataAvailable: false,
+      runStatus: "running", openGate: null,
+    });
+    expect(items.find((item) => item.huntId === available.run_id)).toMatchObject({
+      caseId: input.caseId, title: metadata.title, metadataAvailable: true,
+      runStatus: "awaiting_human_gate", openGate: "scope",
+    });
+    expect(calls.map((call) => call.method)).toEqual(["hunt.list", "case.metadata", "case.metadata"]);
+    await expect(service.getWorkbenchState({ huntId: missing.run_id })).rejects.toThrow("case pack unavailable");
+    expect((await service.getWorkbenchState({ huntId: available.run_id })).huntId).toBe(available.run_id);
+  });
+
   test("returns real metadata and empty evidence, and refreshes status", async () => {
     let id = "";
     const calls: string[] = [];
