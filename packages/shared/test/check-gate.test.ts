@@ -75,4 +75,23 @@ describe("hunt_bots_check AST and policy rules", () => {
     const sqliteExec = `const db = { exec: (sql: string) => sql };\ndb.exec("CREATE TABLE events_hot (id TEXT)");\n`;
     expect(checkTypeScriptAstPolicies("packages/data-plane/src/db.ts", sqliteExec)).toEqual([]);
   });
+
+  test("forbids the system temp folder in shipped source, with a reasoned waiver, and leaves tests alone", () => {
+    const viaNamespace = `import os from "node:os";\nconst dir = os.tmpdir();\n`;
+    const viaNamedImport = `import { tmpdir } from "node:os";\nconst dir = tmpdir();\n`;
+    for (const source of [viaNamespace, viaNamedImport]) {
+      for (const file of ["packages/daemon/src/pool.ts", "apps/desktop/src/main/film.ts"]) {
+        const found = checkTypeScriptAstPolicies(file, source);
+        expect(found.map((v) => [v.rule, v.line])).toEqual([["SYSTEM_TEMP", 2]]);
+      }
+    }
+
+    const waived = `import os from "node:os";\n// health: allow SYSTEM_TEMP -- a clean room must be outside the workspace\nconst dir = os.tmpdir();\n`;
+    expect(checkTypeScriptAstPolicies("packages/coach/src/room.ts", waived)).toEqual([]);
+    const waiverWithoutReason = `import os from "node:os";\n// health: allow SYSTEM_TEMP --\nconst dir = os.tmpdir();\n`;
+    expect(checkTypeScriptAstPolicies("packages/coach/src/room.ts", waiverWithoutReason)).toHaveLength(1);
+
+    expect(checkTypeScriptAstPolicies("packages/daemon/test/pool.test.ts", viaNamespace)).toEqual([]);
+    expect(checkTypeScriptAstPolicies("scripts/test-temp.ts", viaNamespace)).toEqual([]);
+  });
 });

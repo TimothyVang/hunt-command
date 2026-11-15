@@ -26,10 +26,6 @@ function getNativeBridge(): DesktopBridge | null {
   return rendererWindow()?.huntWorkbench ?? null;
 }
 
-export function hasDesktopBridge(): boolean {
-  return getNativeBridge() !== null;
-}
-
 /**
  * Fixture data is served only when explicitly requested on a dev-server renderer
  * (`electron-vite dev` / `vite` with `?preview=fixtures`). A packaged or built renderer

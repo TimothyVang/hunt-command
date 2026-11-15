@@ -17,7 +17,6 @@ import type { CitationVerificationReceipt, HuntDataPlanePort } from "./ports.ts"
 
 export const FINAL_HANDOFF_BYTES = 32_768;
 export const RETRY_NOTICE_RESERVE_BYTES = 2_048;
-export const FOCUS_FRAME_RESERVE_BYTES = 1_024;
 
 export const WHOLE_CHECK_RETRY_SUFFIX =
   "\n\nIMPORTANT: Your previous handoff failed strict ontology validation. " +

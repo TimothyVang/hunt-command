@@ -35,8 +35,6 @@ export const GlobalStopInputSchema = z
   })
   .strict();
 
-export type GlobalStopInput = z.infer<typeof GlobalStopInputSchema>;
-
 export const SubmitGateDecisionInputSchema = z
   .object({
     huntId: z.string().min(1).max(128),
@@ -69,8 +67,6 @@ export const InspectTranscriptInputSchema = z
   })
   .strict();
 
-export type InspectTranscriptInput = z.infer<typeof InspectTranscriptInputSchema>;
-
 export const QueryDissectorInputSchema = z
   .object({
     huntId: z.string().min(1).max(128),
@@ -82,8 +78,6 @@ export const QueryDissectorInputSchema = z
     limit: z.number().int().min(1).max(1000).default(250),
   })
   .strict();
-
-export type QueryDissectorInput = z.infer<typeof QueryDissectorInputSchema>;
 
 export const WatchBoundsInputSchema = z
   .object({
@@ -148,8 +142,6 @@ export const FilmCutInputSchema = z
     allowWorkFilm: z.boolean().default(false),
   })
   .strict();
-
-export type FilmCutInput = z.infer<typeof FilmCutInputSchema>;
 
 export const VaultSetSecretInputSchema = z
   .object({

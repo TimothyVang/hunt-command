@@ -10,6 +10,7 @@ STACK.md
 THIRD-PARTY-NOTICES.md
 TRACKED-FILES.txt
 apps/desktop/.gitignore
+apps/desktop/bunfig.toml
 apps/desktop/electron-builder.yml
 apps/desktop/electron.vite.config.ts
 apps/desktop/package.json
@@ -88,6 +89,7 @@ apps/desktop/tsconfig.json
 apps/desktop/tsconfig.node.json
 apps/desktop/tsconfig.web.json
 bun.lock
+bunfig.toml
 package.json
 packages/coach/package.json
 packages/coach/src/clean-room-coach.ts
@@ -106,7 +108,9 @@ packages/daemon/src/cli.ts
 packages/daemon/src/drive-gates.ts
 packages/daemon/src/gate-context.ts
 packages/daemon/src/gates.ts
+packages/daemon/src/hunter-policy.ts
 packages/daemon/src/index.ts
+packages/daemon/src/lazy-hunter-pool.ts
 packages/daemon/src/omp-pool.ts
 packages/daemon/src/ontology-validator.ts
 packages/daemon/src/ports.ts
@@ -122,6 +126,7 @@ packages/daemon/test/case-data-plane.test.ts
 packages/daemon/test/cli-errors.test.ts
 packages/daemon/test/gate-context.test.ts
 packages/daemon/test/gates-slack-rpc.test.ts
+packages/daemon/test/lazy-hunter-pool.test.ts
 packages/daemon/test/omp-pool-live.test.ts
 packages/daemon/test/ontology-validator.test.ts
 packages/daemon/test/review-regressions.test.ts
@@ -164,4 +169,5 @@ packages/telemetry/src/scrubber.ts
 packages/telemetry/src/telemetry-store.ts
 packages/telemetry/test/telemetry.test.ts
 scripts/hunt_bots_check.ts
+scripts/test-temp.ts
 tsconfig.json

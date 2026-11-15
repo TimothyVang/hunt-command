@@ -28,8 +28,6 @@ export const EVENT_FIELDS = [
   "labels",
 ] as const;
 
-export type EventTopLevelField = (typeof EVENT_FIELDS)[number];
-
 export const NETWORK_FIELDS = [
   "firstPacket",
   "lastPacket",
@@ -43,8 +41,6 @@ export const NETWORK_FIELDS = [
   "dns.host",
   "node",
 ] as const;
-
-export type NetworkSummaryField = (typeof NETWORK_FIELDS)[number];
 
 export const KEYWORD_FIELDS = [
   "event.id",
@@ -164,10 +160,7 @@ export const KEYWORD_FIELDS = [
   "winlog.event_data.TargetProcessGUID",
 ] as const;
 
-export type KeywordField = (typeof KEYWORD_FIELDS)[number];
-
 export const AGG_FIELDS: ReadonlySet<string> = new Set<string>(KEYWORD_FIELDS);
-export const ES_AGG_FIELDS = KEYWORD_FIELDS;
 
 export const SEARCH_EXTRA_FIELDS = [
   "@timestamp",
@@ -179,7 +172,6 @@ export const SEARCH_EXTRA_FIELDS = [
 ] as const;
 
 export const ES_RETURN_FIELDS = [...KEYWORD_FIELDS, ...SEARCH_EXTRA_FIELDS] as const;
-export type SearchField = (typeof ES_RETURN_FIELDS)[number];
 
 export const SEARCH_FIELDS: ReadonlySet<string> = new Set<string>(ES_RETURN_FIELDS);
 
@@ -252,8 +244,6 @@ export const INTEL_FIELDS = [
   "first_seen",
 ] as const;
 
-export type IntelField = (typeof INTEL_FIELDS)[number];
-
 export const ARKIME_SESSION_FIELDS = [
   "firstPacket",
   "lastPacket",
@@ -280,8 +270,6 @@ export const ARKIME_SESSION_FIELDS = [
   "tls.ja4",
   "tags",
 ] as const;
-
-export type ArkimeSessionField = (typeof ARKIME_SESSION_FIELDS)[number];
 
 export const ARKIME_DEFAULT_FIELDS = [
   "firstPacket",
@@ -319,7 +307,6 @@ export const ARKIME_UNIQUE_FIELD_LIST = [
   "tags",
 ] as const;
 
-export type ArkimeUniqueField = (typeof ARKIME_UNIQUE_FIELD_LIST)[number];
 export const ARKIME_UNIQUE_FIELDS: ReadonlySet<string> = new Set<string>(ARKIME_UNIQUE_FIELD_LIST);
 
 export const PACKET_ALWAYS_FIELDS = ["frame.number", "frame.time_epoch"] as const;
@@ -366,7 +353,6 @@ export const PACKET_FIELDS = [
 ] as const;
 
 export type AllowedPacketField = (typeof PACKET_FIELDS)[number];
-export const ADR0003_PACKET_FIELD_ALLOWLIST = PACKET_FIELDS;
 
 export const PACKET_DEFAULT_FIELDS = [
   "ip.src",
@@ -378,8 +364,6 @@ export const PACKET_DEFAULT_FIELDS = [
   "http.host",
   "tls.handshake.extensions_server_name",
 ] as const;
-
-export const PACKET_COLUMN_FIELDS: ReadonlySet<string> = new Set<string>(["_ws.col.Protocol"]);
 
 export const PACKET_FILTER_FIELD_LIST = PACKET_FIELDS.filter(
   (field): field is Exclude<AllowedPacketField, "_ws.col.Protocol" | "http.request.uri"> =>
@@ -402,8 +386,6 @@ export const PACKET_FILTER_PROTOCOLS = [
   "arp",
   "icmp",
 ] as const;
-
-export type PacketFilterProtocol = (typeof PACKET_FILTER_PROTOCOLS)[number];
 
 export const PACKET_FILTER_WORDS = {
   and: "logic",

@@ -9,7 +9,7 @@ import {
   loadOrCreateOperatorSessionSecret,
   type RbacRole,
 } from "./gates.ts";
-import { OmpHunterPool } from "./omp-pool.ts";
+import { LazyHunterPool } from "./lazy-hunter-pool.ts";
 import { createCaseDirDataPlaneResolver } from "./case-data-plane.ts";
 import { InMemoryTelemetrySink, type ModelRunnerPort } from "./ports.ts";
 import { HuntDaemonRpcServer } from "./rpc-server.ts";
@@ -54,8 +54,10 @@ export function createHuntDaemonRuntime(options?: CreateDaemonContextOptions) {
   const telemetry = new InMemoryTelemetrySink();
   const modelRunner =
     options?.modelRunner ??
-    new OmpHunterPool({
+    // The agent stack is loaded on the first model call, not at daemon start.
+    new LazyHunterPool({
       subscriptionOnly: options?.subscriptionOnly ?? true,
+      runtimeRootDir: paths.rootDir,
     });
   const engine = new HuntWaveEngine({
     stateStore,

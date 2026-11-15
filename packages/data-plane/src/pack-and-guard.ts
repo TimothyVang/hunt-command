@@ -216,11 +216,6 @@ export function fenceToolResult(rawResult: unknown): string {
   return `<untrusted_tool_result_${nonce}>\n${serializeToolResult(result)}\n</untrusted_tool_result_${nonce}>`;
 }
 
-export interface ValidatedCaseSource {
-  artifact: string;
-  coverage: string;
-}
-
 export interface ValidatedCasePack {
   caseDir: string;
   caseJsonPath: string;

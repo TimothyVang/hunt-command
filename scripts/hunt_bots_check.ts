@@ -60,6 +60,11 @@ const CHILD_PROCESS_FUNCTIONS = new Set<string>([
 ]);
 
 const SPAWN_WAIVER_RE = /\/\/\s*health:\s*allow\s+SPAWN_WINDOW\s*--\s*\S+/;
+/** Shipped source (not tests or scripts): `packages/<name>/src/` and `apps/<name>/src/`. */
+const PRODUCT_SOURCE_RE = /^(?:packages|apps)\/[^/]+\/src\//;
+
+const SYSTEM_TEMP_WAIVER_RE = /\/\/\s*health:\s*allow\s+SYSTEM_TEMP\s*--\s*\S+/;
+
 const TOKEN_WAIVER_RE = /\/\/\s*health:\s*allow\s+FORBIDDEN_TOKEN\s*--\s*\S+/;
 
 function normalizeLines(content: string): string[] {
@@ -252,11 +257,15 @@ function hasWindowsHideTrue(args: readonly ts.Expression[]): boolean {
   return false;
 }
 
-function hasSpawnWaiverComment(sourceText: string, lineZeroBased: number): boolean {
+function hasWaiverComment(sourceText: string, lineZeroBased: number, waiver: RegExp): boolean {
   const lines = sourceText.replace(/\r\n/g, "\n").split("\n");
   const currentLine = lines[lineZeroBased] ?? "";
   const previousLine = lineZeroBased > 0 ? (lines[lineZeroBased - 1] ?? "") : "";
-  return SPAWN_WAIVER_RE.test(currentLine) || SPAWN_WAIVER_RE.test(previousLine);
+  return waiver.test(currentLine) || waiver.test(previousLine);
+}
+
+function hasSpawnWaiverComment(sourceText: string, lineZeroBased: number): boolean {
+  return hasWaiverComment(sourceText, lineZeroBased, SPAWN_WAIVER_RE);
 }
 
 export function checkTypeScriptAstPolicies(relPath: string, sourceText: string): PolicyViolation[] {
@@ -359,6 +368,25 @@ export function checkTypeScriptAstPolicies(relPath: string, sourceText: string):
         ts.isStringLiteral(node.arguments[0]!)
       ) {
         checkSpecifier(node.arguments[0]!.text, node.arguments[0]!);
+      }
+
+      const callee = node.expression;
+      const calleeName = ts.isPropertyAccessExpression(callee)
+        ? callee.name.text
+        : ts.isIdentifier(callee)
+          ? callee.text
+          : null;
+      if (calleeName === "tmpdir" && PRODUCT_SOURCE_RE.test(relPath)) {
+        const lineZeroBased = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line;
+        if (!hasWaiverComment(sourceText, lineZeroBased, SYSTEM_TEMP_WAIVER_RE)) {
+          violations.push({
+            rule: "SYSTEM_TEMP",
+            file: relPath,
+            line: lineZeroBased + 1,
+            message:
+              "Product code must not write to the system temp folder; use resolveWorkspaceTempDir() from @hunt-command/shared, or carry '// health: allow SYSTEM_TEMP -- <reason>'",
+          });
+        }
       }
 
       let spawnCallLabel: string | null = null;

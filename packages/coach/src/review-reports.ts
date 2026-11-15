@@ -50,16 +50,6 @@ export const GENERIC_VALUES: ReadonlySet<string> = new Set<string>([
   "0.0.0.0",
 ]);
 
-export const EVENT_CAP = 40 as const;
-export const REASON_LIMIT = 300 as const;
-export const VERDICTS = ["correct", "wrong", "unsupported"] as const;
-export const ESTABLISHED = ["yes", "partly", "no"] as const;
-export const SCORER_TO_REVIEW = {
-  found: "yes",
-  partial: "partly",
-  missed: "no",
-} as const;
-
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
