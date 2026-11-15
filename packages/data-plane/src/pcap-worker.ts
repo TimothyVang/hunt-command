@@ -14,6 +14,8 @@ export interface PcapWorkerRequest {
   dbPath: string;
   pcapPath: string;
   caseId: string;
+  startNs: bigint;
+  endNs: bigint;
 }
 
 export interface PcapWorkerResponse {
@@ -210,6 +212,8 @@ export function indexPcapIntoDatabase(
   db: Database,
   pcapPath: string,
   caseId: string,
+  startNs: bigint,
+  endNs: bigint,
 ): { totalFrames: number; totalSessions: number } {
   ensureNetworkTables(db);
 
@@ -271,6 +275,7 @@ export function indexPcapIntoDatabase(
   try {
     const dissected = streamDissectPcapFile(pcapPath, {
       caseId,
+      window: { startNs, endNs },
       onPacket: (pkt) => {
         packetBatch.push(pkt);
         if (packetBatch.length >= BATCH_SIZE) {
@@ -431,12 +436,12 @@ export function runPcapIndexerWorker(req: PcapWorkerRequest): Promise<{
 // Worker entrypoint when executed inside a Bun Worker thread
 if (typeof self !== "undefined" && typeof self.postMessage === "function" && !Bun.isMainThread) {
   self.onmessage = (ev: MessageEvent<PcapWorkerRequest>) => {
-    const { dbPath, pcapPath, caseId } = ev.data;
+    const { dbPath, pcapPath, caseId, startNs, endNs } = ev.data;
     let db: Database | null = null;
     try {
       db = new Database(dbPath);
       db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
-      const stats = indexPcapIntoDatabase(db, pcapPath, caseId);
+      const stats = indexPcapIntoDatabase(db, pcapPath, caseId, startNs, endNs);
       db.close();
       db = null;
       const resp: PcapWorkerResponse = {

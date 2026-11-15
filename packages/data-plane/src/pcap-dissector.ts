@@ -870,21 +870,31 @@ interface Ipv4FragBucket {
   collectedBytes: number;
 }
 
+interface PcapDissectionWindow {
+  startNs: bigint;
+  endNs: bigint;
+}
+
+interface PcapStreamOptions {
+  caseId?: string;
+  window?: PcapDissectionWindow;
+  onPacket: (pkt: DissectedPacket) => void;
+}
+
 export class PcapStreamDissector {
   private readonly caseTag: string | null;
   private readonly onPacket: (pkt: DissectedPacket) => void;
+  private readonly window: PcapDissectionWindow | undefined;
   private frameCounter = 0;
   private nextTcpStreamId = 0;
   private nextSessionId = 1;
   private readonly sessions = new Map<string, SessionState>();
   private readonly fragBuckets = new Map<string, Ipv4FragBucket>();
 
-  constructor(options: {
-    caseId?: string;
-    onPacket: (pkt: DissectedPacket) => void;
-  }) {
+  constructor(options: PcapStreamOptions) {
     this.caseTag = options.caseId ? `case:${options.caseId}` : null;
     this.onPacket = options.onPacket;
+    this.window = options.window;
   }
 
   public getSessions(): DissectedSession[] {
@@ -906,6 +916,10 @@ export class PcapStreamDissector {
     // Invariant: physical 1-based frame ordinal assigned BEFORE any filter!
     this.frameCounter += 1;
     const frameNumber = this.frameCounter;
+    // Windowing precedes all decoding, fragment/TCP reassembly and session mutation.
+    if (this.window && (tsNs < this.window.startNs || tsNs >= this.window.endNs)) {
+      return;
+    }
     const epochMs = Number(tsNs / 1_000_000n);
     const kv = new Map<string, string[]>();
     const protocols = new Set<string>();
@@ -1957,10 +1971,7 @@ function parsePcapngTsNs(tsHigh: number, tsLow: number, tsResolByte: number): bi
  */
 export function streamDissectPcapFile(
   pcapPath: string,
-  options: {
-    caseId?: string;
-    onPacket: (pkt: DissectedPacket) => void;
-  },
+  options: PcapStreamOptions,
 ): { totalFrames: number; sessions: DissectedSession[] } {
   const dissector = new PcapStreamDissector(options);
   const fd = fs.openSync(pcapPath, "r");

@@ -721,6 +721,42 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
     }
   });
 
+  test("verifies event citations against the same host and time scope as searches", async () => {
+    const scopedDir = path.join(tmpRoot, "citation-host-case");
+    fs.mkdirSync(scopedDir);
+    fs.writeFileSync(path.join(scopedDir, "events.jsonl"), [
+      { "@timestamp": "2026-11-14T10:01:00Z", event: { id: "evt-ws" }, host: { name: "WS-01" } },
+      { "@timestamp": "2026-11-14T10:02:00Z", event: { id: "evt-dc" }, host: { name: "DC-01" } },
+      { "@timestamp": "2026-11-14T10:03:00Z", event: { id: "evt-nohost" } },
+      { "@timestamp": "2026-11-14T09:59:59Z", event: { id: "evt-before" }, host: { name: "WS-01" } },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+    const allIds = ["evt-ws", "evt-dc", "evt-nohost", "evt-before"];
+    for (const hosts of [["WS-01"], ["WS-01", "DC-01"], [], undefined]) {
+      fs.writeFileSync(path.join(scopedDir, "case.json"), JSON.stringify({
+        case_id: "citation-host-case",
+        data_origin: "synthetic",
+        hosts,
+        time_range_utc: {
+          start_inclusive: "2026-11-14T10:00:00Z",
+          end_exclusive: "2026-11-14T11:00:00Z",
+        },
+      }));
+      const expected = hosts?.length ? allIds.slice(0, hosts.length) : allIds.slice(0, 3);
+      for (const warm of [false, true]) {
+        const dp = EmbeddedHuntDataPlane.openSync(scopedDir, { cacheDir });
+        try {
+          expect(dp.cacheHit).toBe(warm);
+          expect(dp.elasticSearch({}).hits.map((hit) => hit["event.id"])).toEqual(expected);
+          const citations = dp.verifyCitations(allIds);
+          expect(citations.resolved.eventIds).toEqual(expected);
+          expect(citations.unresolved).toEqual(allIds.filter((id) => !expected.includes(id)));
+        } finally {
+          await dp.close();
+        }
+      }
+    }
+  });
+
   test("enforces closure-bound HMAC-SHA256 RoleCapabilityMint, ROLE_TOOL_OWNERSHIP (403), 405 read_only, and wire secret scrubbing", async () => {
     const dp = await EmbeddedHuntDataPlane.open(caseDir, { cacheDir });
     try {
@@ -783,15 +819,15 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
       ).rejects.toThrow(/does not own tool/);
 
       // Researcher running elastic_search with string size "10" coerces cleanly AND scrubs leaked credentials on wire!
-      const res = await researcherPlane.executeTool<{
-        returned: number;
-        hits: Array<Record<string, unknown>>;
-      }>("elastic_search", {
+      const wire = await researcherPlane.executeTool("elastic_search", {
         case_id: "synth-case-001",
         q: "event.code:1",
         size: "10",
         fields: "message,user.name",
       });
+      const fenced = /^<untrusted_tool_result_([0-9a-f]{32})>\n([\s\S]*)\n<\/untrusted_tool_result_\1>$/.exec(wire);
+      expect(fenced).not.toBeNull();
+      const res = JSON.parse(fenced![2]!) as { returned: number; hits: Array<Record<string, unknown>> };
       expect(res.returned).toBe(1);
       const msg = String(res.hits[0]!.message);
       expect(msg).not.toContain("secret_event_jwt_token");
@@ -1204,10 +1240,11 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
       expect(healthObj.ready).toBe(true);
       expect(healthObj.event_count).toBe(3);
 
-      const watchHtml = await rawGet(
-        `/watch/kibana_discover?key=${srv.secret}&q=host.name%3AWS-01`,
-        { Host: `127.0.0.1:${srv.port}` },
-      );
+      const watch = await dp.labBrowser({ page: "kibana_discover", q: "host.name:WS-01" });
+      const watchUrl = new URL(watch.url);
+      const watchHtml = await rawGet(`${watchUrl.pathname}${watchUrl.search}`, {
+        Host: `127.0.0.1:${srv.port}`,
+      });
       expect(watchHtml.status).toBe(200);
       expect(watchHtml.headers["content-type"]).toContain("text/html");
       expect(watchHtml.body).toContain("evt-00001");
@@ -1238,6 +1275,39 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
       const filteredHtml = await filteredPage.text();
       expect(filteredHtml).toContain("evt-00003");
       expect(filteredHtml).not.toContain("evt-00001");
+
+      const networkPlane = createRoleCapabilityMint();
+      const network = networkPlane.bindDataPlane(dp, networkPlane.issueCapability({
+        huntId: "hunt-watch-boundary",
+        caseId: dp.caseId,
+        profile: "framework-network-analyst",
+      }));
+      await expect(network.executeTool("elastic_search", {})).rejects.toThrow(/does not own tool/);
+      await expect(network.executeTool("intel_lookup", { values: "example.test" })).rejects.toThrow(/does not own tool/);
+      const wire = await network.executeTool("lab_browser", { page: "lab_console" });
+      expect(wire.includes(srv.secret)).toBe(false);
+      const fence = /^<untrusted_tool_result_([0-9a-f]{32})>\n([\s\S]*)\n<\/untrusted_tool_result_\1>$/.exec(wire);
+      expect(fence).not.toBeNull();
+      const result = JSON.parse(fence![2]!) as { url: string };
+      const key = new URL(result.url).searchParams.get("key")!;
+      expect(key.length).toBe(64);
+      expect(key === srv.secret).toBe(false);
+      for (const route of ["/case", "/health", "/activity", "/es/search", "/intel?values=example.test"]) {
+        const asHeader = await rawGet(route, {
+          Host: `127.0.0.1:${srv.port}`,
+          "X-Hunt-Lab-Secret": key,
+        });
+        expect(asHeader.status).toBe(401);
+        const asQuery = await rawGet(`${route}${route.includes("?") ? "&" : "?"}key=${key}`, {
+          Host: `127.0.0.1:${srv.port}`,
+        });
+        expect(asQuery.status).toBe(401);
+      }
+      const watchAsHeader = await rawGet("/view", {
+        Host: `127.0.0.1:${srv.port}`,
+        "X-Hunt-Lab-Secret": key,
+      });
+      expect(watchAsHeader.status).toBe(401);
 
       // 5. decideWatchRequest policy checks
       const scope = {

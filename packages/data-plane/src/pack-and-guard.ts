@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import {
   assertReadOnlyOperation,
   assertRoleOwnsTool,
@@ -10,13 +11,56 @@ import {
   type HistogramInterval,
   type ProfileId,
 } from "@hunt-command/shared";
-import { scrubSecretsValue } from "@hunt-command/telemetry";
+import { scrubSecretsValue, truncateUtf8Safe } from "@hunt-command/telemetry";
 import { throwDataPlaneError } from "./errors.ts";
 import { parseTimestampNs } from "./timestamps-and-ip.ts";
 
 const CASE_ID_RE = /^[a-z0-9-]{3,64}$/;
 const WIN32_RESERVED_DEVICE_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 const SAFE_REL_ARTIFACT_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+
+const TOOL_RESULT_MAX_BYTES = 24 * 1024;
+const TOOL_RESULT_TRUNCATION_MARKER = "\n[TRUNCATED]";
+const TOOL_RESULT_INVISIBLE_RE = /[\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g;
+
+function stripToolResultControls(value: unknown): unknown {
+  if (typeof value === "string") {
+    return stripVTControlCharacters(value).replace(TOOL_RESULT_INVISIBLE_RE, "");
+  }
+  if (Array.isArray(value)) {
+    return value.map(stripToolResultControls);
+  }
+  if (value !== null && typeof value === "object" && !(value instanceof Date) && !(value instanceof Uint8Array)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        stripVTControlCharacters(key).replace(TOOL_RESULT_INVISIBLE_RE, ""),
+        stripToolResultControls(item),
+      ]),
+    );
+  }
+  return value;
+}
+
+function fenceToolResult(rawResult: unknown): string {
+  // Normalize controls before scrubbing so invisible characters cannot disguise credentials.
+  const serialized = JSON.stringify(scrubSecretsValue(stripToolResultControls(rawResult)));
+  if (serialized === undefined) {
+    throw new TypeError("Tool result is not JSON serializable");
+  }
+  // JSON escapes preserve the data while preventing case text from introducing any fence tag.
+  const content = serialized.replace(/</g, "\\u003c");
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const open = `<untrusted_tool_result_${nonce}>\n`;
+  const close = `\n</untrusted_tool_result_${nonce}>`;
+  const contentBudget = TOOL_RESULT_MAX_BYTES - Buffer.byteLength(open + close, "utf8");
+  const inner = Buffer.byteLength(content, "utf8") <= contentBudget
+    ? content
+    : truncateUtf8Safe(
+      content,
+      contentBudget - Buffer.byteLength(TOOL_RESULT_TRUNCATION_MARKER, "utf8"),
+    ) + TOOL_RESULT_TRUNCATION_MARKER;
+  return open + inner + close;
+}
 
 export interface ValidatedCaseSource {
   artifact: string;
@@ -574,11 +618,11 @@ export interface RoleScopedDataPlane {
   readonly profile: ProfileId;
   readonly stepId?: string;
   readonly caseId: string;
-  executeTool<T = unknown>(
+  executeTool(
     tool: DataPlaneToolName,
     args: Record<string, unknown>,
     options?: { method?: string },
-  ): Promise<T>;
+  ): Promise<string>;
 }
 
 export interface RoleCapabilityMint {
@@ -677,11 +721,11 @@ export function createRoleCapabilityMint(explicitSecret?: Uint8Array): RoleCapab
   ): RoleScopedDataPlane => {
     verifyCapability(token, dataPlane.caseId);
 
-    const executeTool = async <T = unknown>(
+    const executeTool = async (
       tool: DataPlaneToolName,
       args: Record<string, unknown>,
       options?: { method?: string },
-    ): Promise<T> => {
+    ): Promise<string> => {
       // Re-verify closure HMAC on every invocation in case token object was mutated/swapped.
       verifyCapability(token, dataPlane.caseId);
 
@@ -729,8 +773,7 @@ export function createRoleCapabilityMint(explicitSecret?: Uint8Array): RoleCapab
           throwDataPlaneError(403, "tool_not_owned", `Unknown data-plane tool '${String(tool)}'`);
       }
 
-      // Deterministic credential scrubbing BEFORE returning on LLM wire.
-      return scrubSecretsValue(rawResult) as T;
+      return fenceToolResult(rawResult);
     };
 
     return Object.freeze({

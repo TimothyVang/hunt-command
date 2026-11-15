@@ -73,7 +73,7 @@ import {
   pickFieldValue,
 } from "./timestamps-and-ip.ts";
 
-const CACHE_SCHEMA_VERSION = "hunt-command-embedded-cache-v1";
+const CACHE_SCHEMA_VERSION = "hunt-command-embedded-cache-v2";
 const MAX_RESULT = 200;
 const MAX_HISTOGRAM_BUCKETS = 2_000;
 const MAX_UNIQUE_VALUES = 500;
@@ -843,6 +843,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
   private readonly startMs: number;
   private readonly endMs: number;
   private localServer: LocalDataPlaneHttpHandle | null = null;
+  private readonly watchKey = crypto.randomBytes(32).toString("hex");
   private closed = false;
 
   private constructor(params: {
@@ -923,6 +924,8 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
             dbPath: tmpPath,
             pcapPath: pack.pcapPath,
             caseId: pack.caseId,
+            startNs: pack.startNs,
+            endNs: pack.endNs,
           });
         }
 
@@ -1026,7 +1029,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
         buildDb.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
         ingestEventsAndIntelIntoDb(buildDb, pack);
         if (pack.pcapPath && pack.networkCapture === "present") {
-          indexPcapIntoDatabase(buildDb, pack.pcapPath, pack.caseId);
+          indexPcapIntoDatabase(buildDb, pack.pcapPath, pack.caseId, pack.startNs, pack.endNs);
         }
         buildDb.exec(`
           INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('ready', '1');
@@ -1481,8 +1484,8 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     );
     const compiled = compileArkimeExpression(params.expression);
 
-    const whereSql = `s.first_packet_ms >= ? AND s.first_packet_ms < ? AND (${compiled.whereSql})`;
-    const baseParams: SqlParam[] = [this.startMs, this.endMs, ...compiled.params];
+    const whereSql = compiled.whereSql;
+    const baseParams = compiled.params;
 
     const countRow = this.db
       .query(`SELECT COUNT(*) AS cnt FROM sessions s WHERE ${whereSql}`)
@@ -1527,8 +1530,8 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     const includeCounts = rawCounts === "1";
 
     const compiled = compileArkimeExpression(params.expression);
-    const whereSql = `s.first_packet_ms >= ? AND s.first_packet_ms < ? AND (${compiled.whereSql})`;
-    const baseParams: SqlParam[] = [this.startMs, this.endMs, ...compiled.params];
+    const whereSql = compiled.whereSql;
+    const baseParams = compiled.params;
 
     const rows = this.db
       .query(
@@ -1674,8 +1677,8 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     // dataset === "network"
     this.requireCapture();
     const netFilter = compileNetworkDatasetFilter(q, host);
-    const whereSql = `s.first_packet_ms >= ? AND s.first_packet_ms < ? AND (${netFilter.whereSql})`;
-    const sqlParams: SqlParam[] = [this.startMs, this.endMs, ...netFilter.params];
+    const whereSql = netFilter.whereSql;
+    const sqlParams = netFilter.params;
 
     const totalRow = this.db
       .query(`SELECT COUNT(*) AS cnt FROM sessions s WHERE ${whereSql}`)
@@ -1840,7 +1843,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     const routePath =
       params.page === "lab_console" ? "/view" : `/watch/${params.page}`;
     const url = new URL(routePath, srv.baseUrl);
-    url.searchParams.set("key", srv.secret);
+    url.searchParams.set("key", this.watchKey);
     for (const name of ["q", "host", "expression", "field"] as const) {
       if (params[name] !== undefined) {
         url.searchParams.set(name, params[name]);
@@ -1868,8 +1871,9 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     const unresolved: string[] = [];
     const malformed: string[] = [];
 
+    const eventScope = this.buildScopedEventWhere(undefined);
     const checkEvt = this.db.query(
-      "SELECT 1 FROM events_hot WHERE event_id = ? AND ts_ns >= ? AND ts_ns < ? LIMIT 1",
+      `SELECT 1 FROM events_hot e WHERE e.event_id = ? AND ${eventScope.whereSql} LIMIT 1`,
     );
     const checkIoc = this.db.query("SELECT 1 FROM intel_items WHERE ioc_id = ? LIMIT 1");
     const hasPacketsTable =
@@ -1885,7 +1889,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
 
     for (const raw of uniqueCitations) {
       if (/^evt-[A-Za-z0-9_-]{1,120}$/.test(raw)) {
-        if (checkEvt.get(raw, this.pack.startNs, this.pack.endNs)) {
+        if (checkEvt.get(raw, ...eventScope.params)) {
           eventIds.push(raw);
         } else {
           unresolved.push(raw);
@@ -1943,6 +1947,7 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     }
     const instanceId = options?.instanceId ?? crypto.randomBytes(16).toString("hex");
     const secretBuf = Buffer.from(secret, "ascii");
+    const watchKeyBuf = Buffer.from(this.watchKey, "ascii");
 
     const activityRing: ActivityEntry[] = [];
     let activitySeq = 0;
@@ -2003,19 +2008,20 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
         return;
       }
 
-      // 2. Caller secret check (X-Hunt-Lab-Secret, or ?key= on HTML Watch/console pages only)
-      let secrets = req.headersDistinct["x-hunt-lab-secret"] ?? [];
-      if (secrets.length === 0 && isConsoleRoute) {
-        secrets = parsedUrl.searchParams.getAll("key");
-      }
+      // Watch keys authorize HTML only; the operator's API credential never reaches tool results.
+      const headerSecrets = req.headersDistinct["x-hunt-lab-secret"] ?? [];
+      const secrets = headerSecrets.length > 0
+        ? headerSecrets
+        : isConsoleRoute ? parsedUrl.searchParams.getAll("key") : [];
+      const expectedSecret = headerSecrets.length > 0 ? secretBuf : watchKeyBuf;
       if (secrets.length !== 1) {
         sendResponse(res, 401, { error: "caller_not_authorized" });
         return;
       }
       const candidateBuf = Buffer.from(secrets[0]!, "latin1");
       if (
-        candidateBuf.byteLength !== secretBuf.byteLength ||
-        !crypto.timingSafeEqual(candidateBuf, secretBuf)
+        candidateBuf.byteLength !== expectedSecret.byteLength ||
+        !crypto.timingSafeEqual(candidateBuf, expectedSecret)
       ) {
         sendResponse(res, 401, { error: "caller_not_authorized" });
         return;

@@ -13,6 +13,8 @@ import {
   isAllowedSearchField,
   LEADING_WILDCARD_RE,
   QUERY_FIELDS,
+  resolveRuntimeDir,
+  RuntimeFenceError,
 } from "@hunt-command/shared";
 import { throwDataPlaneError } from "./errors.ts";
 import {
@@ -963,18 +965,16 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
     let citationsPath: string | null = null;
     let activePitPath: string | null = null;
     if (options.stateDir) {
-      const resolvedState = path.resolve(options.stateDir);
-      // Verify stateDir is never inside a Git checkout!
-      let cur = resolvedState;
-      while (true) {
-        if (fs.existsSync(path.join(cur, ".git"))) {
-          throw new ConnectConfigError("stateDir must not be inside a Git checkout");
+      let caseFolder: string;
+      try {
+        const resolvedState = resolveRuntimeDir(options.stateDir).rootDir;
+        caseFolder = resolveRuntimeDir(path.join(resolvedState, validatedCase.case_id)).rootDir;
+      } catch (error) {
+        if (error instanceof RuntimeFenceError) {
+          throw new ConnectConfigError("stateDir must not be inside a Git checkout", error.code);
         }
-        const parent = path.dirname(cur);
-        if (parent === cur) break;
-        cur = parent;
+        throw error;
       }
-      const caseFolder = path.join(resolvedState, validatedCase.case_id);
       fs.mkdirSync(caseFolder, { recursive: true, mode: 0o700 });
       citationsPath = path.join(caseFolder, "citations.jsonl");
       activePitPath = path.join(caseFolder, "active_pit.json");
@@ -1887,7 +1887,6 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
     const size = coerceBoundedInt(params.size, 20, 1, 100, "invalid_query");
 
     let aggregation: Record<string, unknown>;
-    const extraBounds: Array<Record<string, unknown>> = [];
 
     if (field === "@timestamp") {
       const interval = (params.interval ?? "1h") as HistogramInterval;
@@ -1908,15 +1907,6 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
           format: "yyyy-MM-dd'T'HH:mm:ss'Z'",
         },
       };
-      extraBounds.push({
-        range: {
-          "@timestamp": {
-            gte: this.startMs,
-            lt: this.endMs,
-            format: "epoch_millis",
-          },
-        },
-      });
     } else if (isAllowedAggField(field)) {
       if (params.interval !== undefined) {
         throwDataPlaneError(400, "invalid_query", "interval applies only to @timestamp");
@@ -1936,11 +1926,8 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
       },
     };
 
-    const query = this.buildEventEsQuery(params.q);
-    ((query.bool as Record<string, unknown>).filter as unknown[]).push(...extraBounds);
-
     const resp = await this.runSearch({
-      query,
+      query: this.buildEventEsQuery(params.q),
       size: 0,
       track_total_hits: true,
       timeout: "10s",
