@@ -662,68 +662,98 @@ function parseKerberosPrincipalName(seqBytes: Uint8Array): string[] | null {
     pos = tlv.next;
   }
 
-  // NT-PRINCIPAL (1) or NT-ENTERPRISE (10) typically holds client usernames; NT-SRV-INST (2) has 2 parts (krbtgt/REALM or cifs/host).
   if (nameType === null || parts.length === 0) {
-    return null;
-  }
-  if (nameType === 2) {
-    // Service principal (sname), not cname!
     return null;
   }
   return parts;
 }
 
-function extractKerberosCNameFromAsn1(
+function findDerChildByTag(
   buf: Uint8Array,
-  start: number,
-  end: number,
-  depth: number,
-): string | null {
-  if (depth > 10) return null;
-  let pos = start;
-  while (pos < end) {
+  seqStart: number,
+  seqEnd: number,
+  targetTag: number,
+): { valueStart: number; next: number } | null {
+  let pos = seqStart;
+  while (pos < seqEnd) {
     const tlv = readDerTlv(buf, pos);
-    if (!tlv || tlv.next > end) break;
-
-    // KDC-REQ (AS-REQ=0x6a [APP 10], TGS-REQ=0x6c [APP 12]): KDC-REQ-BODY is [4] (0xa4), inside which cname is [1] (0xa1)
-    // AS-REP=0x6b [APP 11], TGS-REP=0x6d [APP 13]: cname is [3] (0xa3)
-    // KRB-ERROR=0x7e [APP 30]: cname is [8] (0xa8)
-    const isConstructed = (tlv.tag & 0x20) !== 0;
-    if (tlv.tag === 0xa1 || tlv.tag === 0xa3 || tlv.tag === 0xa8) {
-      const candidate = parseKerberosPrincipalName(buf.subarray(tlv.valueStart, tlv.next));
-      if (candidate && candidate.length > 0) {
-        return candidate.join("/");
-      }
-    }
-    if (isConstructed && tlv.length >= 4) {
-      const sub = extractKerberosCNameFromAsn1(buf, tlv.valueStart, tlv.next, depth + 1);
-      if (sub) return sub;
+    if (!tlv || tlv.next > seqEnd) return null;
+    if (tlv.tag === targetTag) {
+      return { valueStart: tlv.valueStart, next: tlv.next };
     }
     pos = tlv.next;
   }
   return null;
 }
 
-function decodeKerberosPayload(payload: Uint8Array, isTcp: boolean): string | null {
-  let work = payload;
-  if (isTcp && work.length >= 8) {
-    const recLen = readU32BE(work, 0) & 0x7fffffff;
-    if (recLen >= 4 && recLen <= work.length - 4) {
-      work = work.subarray(4, 4 + recLen);
-    }
+function extractRfc4120KerberosCName(
+  buf: Uint8Array,
+  appTag: number,
+  appValueStart: number,
+  appEnd: number,
+): { matched: boolean; cname: string | null } | null {
+  const outerSeq = readDerTlv(buf, appValueStart);
+  if (!outerSeq || outerSeq.tag !== 0x30 || outerSeq.next !== appEnd) {
+    return null;
   }
-  // Scan for Kerberos APPLICATION tags (0x6a AS-REQ, 0x6b AS-REP, 0x6c TGS-REQ, 0x6d TGS-REP, 0x6e AP-REQ, 0x7e KRB-ERROR)
-  for (let i = 0; i + 12 < work.length; i++) {
+
+  // RFC 4120 §5.4.1 KDC-REQ (AS-REQ = [APPLICATION 10] 0x6a, TGS-REQ = [APPLICATION 12] 0x6c):
+  // req-body is [4] (0xa4) -> SEQUENCE (0x30) -> cname is [1] (0xa1) ONLY (never sname [3] 0xa3!).
+  if (appTag === 0x6a || appTag === 0x6c) {
+    const reqBodyTag = findDerChildByTag(buf, outerSeq.valueStart, outerSeq.next, 0xa4);
+    if (!reqBodyTag) return null;
+    const reqBodySeq = readDerTlv(buf, reqBodyTag.valueStart);
+    if (!reqBodySeq || reqBodySeq.tag !== 0x30 || reqBodySeq.next !== reqBodyTag.next) {
+      return null;
+    }
+    const cnameTag = findDerChildByTag(buf, reqBodySeq.valueStart, reqBodySeq.next, 0xa1);
+    const parts = cnameTag
+      ? parseKerberosPrincipalName(buf.subarray(cnameTag.valueStart, cnameTag.next))
+      : null;
+    return { matched: true, cname: parts && parts.length > 0 ? parts.join("/") : null };
+  }
+
+  // RFC 4120 §5.4.2 KDC-REP (AS-REP = [APPLICATION 11] 0x6b, TGS-REP = [APPLICATION 13] 0x6d):
+  // cname is [4] (0xa4) ONLY (crealm is [3] 0xa3, ticket is [5] 0xa5).
+  if (appTag === 0x6b || appTag === 0x6d) {
+    const cnameTag = findDerChildByTag(buf, outerSeq.valueStart, outerSeq.next, 0xa4);
+    if (!cnameTag) return null;
+    const parts = parseKerberosPrincipalName(buf.subarray(cnameTag.valueStart, cnameTag.next));
+    return { matched: true, cname: parts && parts.length > 0 ? parts.join("/") : null };
+  }
+
+  // RFC 4120 §5.9.1 KRB-ERROR ([APPLICATION 30] 0x7e):
+  // cname is [8] (0xa8) OPTIONAL (sname is [10] 0xaa — never match sname!).
+  if (appTag === 0x7e) {
+    const cnameTag = findDerChildByTag(buf, outerSeq.valueStart, outerSeq.next, 0xa8);
+    const parts = cnameTag
+      ? parseKerberosPrincipalName(buf.subarray(cnameTag.valueStart, cnameTag.next))
+      : null;
+    return { matched: true, cname: parts && parts.length > 0 ? parts.join("/") : null };
+  }
+
+  // RFC 4120 §5.5.1 AP-REQ ([APPLICATION 14] 0x6e): valid Kerberos PDU, client principal is encrypted.
+  if (appTag === 0x6e) {
+    return { matched: true, cname: null };
+  }
+
+  return null;
+}
+
+function decodeKerberosMessage(work: Uint8Array): { matched: boolean; cname: string | null } {
+  for (let i = 0; i + 10 <= work.length; i++) {
     const b = work[i]!;
     if (b === 0x6a || b === 0x6b || b === 0x6c || b === 0x6d || b === 0x6e || b === 0x7e) {
       const tlv = readDerTlv(work, i);
-      if (tlv && tlv.length >= 10) {
-        const cname = extractKerberosCNameFromAsn1(work, tlv.valueStart, tlv.next, 0);
-        if (cname) return cname;
+      if (tlv && tlv.length >= 8) {
+        const res = extractRfc4120KerberosCName(work, b, tlv.valueStart, tlv.next);
+        if (res) {
+          return res;
+        }
       }
     }
   }
-  return null;
+  return { matched: false, cname: null };
 }
 
 export interface DissectedPacket {
@@ -782,11 +812,14 @@ const STREAM_CAP_BYTES = 16_384;
 
 interface TcpDirectionStream {
   initialized: boolean;
+  sawSyn: boolean;
   baseSeq: number;
   buf: Uint8Array;
   maxFilled: number;
   parsedTlsOffsets: Set<number>;
   parsedHttp: boolean;
+  dnsParsedOffset: number;
+  krbParsedOffset: number;
 }
 
 interface SessionState {
@@ -801,11 +834,14 @@ interface SessionState {
 function createDirStream(): TcpDirectionStream {
   return {
     initialized: false,
+    sawSyn: false,
     baseSeq: 0,
     buf: new Uint8Array(STREAM_CAP_BYTES),
     maxFilled: 0,
     parsedTlsOffsets: new Set<number>(),
     parsedHttp: false,
+    dnsParsedOffset: 0,
+    krbParsedOffset: 0,
   };
 }
 
@@ -818,21 +854,55 @@ function appendToDirStream(dir: TcpDirectionStream, seq: number, payload: Uint8A
   if (payload.length === 0) {
     return dir.buf.subarray(0, dir.maxFilled);
   }
+  const uSeq = seq >>> 0;
   if (!dir.initialized) {
     dir.initialized = true;
-    dir.baseSeq = seq >>> 0;
+    dir.baseSeq = uSeq;
   }
-  const rel = seqDelta(seq >>> 0, dir.baseSeq);
+  const rel = seqDelta(uSeq, dir.baseSeq);
   if (rel < 0) {
-    // Partial overlap with already buffered prefix
-    const skip = -rel;
-    if (skip >= payload.length) {
+    const shift = -rel;
+    if (!dir.sawSyn && shift <= STREAM_CAP_BYTES) {
+      // Mid-stream capture where an earlier TCP segment arrived out-of-order after a later one:
+      // shift existing buffered bytes right, rebase baseSeq, and insert the earlier prefix at offset 0.
+      const keepExisting = Math.max(0, Math.min(dir.maxFilled, STREAM_CAP_BYTES - shift));
+      if (keepExisting > 0) {
+        dir.buf.copyWithin(shift, 0, keepExisting);
+      }
+      if (shift > keepExisting) {
+        dir.buf.fill(0, keepExisting, Math.min(shift, STREAM_CAP_BYTES));
+      }
+      const copyLen = Math.min(payload.length, STREAM_CAP_BYTES);
+      dir.buf.set(payload.subarray(0, copyLen), 0);
+      dir.baseSeq = uSeq;
+      dir.maxFilled = Math.min(STREAM_CAP_BYTES, Math.max(shift + keepExisting, copyLen));
+
+      if (dir.parsedTlsOffsets.size > 0) {
+        const shifted = new Set<number>();
+        for (const off of dir.parsedTlsOffsets) {
+          if (off + shift < STREAM_CAP_BYTES) shifted.add(off + shift);
+        }
+        dir.parsedTlsOffsets = shifted;
+      }
+      if (dir.dnsParsedOffset > 0) {
+        dir.dnsParsedOffset = Math.min(STREAM_CAP_BYTES, dir.dnsParsedOffset + shift);
+      }
+      if (dir.krbParsedOffset > 0) {
+        dir.krbParsedOffset = Math.min(STREAM_CAP_BYTES, dir.krbParsedOffset + shift);
+      }
       return dir.buf.subarray(0, dir.maxFilled);
     }
-    const trimmed = payload.subarray(skip);
+
+    // Post-SYN retransmission overlapping before baseSeq: append only any newly revealed tail past maxFilled.
+    if (shift >= payload.length) {
+      return dir.buf.subarray(0, dir.maxFilled);
+    }
+    const trimmed = payload.subarray(shift);
     const copyLen = Math.min(trimmed.length, STREAM_CAP_BYTES);
-    dir.buf.set(trimmed.subarray(0, copyLen), 0);
-    if (copyLen > dir.maxFilled) dir.maxFilled = copyLen;
+    if (copyLen > dir.maxFilled) {
+      dir.buf.set(trimmed.subarray(dir.maxFilled, copyLen), dir.maxFilled);
+      dir.maxFilled = copyLen;
+    }
     return dir.buf.subarray(0, dir.maxFilled);
   }
   if (rel >= STREAM_CAP_BYTES) {
@@ -1097,20 +1167,44 @@ export class PcapStreamDissector {
 
       let extPos = l3Offset + 40;
       const ipv6End = Math.min(data.length, extPos + payloadLen);
+      let ipv6Fragmented = false;
+      let ipv6FragOffset = 0;
+      let ipv6MoreFragments = false;
+      let ipv6FragId = 0;
+
       for (let hops = 0; hops < 8 && extPos < ipv6End; hops++) {
         if (nextHeader === 0 || nextHeader === 43 || nextHeader === 60) {
-          if (extPos + 2 > ipv6End) break;
+          if (extPos + 2 > ipv6End) {
+            extPos = ipv6End + 1;
+            break;
+          }
           const hdrExtLen = (data[extPos + 1]! + 1) * 8;
           nextHeader = data[extPos]!;
           extPos += hdrExtLen;
         } else if (nextHeader === 44) {
-          // IPv6 Fragment Header (8 bytes)
-          if (extPos + 8 > ipv6End) break;
-          nextHeader = data[extPos]!;
+          // RFC 8200 §4.5 IPv6 Fragment Header (8 bytes)
+          if (extPos + 8 > ipv6End) {
+            extPos = ipv6End + 1;
+            break;
+          }
+          const nextHdr = data[extPos]!;
+          const fragWord = readU16BE(data, extPos + 2);
+          ipv6FragOffset = fragWord & 0xfff8;
+          ipv6MoreFragments = (fragWord & 0x0001) !== 0;
+          ipv6FragId = readU32BE(data, extPos + 4);
+          ipv6Fragmented = ipv6MoreFragments || ipv6FragOffset > 0;
+          nextHeader = nextHdr;
           extPos += 8;
+          // Non-zero fragment offsets carry mid-payload bytes, never inner headers.
+          if (ipv6FragOffset > 0) {
+            break;
+          }
         } else if (nextHeader === 51) {
           // AH
-          if (extPos + 2 > ipv6End) break;
+          if (extPos + 2 > ipv6End) {
+            extPos = ipv6End + 1;
+            break;
+          }
           const ahLen = (data[extPos + 1]! + 2) * 4;
           nextHeader = data[extPos]!;
           extPos += ahLen;
@@ -1120,7 +1214,22 @@ export class PcapStreamDissector {
       }
       if (extPos <= ipv6End) {
         ipProto = nextHeader;
-        l4Payload = data.subarray(extPos, ipv6End);
+        const ipv6Body = data.subarray(extPos, ipv6End);
+        if (ipv6Fragmented) {
+          const reassembled = this.handleIpv4Fragment(
+            `v6|${srcIp}|${dstIp}|${ipv6FragId}|${ipProto}`,
+            ipv6FragOffset,
+            ipv6MoreFragments,
+            ipv6Body,
+          );
+          if (!reassembled) {
+            this.onPacket(pkt);
+            return;
+          }
+          l4Payload = reassembled;
+        } else {
+          l4Payload = ipv6Body;
+        }
       }
     } else {
       this.onPacket(pkt);
@@ -1250,11 +1359,13 @@ export class PcapStreamDissector {
 
       if (isSyn && !dirStream.initialized) {
         dirStream.initialized = true;
+        dirStream.sawSyn = true;
         dirStream.baseSeq = (seqNum + 1) >>> 0;
       }
 
       if (tcpPayload.length > 0) {
-        const streamView = appendToDirStream(dirStream, seqNum, tcpPayload);
+        const payloadStartSeq = isSyn ? (seqNum + 1) >>> 0 : seqNum;
+        const streamView = appendToDirStream(dirStream, payloadStartSeq, tcpPayload);
         this.dissectAppLayer({
           pkt,
           session: sessState.session,
@@ -1429,27 +1540,80 @@ export class PcapStreamDissector {
       return;
     }
 
-    // 4. DNS (UDP 53/5353 or TCP 53 with 2-byte length prefix)
+    // 4. DNS (UDP 53/5353 or TCP 53 with 2-byte length prefix & per-stream record offset)
     if (
       srcPort === 53 ||
       dstPort === 53 ||
       srcPort === 5353 ||
       dstPort === 5353
     ) {
-      if (this.tryDissectDns(pkt, session, isTcp ? streamBuffer : segmentPayload, isTcp)) {
+      if (isTcp && dirStream) {
+        let anyDns = false;
+        while (dirStream.dnsParsedOffset + 2 <= streamBuffer.length) {
+          const dnsLen = readU16BE(streamBuffer, dirStream.dnsParsedOffset);
+          if (dnsLen < 12 || dirStream.dnsParsedOffset + 2 + dnsLen > streamBuffer.length) {
+            break;
+          }
+          const msgSlice = streamBuffer.subarray(
+            dirStream.dnsParsedOffset + 2,
+            dirStream.dnsParsedOffset + 2 + dnsLen,
+          );
+          dirStream.dnsParsedOffset += 2 + dnsLen;
+          if (this.tryDissectDns(pkt, session, msgSlice, false)) {
+            anyDns = true;
+          }
+        }
+        if (anyDns) {
+          return;
+        }
+      } else if (this.tryDissectDns(pkt, session, segmentPayload, false)) {
         return;
       }
     }
 
-    // 5. Kerberos (port 88 or raw ASN.1 APPLICATION tags)
+    // 5. Kerberos (port 88 UDP or 4-byte record-framed TCP with per-stream record offset)
     if (srcPort === 88 || dstPort === 88) {
-      const cname = decodeKerberosPayload(isTcp ? streamBuffer : segmentPayload, isTcp);
-      if (cname) {
-        pkt.protocols.add("kerberos");
-        pkt.wsProtocol = "KRB5";
-        session.protocols.add("krb5");
-        pushKv(pkt.kv, "kerberos.CNameString", cname);
-        return;
+      if (isTcp && dirStream) {
+        let anyKrb = false;
+        while (dirStream.krbParsedOffset + 4 <= streamBuffer.length) {
+          const recLen = readU32BE(streamBuffer, dirStream.krbParsedOffset) & 0x7fffffff;
+          if (
+            recLen < 10 ||
+            recLen > STREAM_CAP_BYTES ||
+            dirStream.krbParsedOffset + 4 + recLen > streamBuffer.length
+          ) {
+            break;
+          }
+          const recSlice = streamBuffer.subarray(
+            dirStream.krbParsedOffset + 4,
+            dirStream.krbParsedOffset + 4 + recLen,
+          );
+          dirStream.krbParsedOffset += 4 + recLen;
+          const krb = decodeKerberosMessage(recSlice);
+          if (krb.matched) {
+            anyKrb = true;
+            pkt.protocols.add("kerberos");
+            pkt.wsProtocol = "KRB5";
+            session.protocols.add("krb5");
+            if (krb.cname) {
+              pushKv(pkt.kv, "kerberos.CNameString", krb.cname);
+            }
+          }
+        }
+        if (anyKrb) {
+          return;
+        }
+      } else {
+        const krb = decodeKerberosMessage(segmentPayload);
+        if (krb.matched) {
+          pkt.protocols.add("kerberos");
+          pkt.wsProtocol = "KRB5";
+          session.protocols.add("krb5");
+          if (krb.cname) {
+            pushKv(pkt.kv, "kerberos.CNameString", krb.cname);
+          }
+          return;
+        }
       }
     }
 
@@ -1707,9 +1871,13 @@ export class PcapStreamDissector {
 
     const hdrEndIdx = headText.indexOf("\r\n\r\n");
     const lfEndIdx = hdrEndIdx === -1 ? headText.indexOf("\n\n") : hdrEndIdx;
-    if (lfEndIdx === -1 && checkSource === streamBuffer && streamBuffer.length < 4096) {
-      // Wait for complete HTTP headers if split across TCP segments, unless single packet
-      // Fall through and still extract what's visible if segment itself starts with HTTP
+    if (lfEndIdx === -1 && dirStream && checkSource === streamBuffer && streamBuffer.length < 8192) {
+      // Incomplete HTTP header block split across TCP segments: mark packet/session as HTTP,
+      // keep dirStream.parsedHttp = false, and wait for the completing segment before extracting headers!
+      pkt.protocols.add("http");
+      pkt.wsProtocol = "HTTP";
+      session.protocols.add("http");
+      return true;
     }
     if (dirStream) {
       dirStream.parsedHttp = true;
@@ -1859,10 +2027,10 @@ export class PcapStreamDissector {
           if (ntlm.username) pushKv(pkt.kv, "ntlmssp.auth.username", ntlm.username);
           if (ntlm.domain) pushKv(pkt.kv, "ntlmssp.auth.domain", ntlm.domain);
         } else {
-          const cname = decodeKerberosPayload(pduSlice.subarray(64), false);
-          if (cname) {
+          const krb = decodeKerberosMessage(pduSlice.subarray(64));
+          if (krb.matched) {
             pkt.protocols.add("kerberos");
-            pushKv(pkt.kv, "kerberos.CNameString", cname);
+            if (krb.cname) pushKv(pkt.kv, "kerberos.CNameString", krb.cname);
           }
         }
       }

@@ -1012,9 +1012,10 @@ export function compileNetworkDatasetFilter(
           singleMatch =
             "EXISTS (SELECT 1 FROM session_kv sk WHERE sk.session_id = s.session_id AND ((sk.field = 'host.dns' AND lower(sk.val_str) GLOB ?) OR (sk.field = 'protocols' AND lower(sk.val_str) GLOB ?)))";
         } else {
-          params.push(`%${item.term}%`, item.term);
+          const escapedLike = item.term.replace(/[\\%_]/g, "\\$&");
+          params.push(`%${escapedLike}%`, item.term);
           singleMatch =
-            "EXISTS (SELECT 1 FROM session_kv sk WHERE sk.session_id = s.session_id AND ((sk.field = 'host.dns' AND lower(sk.val_str) LIKE ?) OR (sk.field = 'protocols' AND lower(sk.val_str) = ?)))";
+            "EXISTS (SELECT 1 FROM session_kv sk WHERE sk.session_id = s.session_id AND ((sk.field = 'host.dns' AND lower(sk.val_str) LIKE ? ESCAPE '\\') OR (sk.field = 'protocols' AND lower(sk.val_str) = ?)))";
         }
         andSqls.push(item.neg ? `NOT (${singleMatch})` : singleMatch);
       }

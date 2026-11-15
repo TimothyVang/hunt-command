@@ -1,4 +1,4 @@
-import { QUERY_FIELDS } from "@hunt-command/shared";
+import { LEADING_WILDCARD_RE, QUERY_FIELDS } from "@hunt-command/shared";
 import { throwDataPlaneError } from "./errors.ts";
 import { cidrOrIpToBounds16, ipToBytes16, parseTimestampNs } from "./timestamps-and-ip.ts";
 
@@ -120,6 +120,7 @@ function readRangeBound(
 
   if (src[i] === '"') {
     i++;
+    const rawWildcardStart = src[i] === "*" || src[i] === "?";
     let out = "";
     while (i < src.length && src[i] !== '"') {
       if (src[i] === "\\") {
@@ -134,7 +135,7 @@ function readRangeBound(
     if (i >= src.length || src[i] !== '"') {
       throwDataPlaneError(400, "invalid_query", "Unclosed quote inside range expression");
     }
-    return { value: out, quoted: true, rawWildcardStart: false, nextIdx: i + 1 };
+    return { value: out, quoted: true, rawWildcardStart, nextIdx: i + 1 };
   }
 
   let out = "";
@@ -683,7 +684,7 @@ function buildFtsMatchExpr(
   text: string,
   trailingPrefixWildcard: boolean,
 ): string | null {
-  const words = text.match(/[\p{L}\p{N}_]+/gu);
+  const words = text.match(/[\p{L}\p{N}_]+/gu)?.map((w) => w.toLowerCase());
   if (!words || words.length === 0) {
     return null;
   }
@@ -693,17 +694,118 @@ function buildFtsMatchExpr(
       ? `${ftsColumn} : "${token}"*`
       : `${ftsColumn} : "${token}"`;
   }
-  // Phrase sequence in FTS5; if trailing wildcard, last token gets prefix '*' outside quote
+  // Adjacent phrase sequence in FTS5 (`+`); if trailing wildcard, last token gets prefix '*' outside quote.
   if (trailingPrefixWildcard) {
-    const prefixPhrase = words
-      .slice(0, -1)
-      .map((w) => `"${w}"`)
-      .join(" ");
-    const last = words[words.length - 1]!;
-    return `${ftsColumn} : (${prefixPhrase} AND "${last}"*)`;
+    const parts = words.map((w, idx) => (idx === words.length - 1 ? `"${w}"*` : `"${w}"`));
+    return `${ftsColumn} : (${parts.join(" + ")})`;
   }
-  const phrase = words.map((w) => `"${w}"`).join(" ");
+  const phrase = words.map((w) => `"${w}"`).join(" + ");
   return `${ftsColumn} : (${phrase})`;
+}
+
+function nextLexicographicPrefix(prefix: string): string {
+  const cps = [...prefix];
+  const lastCp = cps[cps.length - 1]!.codePointAt(0)!;
+  cps[cps.length - 1] = String.fromCodePoint(lastCp + 1);
+  return cps.join("");
+}
+
+function piecesToNonWhitespaceGlob(pieces: readonly PatternPiece[]): string {
+  let glob = "";
+  for (const piece of pieces) {
+    if (piece.kind === "wild") {
+      glob += piece.op === "?" ? "[^ \t\r\n]" : "*";
+    } else {
+      for (const ch of piece.text) {
+        if (ch === "*") glob += "[*]";
+        else if (ch === "?") glob += "[?]";
+        else if (ch === "[") glob += "[[]";
+        else glob += ch;
+      }
+    }
+  }
+  return glob;
+}
+
+function compileFtsWildcardTerm(
+  ftsCol: string,
+  rawValue: string,
+  pieces: readonly PatternPiece[],
+  params: SqlParam[],
+): string {
+  const lowerPieces: PatternPiece[] = pieces.map((p) =>
+    p.kind === "lit" ? { kind: "lit", text: p.text.toLowerCase() } : p,
+  );
+  const allWordChars = lowerPieces.every(
+    (p) => p.kind === "wild" || /^[\p{L}\p{N}_]*$/u.test(p.text),
+  );
+
+  // Fast path 1: pure single-token prefix wildcard (`foo*`) -> native FTS5 prefix query
+  if (
+    allWordChars &&
+    lowerPieces.length === 2 &&
+    lowerPieces[0]!.kind === "lit" &&
+    lowerPieces[0]!.text.length > 0 &&
+    lowerPieces[1]!.kind === "wild" &&
+    lowerPieces[1]!.op === "*"
+  ) {
+    params.push(`${ftsCol} : "${lowerPieces[0]!.text}"*`);
+    return "e.doc_id IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?)";
+  }
+
+  // Fast path 2: single-token `?` / infix `*` wildcard (`ali?e`, `Mimik?tz`, `pow*shell`) -> indexed fts5vocab B-tree range + GLOB
+  if (allWordChars) {
+    const firstPiece = lowerPieces[0];
+    if (!firstPiece || firstPiece.kind !== "lit" || firstPiece.text.length === 0) {
+      return "0 = 1";
+    }
+    const prefix = firstPiece.text;
+    const prefixUpper = nextLexicographicPrefix(prefix);
+    const globPat = piecesToSqliteGlob(lowerPieces);
+    params.push(ftsCol, prefix, prefixUpper, globPat);
+    return "e.doc_id IN (SELECT doc FROM events_fts_vocab WHERE col = ? AND term >= ? AND term < ? AND term GLOB ?)";
+  }
+
+  // Fast path 3: multi-token pattern with ONLY a trailing `*` right after a word char (`Invoke-Mimi*`)
+  const onlyTrailingStar =
+    lowerPieces.length >= 2 &&
+    lowerPieces.slice(0, -1).every((p) => p.kind === "lit") &&
+    lowerPieces[lowerPieces.length - 1]!.kind === "wild" &&
+    (lowerPieces[lowerPieces.length - 1] as Extract<PatternPiece, { kind: "wild" }>).op === "*";
+  const prefixText = onlyTrailingStar
+    ? (lowerPieces[0] as Extract<PatternPiece, { kind: "lit" }>).text
+    : "";
+  if (onlyTrailingStar && /[\p{L}\p{N}_]$/u.test(prefixText)) {
+    const matchExpr = buildFtsMatchExpr(ftsCol, rawValue, true);
+    if (!matchExpr) return "0 = 1";
+    params.push(matchExpr);
+    return "e.doc_id IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?)";
+  }
+
+  // General punctuation + wildcard (`Invoke-Mimik?tz`, `C:\Users\*\evil.ps1`):
+  // Narrow by leading word token in fts5vocab when available, then verify contiguous GLOB on the FTS column text.
+  const conds: string[] = [];
+  const leadingLit = lowerPieces[0]?.kind === "lit" ? lowerPieces[0].text : "";
+  const leadingWordMatch = /^[\p{L}\p{N}_]+/u.exec(leadingLit);
+  if (leadingWordMatch) {
+    const leadWord = leadingWordMatch[0];
+    if (leadWord.length < leadingLit.length) {
+      // Complete leading word before punctuation separator (e.g. `invoke` in `invoke-mimik?tz`)
+      params.push(`${ftsCol} : "${leadWord}"`);
+      conds.push("e.doc_id IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?)");
+    } else {
+      // Leading word directly borders wildcard (e.g. `mimi?` in `mimi?-test`)
+      params.push(ftsCol, leadWord, nextLexicographicPrefix(leadWord));
+      conds.push(
+        "e.doc_id IN (SELECT doc FROM events_fts_vocab WHERE col = ? AND term >= ? AND term < ?)",
+      );
+    }
+  }
+  params.push(`*${piecesToNonWhitespaceGlob(lowerPieces)}*`);
+  conds.push(
+    `EXISTS (SELECT 1 FROM events_fts f WHERE f.rowid = e.doc_id AND lower(f.${ftsCol}) GLOB ?)`,
+  );
+  return `(${conds.join(" AND ")})`;
 }
 
 function compileSingleFieldTermOrPhrase(
@@ -712,15 +814,14 @@ function compileSingleFieldTermOrPhrase(
   pieces: readonly PatternPiece[] | null,
   params: SqlParam[],
 ): string {
-  const ftsCol = FTS_FIELD_TO_COLUMN[rawField];
+  const ftsCol = Object.prototype.hasOwnProperty.call(FTS_FIELD_TO_COLUMN, rawField)
+    ? FTS_FIELD_TO_COLUMN[rawField]
+    : undefined;
   if (ftsCol) {
-    const hasWild = pieces !== null && piecesHaveWildcard(pieces);
-    const trailingStar =
-      hasWild &&
-      pieces!.length >= 2 &&
-      pieces![pieces!.length - 1]!.kind === "wild" &&
-      (pieces![pieces!.length - 1] as Extract<PatternPiece, { kind: "wild" }>).op === "*";
-    const matchExpr = buildFtsMatchExpr(ftsCol, value, trailingStar);
+    if (pieces !== null && piecesHaveWildcard(pieces)) {
+      return compileFtsWildcardTerm(ftsCol, value, pieces, params);
+    }
+    const matchExpr = buildFtsMatchExpr(ftsCol, value, false);
     if (!matchExpr) {
       return "0 = 1";
     }
@@ -868,7 +969,9 @@ function compileExistsNode(rawField: string, params: SqlParam[]): string {
   if (field === "powershell.file.script_block_text") {
     return "e.has_script_block = 1";
   }
-  const ftsCol = FTS_FIELD_TO_COLUMN[rawField];
+  const ftsCol = Object.prototype.hasOwnProperty.call(FTS_FIELD_TO_COLUMN, rawField)
+    ? FTS_FIELD_TO_COLUMN[rawField]
+    : undefined;
   if (ftsCol) {
     const baseField = rawField.endsWith(".text") ? rawField.slice(0, -5) : rawField;
     params.push(baseField);
@@ -942,6 +1045,39 @@ function compileAstToSql(node: AstNode, params: SqlParam[]): string {
   }
 }
 
+export function maskUnboundedRangeEndpoints(src: string): string {
+  let out = "";
+  let inQuotes = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i]!;
+    if (ch === "\\") {
+      out += ch;
+      if (i + 1 < src.length) {
+        out += src[i + 1]!;
+        i++;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      out += ch;
+      continue;
+    }
+    if (!inQuotes && ch === "*") {
+      const before = src.slice(0, i);
+      const after = src.slice(i + 1);
+      const isLowerUnbounded = /[\[{]\s*$/.test(before) && /^\s+TO(?:\s|[\]}])/.test(after);
+      const isUpperUnbounded = /\s+TO\s+$/.test(before) && /^\s*[\]}]/.test(after);
+      if (isLowerUnbounded || isUpperUnbounded) {
+        out += "0";
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
 export function compileLuceneQueryString(rawQuery: string | undefined): CompiledSqlPredicate {
   const q = rawQuery ?? "";
   if (q.length > 500) {
@@ -956,6 +1092,10 @@ export function compileLuceneQueryString(rawQuery: string | undefined): Compiled
 
   if (q.trim().length === 0) {
     return { whereSql: "1 = 1", params: [] };
+  }
+
+  if (LEADING_WILDCARD_RE.test(maskUnboundedRangeEndpoints(q))) {
+    throwDataPlaneError(400, "leading_wildcard_not_supported", "Leading wildcards are refused");
   }
 
   const tokens = tokenizeLucene(q);

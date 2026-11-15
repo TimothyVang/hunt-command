@@ -17,6 +17,7 @@ import {
   RuntimeFenceError,
 } from "@hunt-command/shared";
 import { throwDataPlaneError } from "./errors.ts";
+import { maskUnboundedRangeEndpoints } from "./lucene-compiler.ts";
 import {
   type ArkimeSessionsParams,
   type ArkimeSessionsResult,
@@ -1725,7 +1726,7 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
         throwDataPlaneError(400, "invalid_query", "Control characters in Lucene query");
       }
     }
-    if (LEADING_WILDCARD_RE.test(q)) {
+    if (LEADING_WILDCARD_RE.test(maskUnboundedRangeEndpoints(q))) {
       throwDataPlaneError(400, "leading_wildcard_not_supported", "Leading wildcards are refused");
     }
 
@@ -1740,7 +1741,7 @@ export class ConnectedHuntDataPlane implements HuntDataPlane {
           fields: QUERY_FIELDS.filter((f) => f !== "event.id"),
           default_operator: "AND",
           allow_leading_wildcard: false,
-          analyze_wildcard: true,
+          analyze_wildcard: false,
           lenient: true,
         },
       });

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { DataPlaneAccessError } from "@hunt-command/shared";
@@ -1380,5 +1381,691 @@ describe("@hunt-command/data-plane — Pack F01, Closure HMAC Guard, Lucene AST,
     } finally {
       await dp.close();
     }
+  });
+
+  test("regression (pr1-v3 BLOCK 1 & BLOCK 2): enforces Host->Secret->GET->origin-form order on raw sockets, isolates Watch grants, guards malformed % in decideWatchRequest, and scopes POST search bodies", async () => {
+    const dp = await EmbeddedHuntDataPlane.open(caseDir, { cacheDir });
+    try {
+      const srv = await dp.ensureLocalHttpServer();
+
+      const sendRawHttp = (
+        rawWireRequest: string,
+      ): Promise<{ statusLine: string; headersRaw: string; body: string }> =>
+        new Promise((resolve, reject) => {
+          const sock = net.connect(srv.port, "127.0.0.1", () => {
+            sock.write(rawWireRequest);
+          });
+          const chunks: Buffer[] = [];
+          sock.on("data", (c: Buffer) => chunks.push(c));
+          sock.on("error", reject);
+          sock.on("end", () => {
+            const full = Buffer.concat(chunks).toString("utf8");
+            const splitIdx = full.indexOf("\r\n\r\n");
+            const head = splitIdx >= 0 ? full.slice(0, splitIdx) : full;
+            const body = splitIdx >= 0 ? full.slice(splitIdx + 4) : "";
+            const firstNl = head.indexOf("\r\n");
+            const statusLine = firstNl >= 0 ? head.slice(0, firstNl) : head;
+            resolve({ statusLine, headersRaw: head.toLowerCase(), body });
+          });
+        });
+
+      // 1. Exact pr1-v3 BLOCK 1 live repro: `GET //% HTTP/1.1` with forged `Host: evil.attacker.test` (and NO secret!)
+      // MUST return 403 host_not_allowed + X-Hunt-Lab-Instance (never 200 OK or uncaught TypeError!)
+      const hostileRebind = await sendRawHttp(
+        `GET //% HTTP/1.1\r\nHost: evil.attacker.test\r\nConnection: close\r\n\r\n`,
+      );
+      expect(hostileRebind.statusLine).toContain("403");
+      expect(hostileRebind.headersRaw).toContain(`x-hunt-lab-instance: ${srv.instanceId}`);
+      expect(JSON.parse(hostileRebind.body)).toEqual({ error: "host_not_allowed" });
+
+      // 2. `GET //% HTTP/1.1` with valid `Host: 127.0.0.1:<port>` and NO secret -> 401 caller_not_authorized
+      const hostileUnauth = await sendRawHttp(
+        `GET //% HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nConnection: close\r\n\r\n`,
+      );
+      expect(hostileUnauth.statusLine).toContain("401");
+      expect(hostileUnauth.headersRaw).toContain(`x-hunt-lab-instance: ${srv.instanceId}`);
+      expect(JSON.parse(hostileUnauth.body)).toEqual({ error: "caller_not_authorized" });
+
+      // 3. `POST //% HTTP/1.1` with valid `Host` and valid `X-Hunt-Lab-Secret` -> 405 read_only BEFORE URL parse
+      const hostilePost = await sendRawHttp(
+        `POST //% HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nX-Hunt-Lab-Secret: ${srv.secret}\r\nConnection: close\r\n\r\n`,
+      );
+      expect(hostilePost.statusLine).toContain("405");
+      expect(JSON.parse(hostilePost.body)).toEqual({ error: "read_only" });
+
+      // 4. Scheme-relative `//evil.com/...`, malformed `//%`, `\\` authority, and `#frag` with valid Host + Secret -> 400 invalid_request
+      for (const badTarget of [
+        "//evil.com/watch/kibana_discover",
+        "//%",
+        "/\\\\evil.com",
+        "/health#fragment",
+      ]) {
+        const badReq = await sendRawHttp(
+          `GET ${badTarget} HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nX-Hunt-Lab-Secret: ${srv.secret}\r\nConnection: close\r\n\r\n`,
+        );
+        expect(badReq.statusLine).toContain("400");
+        expect(JSON.parse(badReq.body)).toEqual({ error: "invalid_request" });
+      }
+
+      // 5. Watch grant isolation: labBrowser URL uses dedicated page-bound grant (not API `srv.secret`),
+      // works on its `/watch/*` GET, returns 405 on POST, and CANNOT authenticate JSON `/es/search`!
+      const watchPage = await dp.labBrowser({ page: "kibana_discover", q: "host.name:WS-01" });
+      const parsedWatchUrl = new URL(watchPage.url);
+      const urlKey = parsedWatchUrl.searchParams.get("key")!;
+      expect(urlKey.length).toBe(64);
+      expect(urlKey).not.toBe(srv.secret);
+
+      const okWatchGet = await sendRawHttp(
+        `GET ${parsedWatchUrl.pathname}${parsedWatchUrl.search} HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nConnection: close\r\n\r\n`,
+      );
+      expect(okWatchGet.statusLine).toContain("200");
+
+      const postWatchGrant = await sendRawHttp(
+        `POST ${parsedWatchUrl.pathname}${parsedWatchUrl.search} HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nConnection: close\r\n\r\n`,
+      );
+      expect(postWatchGrant.statusLine).toContain("405");
+      expect(JSON.parse(postWatchGrant.body)).toEqual({ error: "read_only" });
+
+      const replayWatchOnApi = await sendRawHttp(
+        `GET /es/search?q= HTTP/1.1\r\nHost: 127.0.0.1:${srv.port}\r\nX-Hunt-Lab-Secret: ${urlKey}\r\nConnection: close\r\n\r\n`,
+      );
+      expect(replayWatchOnApi.statusLine).toContain("401");
+      expect(JSON.parse(replayWatchOnApi.body)).toEqual({ error: "caller_not_authorized" });
+
+      // 6. pr1-v3 BLOCK 2: decideWatchRequest malformed `%` -> arkime_route_denied (never URIError!)
+      const scope = {
+        caseId: "synth-case-001",
+        labOrigin: `http://127.0.0.1:${srv.port}`,
+        arkimeOrigin: "http://127.0.0.1:8005",
+        kibanaOrigin: "http://127.0.0.1:5601",
+        startSec: 1_763_114_400,
+        stopSec: 1_763_118_000,
+      };
+      for (const badPctUrl of [
+        "http://127.0.0.1:8005/api/%E0%A4%A",
+        "http://127.0.0.1:8005/api/sessions/%ZZ",
+        "http://127.0.0.1:8005/%",
+      ]) {
+        expect(decideWatchRequest(scope, "GET", badPctUrl)).toEqual({
+          block: "arkime_route_denied",
+        });
+      }
+
+      // 7. Arkime POST search body unavailability, rejection, expression guard, JSON scoping & form scoping
+      expect(
+        decideWatchRequest(scope, "POST", "http://127.0.0.1:8005/api/sessions", null),
+      ).toEqual({ block: "arkime_body_unavailable" });
+
+      for (const badBody of ["{bad-json", "[1, 2]"]) {
+        expect(
+          decideWatchRequest(scope, "POST", "http://127.0.0.1:8005/api/sessions", badBody),
+        ).toEqual({ block: "arkime_body_rejected" });
+      }
+
+      expect(
+        decideWatchRequest(
+          scope,
+          "POST",
+          "http://127.0.0.1:8005/api/sessions",
+          JSON.stringify({ expression: ') || tags == "other"' }),
+        ),
+      ).toEqual({ block: "arkime_expression_rejected" });
+
+      const scopedJsonPost = decideWatchRequest(
+        scope,
+        "POST",
+        "http://127.0.0.1:8005/api/sessions",
+        JSON.stringify({
+          expression: "ip.src == 10.20.1.5",
+          date: "-1",
+          startTime: 1,
+          stopTime: 9_999_999_999,
+          fields: ["ip.src", "ip.dst"],
+        }),
+      );
+      expect(scopedJsonPost.block).toBeNull();
+      const parsedScopedBody = JSON.parse(scopedJsonPost.body!) as Record<string, unknown>;
+      expect(parsedScopedBody.date).toBeUndefined();
+      expect(parsedScopedBody.expression).toBe(
+        '(ip.src == 10.20.1.5) && tags == "case:synth-case-001"',
+      );
+      expect(parsedScopedBody.startTime).toBe(scope.startSec);
+      expect(parsedScopedBody.stopTime).toBe(scope.stopSec);
+      expect(parsedScopedBody.fields).toEqual(["ip.src", "ip.dst"]);
+
+      const scopedFormPost = decideWatchRequest(
+        scope,
+        "POST",
+        "http://127.0.0.1:8005/api/spiview",
+        "expression=port.dst%3D%3D443&date=-1&startTime=100&stopTime=9999999999&spi=tls.ja4",
+      );
+      expect(scopedFormPost.block).toBeNull();
+      const outForm = new URLSearchParams(scopedFormPost.body!);
+      expect(outForm.has("date")).toBe(false);
+      expect(outForm.get("expression")).toBe(
+        '(port.dst==443) && tags == "case:synth-case-001"',
+      );
+      expect(outForm.get("startTime")).toBe(String(scope.startSec));
+      expect(outForm.get("stopTime")).toBe(String(scope.stopSec));
+      expect(outForm.get("spi")).toBe("tls.ja4");
+
+      expect(
+        decideWatchRequest(
+          scope,
+          "POST",
+          "http://127.0.0.1:8005/api/sessions",
+          "expression=ip.src%3D%3D1.1.1.1&expression=ip.src%3D%3D2.2.2.2",
+        ),
+      ).toEqual({ block: "arkime_ambiguous_search" });
+
+      // Kibana Discover batch search pinning (`browser_policy.py` `_kibana`)
+      expect(
+        decideWatchRequest(scope, "POST", "http://127.0.0.1:5601/internal/bsearch", null),
+      ).toEqual({ block: "kibana_body_unavailable" });
+      expect(
+        decideWatchRequest(
+          scope,
+          "POST",
+          "http://127.0.0.1:5601/internal/bsearch",
+          JSON.stringify({
+            batch: [{ options: { strategy: "es" }, request: { params: { index: "wrong-index" } } }],
+          }),
+        ),
+      ).toEqual({ block: "kibana_index_denied" });
+      const pinnedKibana = decideWatchRequest(
+        scope,
+        "POST",
+        "http://127.0.0.1:5601/internal/bsearch",
+        JSON.stringify({
+          batch: [
+            {
+              options: { strategy: "ese" },
+              request: {
+                params: {
+                  index: "hunt-lab-case-events",
+                  body: { size: 50, query: { match_all: {} } },
+                },
+              },
+            },
+          ],
+        }),
+      );
+      expect(pinnedKibana.block).toBeNull();
+      expect(pinnedKibana.body).toContain(`"gte":${scope.startSec * 1000}`);
+      expect(pinnedKibana.body).toContain(`"lt":${scope.stopSec * 1000}`);
+    } finally {
+      await dp.close();
+    }
+  });
+
+  test("regression (pr1-v2 BLOCK 1 & BLOCK 2): enforces FTS5 adjacent phrases, fts5vocab ?/* wildcards, quoted leading-wildcard 400, MAX_UNIQUE_VALUES=1000, and LIKE ESCAPE", async () => {
+    const luceneCaseDir = path.join(tmpRoot, "lucene-edge-case");
+    fs.mkdirSync(luceneCaseDir, { recursive: true });
+    const startSec = Math.floor(Date.parse("2026-11-14T10:00:00Z") / 1000);
+    fs.writeFileSync(
+      path.join(luceneCaseDir, "case.json"),
+      JSON.stringify({
+        case_id: "lucene-edge-case",
+        question: "Verify Lucene FTS5 phrases/wildcards, LIKE ESCAPE, and MAX_UNIQUE_VALUES=1000",
+        data_origin: "synthetic",
+        time_range_utc: {
+          start_inclusive: "2026-11-14T10:00:00Z",
+          end_exclusive: "2026-11-14T11:00:00Z",
+        },
+      }),
+    );
+
+    const edgeEvents = [
+      {
+        "@timestamp": "2026-11-14T10:01:00Z",
+        event: { id: "evt-decoy-phrase" },
+        host: { name: "H-1" },
+        user: { name: "bob" },
+        message: "User ali logged in from e gateway and failed",
+      },
+      {
+        "@timestamp": "2026-11-14T10:02:00Z",
+        event: { id: "evt-adj-phrase" },
+        host: { name: "H-1" },
+        user: { name: "bob" },
+        message: "User ali failed login",
+      },
+      {
+        "@timestamp": "2026-11-14T10:03:00Z",
+        event: { id: "evt-mimi" },
+        host: { name: "H-1" },
+        user: { name: "operator" },
+        process: { command_line: "C:\\Tools\\Invoke-Mimikatz.ps1 -DumpCreds" },
+        message: "Launched Mimikatz credential dump",
+      },
+      {
+        "@timestamp": "2026-11-14T10:04:00Z",
+        event: { id: "evt-ps-true" },
+        host: { name: "H-1" },
+        user: { name: "operator" },
+        message: "Ran PowerShell script",
+      },
+      {
+        "@timestamp": "2026-11-14T10:05:00Z",
+        event: { id: "evt-ps-decoy" },
+        host: { name: "H-1" },
+        user: { name: "operator" },
+        process: { command_line: "Invoke helper and later mimic args" },
+        message: "power user opened shell",
+      },
+    ];
+    fs.writeFileSync(
+      path.join(luceneCaseDir, "events.jsonl"),
+      `${edgeEvents.map((e) => JSON.stringify(e)).join("\n")}\n`,
+    );
+
+    // Build 1,005 UDP DNS frames:
+    // - Frame 1 queries `_ldap._tcp.dc.corp.local`
+    // - Frame 2 queries `aldapxtcp.dc.corp.local` (decoy if `_` were unescaped in SQLite LIKE!)
+    // - Frame 3..1005 query `sub0003.uniq.test` .. `sub1005.uniq.test` -> 1,005 distinct `host.dns` values!
+    const buildSimpleDnsQuery = (qnameStr: string): Uint8Array => {
+      const hdr = Buffer.from([0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+      const labels = qnameStr.split(".").map((lbl) => {
+        const b = Buffer.from(lbl, "ascii");
+        return Buffer.concat([Buffer.from([b.length]), b]);
+      });
+      return Buffer.concat([hdr, ...labels, Buffer.from([0x00, 0x00, 0x01, 0x00, 0x01])]);
+    };
+
+    const pcapFrames: Array<{ tsSec: number; tsNsSub: number; data: Uint8Array }> = [];
+    const dnsNames = [
+      "_ldap._tcp.dc.corp.local",
+      "aldapxtcp.dc.corp.local",
+      ...Array.from({ length: 1_003 }, (_, idx) => `sub${String(idx + 3).padStart(4, "0")}.uniq.test`),
+    ];
+    for (let idx = 0; idx < dnsNames.length; idx++) {
+      const srcPort = 40_000 + idx;
+      pcapFrames.push({
+        tsSec: startSec + 10 + Math.floor(idx / 100),
+        tsNsSub: (idx % 100) * 1_000,
+        data: buildEthIpv4Header(
+          [10, 0, 0, 5],
+          [10, 0, 0, 53],
+          17,
+          buildUdpSegment(srcPort, 53, buildSimpleDnsQuery(dnsNames[idx]!)),
+        ),
+      });
+    }
+    fs.writeFileSync(path.join(luceneCaseDir, "traffic.pcap"), buildPcapNsFile(pcapFrames));
+
+    const dpEdge = await EmbeddedHuntDataPlane.open(luceneCaseDir, { cacheDir });
+    try {
+      // (a) FTS5 phrase adjacency (`"ali" + "failed"`, NOT unordered `"ali" AND "failed"`),
+      //     quoted `*` stays literal (never wildcard-expanded inside quotes),
+      //     and unquoted `Invoke-Mimi*` compiles to adjacent `"invoke" + "mimi"*`!
+      const adjPhrase = dpEdge.elasticSearch({ q: 'message:"ali failed"' });
+      expect(adjPhrase.hits.map((h) => h["event.id"])).toEqual(["evt-adj-phrase"]);
+
+      expect(dpEdge.elasticSearch({ q: 'message:"ali fail*"' }).total).toBe(0);
+      expect(
+        dpEdge
+          .elasticSearch({ q: "process.command_line.text:Invoke-Mimi*" })
+          .hits.map((h) => h["event.id"]),
+      ).toEqual(["evt-mimi"]);
+
+      // (b) FTS5 & unqualified `?` and infix `*` wildcards (zero multi-token false positives!)
+      expect(dpEdge.elasticSearch({ q: "ali?e" }).total).toBe(0);
+      expect(dpEdge.elasticSearch({ q: "message:Mimik?tz" }).hits.map((h) => h["event.id"])).toEqual([
+        "evt-mimi",
+      ]);
+      expect(dpEdge.elasticSearch({ q: "Mimik?tz" }).hits.map((h) => h["event.id"])).toEqual([
+        "evt-mimi",
+      ]);
+      expect(
+        dpEdge
+          .elasticSearch({ q: "process.command_line.text:Invoke-Mimik?tz.ps1" })
+          .hits.map((h) => h["event.id"]),
+      ).toEqual(["evt-mimi"]);
+      expect(dpEdge.elasticSearch({ q: "message:pow*shell" }).hits.map((h) => h["event.id"])).toEqual(
+        ["evt-ps-true"],
+      );
+
+      // (c) Quoted & range leading wildcards -> 400 leading_wildcard_not_supported
+      for (const badLeading of [
+        '"*evil"',
+        'message:"?bar"',
+        'message:"foo *bar"',
+        'host.name:["*a" TO "z"]',
+        'host.name:[a TO "?z"]',
+      ]) {
+        try {
+          dpEdge.elasticSearch({ q: badLeading });
+          throw new Error(`Expected leading_wildcard_not_supported for ${badLeading}`);
+        } catch (err) {
+          const dpErr = extractDataPlaneError(err);
+          expect(dpErr?.statusCode).toBe(400);
+          expect(dpErr?.errorCode).toBe("leading_wildcard_not_supported");
+        }
+      }
+
+      // (d) Network dataset LIKE ... ESCAPE '\' (`_` matches literal underscore ONLY, not 'l'/'x'!)
+      const netLdap = dpEdge.huntLabQuery({ dataset: "network", q: "_ldap._tcp" }) as {
+        total: number;
+        records: Array<Record<string, unknown>>;
+      };
+      expect(netLdap.total).toBe(1);
+      expect(JSON.stringify(netLdap.records[0])).toContain("_ldap._tcp.dc.corp.local");
+
+      // (e) MAX_UNIQUE_VALUES = 1,000 (not 500!): 1,005 -> returned:1000, truncated:true
+      const uniqAll = dpEdge.arkimeUnique({ field: "host.dns", counts: 1 });
+      expect(uniqAll.returned).toBe(1_000);
+      expect(uniqAll.truncated).toBe(true);
+    } finally {
+      await dpEdge.close();
+    }
+  });
+
+  test("regression (pr1-v2 BLOCK 3): dissects RFC 4120 Kerberos AS-REP/TGS-REP/TGS-REQ/KRB-ERROR, split 2-segment HTTP headers, IPv6 Fragment Header (44), mid-stream out-of-order TCP, and multi-message TCP DNS/Kerberos", () => {
+    const derLen = (n: number): Buffer => {
+      if (n < 0x80) return Buffer.from([n]);
+      if (n <= 0xff) return Buffer.from([0x81, n]);
+      return Buffer.from([0x82, (n >>> 8) & 0xff, n & 0xff]);
+    };
+    const derTlv = (tag: number, body: Uint8Array): Buffer =>
+      Buffer.concat([Buffer.from([tag]), derLen(body.length), body]);
+    const buildPrincipalSeq = (parts: readonly string[]): Buffer => {
+      const strs = Buffer.concat(parts.map((p) => derTlv(0x1b, Buffer.from(p, "ascii"))));
+      return derTlv(
+        0x30,
+        Buffer.concat([
+          derTlv(0xa0, Buffer.from([0x02, 0x01, 0x01])),
+          derTlv(0xa1, derTlv(0x30, strs)),
+        ]),
+      );
+    };
+
+    // 1. RFC 4120 §5.4.2 AS-REP (0x6b) & TGS-REP (0x6d) -> cname is [4] (0xa4), crealm is [3] (0xa3)
+    const asRep = derTlv(
+      0x6b,
+      derTlv(
+        0x30,
+        Buffer.concat([
+          derTlv(0xa0, Buffer.from([0x02, 0x01, 0x05])),
+          derTlv(0xa1, Buffer.from([0x02, 0x01, 0x0b])),
+          derTlv(0xa3, derTlv(0x1b, Buffer.from("CORP.LOCAL", "ascii"))),
+          derTlv(0xa4, buildPrincipalSeq(["asrep_user"])),
+        ]),
+      ),
+    );
+    const tgsRep = derTlv(
+      0x6d,
+      derTlv(
+        0x30,
+        Buffer.concat([
+          derTlv(0xa0, Buffer.from([0x02, 0x01, 0x05])),
+          derTlv(0xa1, Buffer.from([0x02, 0x01, 0x0d])),
+          derTlv(0xa3, derTlv(0x1b, Buffer.from("CORP.LOCAL", "ascii"))),
+          derTlv(0xa4, buildPrincipalSeq(["tgsrep_admin"])),
+        ]),
+      ),
+    );
+    // TGS-REQ (0x6c) WITHOUT cname [1], WITH sname [3] (`cifs/dc01.corp.local`) -> MUST NOT leak sname as CNameString!
+    const tgsReqNoCname = derTlv(
+      0x6c,
+      derTlv(
+        0x30,
+        derTlv(
+          0xa4,
+          derTlv(
+            0x30,
+            Buffer.concat([
+              derTlv(0xa0, Buffer.from([0x03, 0x05, 0x00, 0x40, 0x81, 0x00, 0x10])),
+              derTlv(0xa2, derTlv(0x1b, Buffer.from("CORP.LOCAL", "ascii"))),
+              derTlv(0xa3, buildPrincipalSeq(["cifs", "dc01.corp.local"])),
+            ]),
+          ),
+        ),
+      ),
+    );
+    // KRB-ERROR (0x7e) with cname [8] (0xa8) and sname [10] (0xaa) -> extracts ONLY cname [8]!
+    const krbError = derTlv(
+      0x7e,
+      derTlv(
+        0x30,
+        Buffer.concat([
+          derTlv(0xa0, Buffer.from([0x02, 0x01, 0x05])),
+          derTlv(0xa1, Buffer.from([0x02, 0x01, 0x1e])),
+          derTlv(0xa6, Buffer.from([0x02, 0x01, 0x06])), // KDC_ERR_C_PRINCIPAL_UNKNOWN
+          derTlv(0xa8, buildPrincipalSeq(["sprayed_user"])),
+          derTlv(0xaa, buildPrincipalSeq(["krbtgt", "CORP.LOCAL"])),
+        ]),
+      ),
+    );
+
+    const pkts: DissectedPacket[] = [];
+    const dissector = new PcapStreamDissector({
+      caseId: "block3-suite",
+      onPacket: (p) => pkts.push(p),
+    });
+    const baseTs = 1_763_114_500_000_000_000n;
+
+    dissector.processRawFrame(
+      1,
+      baseTs + 1n,
+      200,
+      buildEthIpv4Header([10, 0, 0, 10], [10, 0, 0, 5], 17, buildUdpSegment(88, 52001, asRep)),
+    );
+    dissector.processRawFrame(
+      1,
+      baseTs + 2n,
+      200,
+      buildEthIpv4Header([10, 0, 0, 10], [10, 0, 0, 5], 17, buildUdpSegment(88, 52002, tgsRep)),
+    );
+    dissector.processRawFrame(
+      1,
+      baseTs + 3n,
+      200,
+      buildEthIpv4Header([10, 0, 0, 5], [10, 0, 0, 10], 17, buildUdpSegment(52003, 88, tgsReqNoCname)),
+    );
+    dissector.processRawFrame(
+      1,
+      baseTs + 4n,
+      200,
+      buildEthIpv4Header([10, 0, 0, 10], [10, 0, 0, 5], 17, buildUdpSegment(88, 52004, krbError)),
+    );
+
+    expect(pkts[0]!.kv.get("kerberos.CNameString")).toEqual(["asrep_user"]);
+    expect(pkts[1]!.kv.get("kerberos.CNameString")).toEqual(["tgsrep_admin"]);
+    expect(pkts[2]!.wsProtocol).toBe("KRB5");
+    expect(pkts[2]!.kv.get("kerberos.CNameString")).toBeUndefined(); // Never sname!
+    expect(pkts[3]!.kv.get("kerberos.CNameString")).toEqual(["sprayed_user"]);
+
+    // 2. Split 2-segment HTTP request (`Host: split.ex` + `ample.test...`)
+    const ntlmBob = buildNtlmType3Base64("LAB", "bob");
+    const httpSeg1 = Buffer.from("GET /stage?secret=1 HTTP/1.1\r\nHost: split.ex", "ascii");
+    const httpSeg2 = Buffer.from(
+      `ample.test\r\nUser-Agent: SplitAgent/2.0\r\nAuthorization: NTLM ${ntlmBob}\r\n\r\n`,
+      "ascii",
+    );
+    dissector.processRawFrame(
+      1,
+      baseTs + 10n,
+      200,
+      buildEthIpv4Header([10, 0, 0, 5], [10, 0, 0, 80], 6, buildTcpSegment(53100, 80, 10_000, 0x18, httpSeg1)),
+    );
+    dissector.processRawFrame(
+      1,
+      baseTs + 11n,
+      200,
+      buildEthIpv4Header(
+        [10, 0, 0, 5],
+        [10, 0, 0, 80],
+        6,
+        buildTcpSegment(53100, 80, 10_000 + httpSeg1.length, 0x18, httpSeg2),
+      ),
+    );
+    expect(pkts[4]!.wsProtocol).toBe("HTTP");
+    expect(pkts[4]!.kv.get("http.host")).toBeUndefined(); // No truncated "split.ex"!
+    expect(pkts[5]!.kv.get("http.host")).toEqual(["split.example.test"]);
+    expect(pkts[5]!.kv.get("http.user_agent")).toEqual(["SplitAgent/2.0"]);
+    expect(pkts[5]!.kv.get("http.request.uri")).toEqual(["/stage?[redacted]"]);
+    expect(pkts[5]!.kv.get("ntlmssp.auth.username")).toEqual(["bob"]);
+
+    // 3. IPv6 Fragment Header (`nextHeader = 44`):
+    //    (a) Orphan mid-fragment (`fragOffset = 24`) with fake TCP port bytes creates ZERO phantom sessions!
+    //    (b) Valid 2-fragment IPv6 UDP DNS packet reassembles and extracts DNS fields cleanly!
+    const buildEthIpv6FragFrame = (
+      srcAddrLastByte: number,
+      dstAddrLastByte: number,
+      innerNextHdr: number,
+      fragOffsetBytes: number,
+      moreFragments: boolean,
+      fragId: number,
+      fragPayload: Uint8Array,
+    ): Uint8Array => {
+      const ipv6PayloadLen = 8 + fragPayload.length;
+      const frame = new Uint8Array(14 + 40 + ipv6PayloadLen);
+      const dv = new DataView(frame.buffer);
+      dv.setUint16(12, 0x86dd, false); // IPv6 EtherType
+      frame[14] = 0x60; // version 6
+      dv.setUint16(14 + 4, ipv6PayloadLen, false);
+      frame[14 + 6] = 44; // Next Header = IPv6 Fragment (44)
+      frame[14 + 7] = 64; // Hop Limit
+      frame[14 + 8] = 0x20;
+      frame[14 + 9] = 0x01;
+      frame[14 + 10] = 0x0d;
+      frame[14 + 11] = 0xb8;
+      frame[14 + 23] = srcAddrLastByte;
+      frame[14 + 24] = 0x20;
+      frame[14 + 25] = 0x01;
+      frame[14 + 26] = 0x0d;
+      frame[14 + 27] = 0xb8;
+      frame[14 + 39] = dstAddrLastByte;
+      // 8-byte Fragment Header at offset 54
+      frame[54] = innerNextHdr;
+      frame[55] = 0;
+      const fragWord = (fragOffsetBytes & 0xfff8) | (moreFragments ? 1 : 0);
+      dv.setUint16(56, fragWord, false);
+      dv.setUint32(58, fragId >>> 0, false);
+      frame.set(fragPayload, 62);
+      return frame;
+    };
+
+    const sessionCountBeforeOrphan = dissector.getSessions().length;
+    const fakeMidTcpBytes = buildTcpSegment(44444, 443, 1, 0x18, Buffer.from("mid-frag", "ascii"));
+    dissector.processRawFrame(
+      1,
+      baseTs + 20n,
+      200,
+      buildEthIpv6FragFrame(0xaa, 0xbb, 6, 24, false, 0xdeadbeef, fakeMidTcpBytes),
+    );
+    expect(pkts[6]!.wsProtocol).toBe("IPv6");
+    expect(pkts[6]!.tcpSrcPort).toBeUndefined();
+    expect(dissector.getSessions().length).toBe(sessionCountBeforeOrphan); // Zero phantom session!
+
+    const fullIpv6UdpDns = buildUdpSegment(54321, 53, buildDnsCompressedTxtResponse());
+    const v6Part1 = fullIpv6UdpDns.subarray(0, 24); // multiple of 8 bytes!
+    const v6Part2 = fullIpv6UdpDns.subarray(24);
+    dissector.processRawFrame(
+      1,
+      baseTs + 21n,
+      200,
+      buildEthIpv6FragFrame(0x11, 0x22, 17, 0, true, 0x10203040, v6Part1),
+    );
+    dissector.processRawFrame(
+      1,
+      baseTs + 22n,
+      200,
+      buildEthIpv6FragFrame(0x11, 0x22, 17, 24, false, 0x10203040, v6Part2),
+    );
+    expect(pkts[8]!.wsProtocol).toBe("DNS");
+    expect(pkts[8]!.kv.get("dns.cname")).toEqual(["cdn.evil-tunnel.test"]);
+    expect(pkts[8]!.kv.get("dns.txt")).toEqual(["exfil_chunk_01"]);
+
+    // 4. Mid-stream out-of-order TCP (`rel < 0` without SYN): Segment 2 arrives BEFORE Segment 1!
+    const oooClientHello = buildTls13ClientHelloRecord("ooo.c2.test");
+    const oooMid = Math.floor(oooClientHello.length / 2);
+    const oooSeg1 = oooClientHello.subarray(0, oooMid);
+    const oooSeg2 = oooClientHello.subarray(oooMid);
+    dissector.processRawFrame(
+      1,
+      baseTs + 30n,
+      200,
+      buildEthIpv4Header(
+        [10, 0, 0, 5],
+        [198, 51, 100, 77],
+        6,
+        buildTcpSegment(54111, 443, 5000 + oooSeg1.length, 0x18, oooSeg2),
+      ),
+    );
+    dissector.processRawFrame(
+      1,
+      baseTs + 31n,
+      200,
+      buildEthIpv4Header(
+        [10, 0, 0, 5],
+        [198, 51, 100, 77],
+        6,
+        buildTcpSegment(54111, 443, 5000, 0x18, oooSeg1),
+      ),
+    );
+    expect(pkts[10]!.kv.get("tls.handshake.extensions_server_name")).toEqual(["ooo.c2.test"]);
+    expect(pkts[10]!.kv.get("tls.handshake.ja4")?.[0]).toMatch(/^t13d0204h2_/);
+
+    // 5. Multi-message TCP DNS (port 53) & multi-message TCP Kerberos (port 88):
+    //    advances per-record stream offsets instead of re-parsing streamBuffer[0]!
+    const buildTcpDnsMsg = (host: string): Buffer => {
+      const hdr = Buffer.from([0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+      const qn = Buffer.concat(
+        host.split(".").map((l) => Buffer.concat([Buffer.from([l.length]), Buffer.from(l, "ascii")])),
+      );
+      const msg = Buffer.concat([hdr, qn, Buffer.from([0x00, 0x00, 0x01, 0x00, 0x01])]);
+      const lenPref = Buffer.alloc(2);
+      lenPref.writeUInt16BE(msg.length, 0);
+      return Buffer.concat([lenPref, msg]);
+    };
+    const tcpDns1 = buildTcpDnsMsg("first.tcp-dns.test");
+    const tcpDns2 = buildTcpDnsMsg("second.tcp-dns.test");
+    dissector.processRawFrame(
+      1,
+      baseTs + 40n,
+      200,
+      buildEthIpv4Header([10, 0, 0, 5], [10, 0, 0, 53], 6, buildTcpSegment(55100, 53, 20_000, 0x18, tcpDns1)),
+    );
+    dissector.processRawFrame(
+      1,
+      baseTs + 41n,
+      200,
+      buildEthIpv4Header(
+        [10, 0, 0, 5],
+        [10, 0, 0, 53],
+        6,
+        buildTcpSegment(55100, 53, 20_000 + tcpDns1.length, 0x18, tcpDns2),
+      ),
+    );
+    expect(pkts[11]!.kv.get("dns.qry.name")).toEqual(["first.tcp-dns.test"]);
+    expect(pkts[12]!.kv.get("dns.qry.name")).toEqual(["second.tcp-dns.test"]);
+
+    const wrapTcpKrb = (pdu: Uint8Array): Buffer => {
+      const p = Buffer.alloc(4);
+      p.writeUInt32BE(pdu.length, 0);
+      return Buffer.concat([p, pdu]);
+    };
+    const tcpKrb1 = wrapTcpKrb(buildKerberosAsReqUdp("first_krb_user"));
+    const tcpKrb2 = wrapTcpKrb(buildKerberosAsReqUdp("second_krb_user"));
+    dissector.processRawFrame(
+      1,
+      baseTs + 50n,
+      200,
+      buildEthIpv4Header([10, 0, 0, 5], [10, 0, 0, 88], 6, buildTcpSegment(55200, 88, 30_000, 0x18, tcpKrb1)),
+    );
+    dissector.processRawFrame(
+      1,
+      baseTs + 51n,
+      200,
+      buildEthIpv4Header(
+        [10, 0, 0, 5],
+        [10, 0, 0, 88],
+        6,
+        buildTcpSegment(55200, 88, 30_000 + tcpKrb1.length, 0x18, tcpKrb2),
+      ),
+    );
+    expect(pkts[13]!.kv.get("kerberos.CNameString")).toEqual(["first_krb_user"]);
+    expect(pkts[14]!.kv.get("kerberos.CNameString")).toEqual(["second_krb_user"]);
   });
 });

@@ -81,7 +81,7 @@ import {
 const CACHE_SCHEMA_VERSION = "hunt-command-embedded-cache-v2";
 const MAX_RESULT = 200;
 const MAX_HISTOGRAM_BUCKETS = 2_000;
-const MAX_UNIQUE_VALUES = 500;
+const MAX_UNIQUE_VALUES = 1_000;
 const MAX_BACKEND_BYTES = 2 * 1024 * 1024;
 
 const LONG_KEYWORD_FIELDS: ReadonlySet<string> = new Set([
@@ -307,6 +307,8 @@ function initCacheTables(db: Database): void {
       user_agent_original,
       tokenize = 'unicode61'
     );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS events_fts_vocab USING fts5vocab(events_fts, instance);
 
     CREATE TABLE IF NOT EXISTS intel_items (
       ioc_row_id INTEGER PRIMARY KEY,
@@ -708,11 +710,308 @@ function extractCleanOrigin(rawUrl: string): string | null {
   }
 }
 
+const ARKIME_SEARCH_KEYS = ["expression", "date", "startTime", "stopTime"] as const;
+
+function parseArkimeSeconds(value: unknown): number | null {
+  const str =
+    (typeof value === "string" || typeof value === "number") && typeof value !== "boolean"
+      ? String(value)
+      : "";
+  return /^[0-9]{1,12}$/.test(str) ? Number.parseInt(str, 10) : null;
+}
+
+function clampArkimeWindow(
+  scope: WatchScope,
+  rawStart: unknown,
+  rawStop: unknown,
+): [number, number] {
+  const start = parseArkimeSeconds(rawStart);
+  const stop = parseArkimeSeconds(rawStop);
+  if (start !== null && stop !== null) {
+    const clampedStart = Math.max(start, scope.startSec);
+    const clampedStop = Math.min(stop, scope.stopSec);
+    if (clampedStart < clampedStop) {
+      return [clampedStart, clampedStop];
+    }
+  }
+  return [scope.startSec, scope.stopSec];
+}
+
+function scopeArkimeFields(
+  scope: WatchScope,
+  values: Readonly<Record<string, unknown>>,
+): { expression: string; startTime: number; stopTime: number } | { block: string } {
+  const rawExpr = values.expression === undefined || values.expression === null ? "" : values.expression;
+  if (typeof rawExpr !== "string") {
+    return { block: "arkime_expression_rejected" };
+  }
+  let cleanExpr: string;
+  try {
+    cleanExpr = checkArkimeBalancedExpression(rawExpr);
+  } catch {
+    return { block: "arkime_expression_rejected" };
+  }
+  const tag = `tags == "case:${scope.caseId}"`;
+  const scopedExpr = cleanExpr ? `(${cleanExpr}) && ${tag}` : tag;
+  const [startTime, stopTime] = clampArkimeWindow(scope, values.startTime, values.stopTime);
+  return { expression: scopedExpr, startTime, stopTime };
+}
+
+function scopeArkimePairs(
+  scope: WatchScope,
+  pairs: ReadonlyArray<readonly [string, string]>,
+): { pairs: Array<[string, string]>; expression: string } | { block: string } {
+  for (const key of ARKIME_SEARCH_KEYS) {
+    let count = 0;
+    for (const [name] of pairs) {
+      if (name === key) count += 1;
+    }
+    if (count > 1) {
+      return { block: "arkime_ambiguous_search" };
+    }
+  }
+  const dict: Record<string, unknown> = {};
+  for (const [name, value] of pairs) {
+    dict[name] = value;
+  }
+  const scoped = scopeArkimeFields(scope, dict);
+  if ("block" in scoped) {
+    return scoped;
+  }
+  const rest: Array<[string, string]> = [];
+  for (const [name, value] of pairs) {
+    if (!(ARKIME_SEARCH_KEYS as readonly string[]).includes(name)) {
+      rest.push([name, value]);
+    }
+  }
+  rest.push(
+    ["expression", scoped.expression],
+    ["startTime", String(scoped.startTime)],
+    ["stopTime", String(scoped.stopTime)],
+  );
+  return { pairs: rest, expression: scoped.expression };
+}
+
+function scopeArkimePostBody(
+  scope: WatchScope,
+  body: string,
+): { body: string; expression: string } | { block: string } {
+  const trimmed = body.trimStart();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return { block: "arkime_body_rejected" };
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { block: "arkime_body_rejected" };
+    }
+    const values = parsed as Record<string, unknown>;
+    const scoped = scopeArkimeFields(scope, values);
+    if ("block" in scoped) {
+      return scoped;
+    }
+    const rest: Record<string, unknown> = {};
+    for (const [name, value] of Object.entries(values)) {
+      if (!(ARKIME_SEARCH_KEYS as readonly string[]).includes(name)) {
+        rest[name] = value;
+      }
+    }
+    return {
+      body: JSON.stringify({
+        ...rest,
+        expression: scoped.expression,
+        startTime: scoped.startTime,
+        stopTime: scoped.stopTime,
+      }),
+      expression: scoped.expression,
+    };
+  }
+
+  const formParams = new URLSearchParams(body);
+  const rawPairs = [...formParams.entries()] as Array<[string, string]>;
+  const scopedPairs = scopeArkimePairs(scope, rawPairs);
+  if ("block" in scopedPairs) {
+    return scopedPairs;
+  }
+  const encoded = new URLSearchParams(scopedPairs.pairs).toString();
+  return { body: encoded, expression: scopedPairs.expression };
+}
+
+const KIBANA_INDEX = "hunt-lab-case-events";
+const KIBANA_STATIC_RE =
+  /^\/(?:bootstrap\.js|[0-9a-f]{12}\/(?:bundles|ui)\/[\w@%+.,~/-]+|translations\/[0-9a-f]{12}\/[A-Za-z-]+\.json)$/;
+const KIBANA_GET_READS_RE =
+  /^\/(?:app\/discover|api\/(?:licensing\/info|banners\/info|spaces\/space|alerting\/rule_types)|internal\/(?:spaces\/_active_space|security\/(?:me|session|user_profile)|core\/pricing|fields_metadata|data_views\/has_(?:data_views|es_data)))$/;
+const KIBANA_POST_READS_RE = /^\/api\/core\/capabilities$/;
+const KIBANA_CONTENT_RE = /^\/api\/content_management\/rpc\/(?:get|search|mSearch|bulkGet)$/;
+const KIBANA_SEARCH_STRATEGIES: ReadonlySet<string> = new Set(["ese", "es"]);
+const KIBANA_SEARCH_KEYS: ReadonlySet<string> = new Set([
+  "query",
+  "sort",
+  "fields",
+  "size",
+  "from",
+  "version",
+  "_source",
+  "highlight",
+  "stored_fields",
+  "runtime_mappings",
+  "script_fields",
+  "aggs",
+  "aggregations",
+  "track_total_hits",
+  "docvalue_fields",
+  "search_after",
+  "timeout",
+  "terminate_after",
+]);
+
+function parseKibanaJsonBody(
+  body: string | null,
+): Record<string, unknown> | { block: string } {
+  if (body === null) {
+    return { block: "kibana_body_unavailable" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { block: "kibana_body_rejected" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { block: "kibana_body_rejected" };
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function decideKibanaWatchRequest(
+  scope: WatchScope,
+  upperMethod: string,
+  u: URL,
+  body: string | null,
+): WatchVerdict {
+  const pathname = u.pathname;
+  if (upperMethod === "GET" && KIBANA_STATIC_RE.test(pathname)) {
+    return { block: null };
+  }
+  if (upperMethod === "GET" && KIBANA_GET_READS_RE.test(pathname)) {
+    return { block: null };
+  }
+  if (upperMethod === "POST" && KIBANA_POST_READS_RE.test(pathname)) {
+    return { block: null };
+  }
+  if (
+    (upperMethod === "GET" && pathname === "/internal/data_views/fields") ||
+    (upperMethod === "POST" && pathname === "/internal/data_views/_fields_for_wildcard")
+  ) {
+    const patterns = u.searchParams.getAll("pattern");
+    return patterns.length === 1 && patterns[0] === KIBANA_INDEX
+      ? { block: null }
+      : { block: "kibana_index_denied" };
+  }
+  if (upperMethod !== "POST") {
+    return { block: "kibana_route_denied" };
+  }
+  if (pathname === "/internal/bsearch") {
+    const values = parseKibanaJsonBody(body);
+    if ("block" in values && Object.keys(values).length === 1 && typeof values.block === "string") {
+      return { block: values.block };
+    }
+    const doc = values as Record<string, unknown>;
+    const batch = doc.batch;
+    if (!Array.isArray(batch) || batch.length === 0) {
+      return { block: "kibana_body_rejected" };
+    }
+    for (const item of batch) {
+      if (item === null || typeof item !== "object" || Array.isArray(item)) {
+        return { block: "kibana_search_denied" };
+      }
+      const rec = item as Record<string, unknown>;
+      const opts = rec.options;
+      if (
+        opts === null ||
+        typeof opts !== "object" ||
+        Array.isArray(opts) ||
+        !KIBANA_SEARCH_STRATEGIES.has(String((opts as Record<string, unknown>).strategy ?? ""))
+      ) {
+        return { block: "kibana_search_denied" };
+      }
+      const reqObj = rec.request;
+      const params =
+        reqObj !== null && typeof reqObj === "object" && !Array.isArray(reqObj)
+          ? (reqObj as Record<string, unknown>).params
+          : null;
+      if (
+        params === null ||
+        typeof params !== "object" ||
+        Array.isArray(params) ||
+        (params as Record<string, unknown>).index !== KIBANA_INDEX
+      ) {
+        return { block: "kibana_index_denied" };
+      }
+      const paramsRec = params as Record<string, unknown>;
+      if (paramsRec.body === undefined) {
+        paramsRec.body = {};
+      }
+      const search = paramsRec.body;
+      if (search === null || typeof search !== "object" || Array.isArray(search)) {
+        return { block: "kibana_search_denied" };
+      }
+      const searchRec = search as Record<string, unknown>;
+      for (const k of Object.keys(searchRec)) {
+        if (!KIBANA_SEARCH_KEYS.has(k)) {
+          return { block: "kibana_search_denied" };
+        }
+      }
+      const existingQuery = searchRec.query;
+      searchRec.query = {
+        bool: {
+          must: existingQuery ? [existingQuery] : [],
+          filter: [
+            {
+              range: {
+                "@timestamp": {
+                  gte: scope.startSec * 1000,
+                  lt: scope.stopSec * 1000,
+                  format: "epoch_millis",
+                },
+              },
+            },
+          ],
+        },
+      };
+    }
+    return { block: null, body: JSON.stringify(doc) };
+  }
+  if (pathname === `/internal/kibana/suggestions/values/${KIBANA_INDEX}`) {
+    const values = parseKibanaJsonBody(body);
+    if ("block" in values && Object.keys(values).length === 1 && typeof values.block === "string") {
+      return { block: values.block };
+    }
+    return {
+      block: null,
+      body: JSON.stringify({ ...(values as Record<string, unknown>), method: "terms_agg" }),
+    };
+  }
+  if (KIBANA_CONTENT_RE.test(pathname)) {
+    const values = parseKibanaJsonBody(body);
+    if ("block" in values && Object.keys(values).length === 1 && typeof values.block === "string") {
+      return { block: values.block };
+    }
+    return (values as Record<string, unknown>).contentTypeId === "index-pattern"
+      ? { block: null }
+      : { block: "kibana_route_denied" };
+  }
+  return { block: "kibana_route_denied" };
+}
+
 export function decideWatchRequest(
   scope: WatchScope,
   method: string,
   rawUrl: string,
-  body = "",
+  body: string | null = "",
 ): WatchVerdict {
   const upperMethod = method.toUpperCase();
   const srcOrigin = extractCleanOrigin(rawUrl);
@@ -723,28 +1022,28 @@ export function decideWatchRequest(
     return upperMethod === "GET" ? { block: null } : { block: "lab_read_only" };
   }
   if (scope.kibanaOrigin && srcOrigin === scope.kibanaOrigin) {
-    const u = new URL(rawUrl);
-    if (upperMethod === "GET" && u.pathname === "/app/discover") {
-      return { block: null };
-    }
-    return { block: "kibana_route_denied" };
+    return decideKibanaWatchRequest(scope, upperMethod, new URL(rawUrl), body);
   }
   if (srcOrigin !== scope.arkimeOrigin) {
     return { block: "origin_not_lab" };
   }
 
   const u = new URL(rawUrl);
-  const decodedPath = decodeURIComponent(u.pathname);
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(u.pathname);
+  } catch {
+    return { block: "arkime_route_denied" };
+  }
   if (ARKIME_DENIED_PATH_RE.test(decodedPath)) {
     return { block: "arkime_route_denied" };
   }
   const isSearch = ARKIME_SEARCH_PREFIXES.some((p) => u.pathname.startsWith(p));
-  const searchKeys = ["expression", "date", "startTime", "stopTime"] as const;
 
   if (
     upperMethod === "GET" &&
     !isSearch &&
-    !searchKeys.some((k) => u.searchParams.has(k))
+    !ARKIME_SEARCH_KEYS.some((k) => u.searchParams.has(k))
   ) {
     return { block: null };
   }
@@ -752,54 +1051,35 @@ export function decideWatchRequest(
     return { block: "arkime_read_only" };
   }
 
-  for (const k of searchKeys) {
-    if (u.searchParams.getAll(k).length > 1) {
-      return { block: "arkime_ambiguous_search" };
+  const queryPairs = [...u.searchParams.entries()] as Array<[string, string]>;
+  const scopedQuery = scopeArkimePairs(scope, queryPairs);
+  if ("block" in scopedQuery) {
+    return { block: scopedQuery.block };
+  }
+  u.search = new URLSearchParams(scopedQuery.pairs).toString();
+
+  if (upperMethod === "POST") {
+    if (body === null) {
+      return { block: "arkime_body_unavailable" };
     }
-  }
-
-  let cleanExpr: string;
-  try {
-    cleanExpr = checkArkimeBalancedExpression(u.searchParams.get("expression") ?? "");
-  } catch {
-    return { block: "arkime_expression_rejected" };
-  }
-  const tag = `tags == "case:${scope.caseId}"`;
-  const scopedExpr = cleanExpr ? `(${cleanExpr}) && ${tag}` : tag;
-
-  const rawStart = Number(u.searchParams.get("startTime") ?? "");
-  const rawStop = Number(u.searchParams.get("stopTime") ?? "");
-  let clampedStart = scope.startSec;
-  let clampedStop = scope.stopSec;
-  if (Number.isInteger(rawStart) && Number.isInteger(rawStop)) {
-    const s = Math.max(rawStart, scope.startSec);
-    const e = Math.min(rawStop, scope.stopSec);
-    if (s < e) {
-      clampedStart = s;
-      clampedStop = e;
+    if (body.trim().length > 0) {
+      const scopedBody = scopeArkimePostBody(scope, body);
+      if ("block" in scopedBody) {
+        return { block: scopedBody.block };
+      }
+      return {
+        block: null,
+        url: u.toString(),
+        body: scopedBody.body,
+        expression: scopedBody.expression,
+      };
     }
-  }
-
-  for (const k of searchKeys) {
-    u.searchParams.delete(k);
-  }
-  u.searchParams.set("expression", scopedExpr);
-  u.searchParams.set("startTime", String(clampedStart));
-  u.searchParams.set("stopTime", String(clampedStop));
-
-  if (upperMethod === "POST" && body.trim().length > 0) {
-    return {
-      block: null,
-      url: u.toString(),
-      body,
-      expression: scopedExpr,
-    };
   }
 
   return {
     block: null,
     url: u.toString(),
-    expression: scopedExpr,
+    expression: scopedQuery.expression,
   };
 }
 
@@ -1093,7 +1373,13 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
       const row = checkDb
         .query("SELECT value FROM cache_meta WHERE key = 'ready'")
         .get() as { value: string } | null;
-      return row?.value === "1";
+      if (row?.value !== "1") {
+        return false;
+      }
+      const vocabRow = checkDb
+        .query("SELECT 1 FROM sqlite_master WHERE name = 'events_fts_vocab'")
+        .get();
+      return vocabRow !== null;
     } catch {
       return false;
     } finally {
@@ -1961,52 +2247,80 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
     const CONSOLE_PATHS = new Set<string>(["/", ...Object.values(WATCH_PAGES).map((page) => page.path)]);
 
     const server = http.createServer((req, res) => {
-      const rawUrl = req.url ?? "/";
-      const parsedUrl = new URL(rawUrl, "http://127.0.0.1");
-      const isConsoleRoute = req.method === "GET" && CONSOLE_PATHS.has(parsedUrl.pathname);
-
-      // 1. Host header check FIRST (defeats DNS rebinding before testing secret!)
-      const rawHosts = req.headersDistinct.host ?? (req.headers.host ? [req.headers.host] : []);
-      const expectedHost = `127.0.0.1:${boundPort}`;
-      if (rawHosts.length !== 1 || rawHosts[0] !== expectedHost) {
-        sendResponse(res, 403, { error: "host_not_allowed" });
-        return;
-      }
-
-      const headerSecrets = req.headersDistinct["x-hunt-lab-secret"] ?? [];
-      const candidate = headerSecrets.length === 1 ? Buffer.from(headerSecrets[0]!, "latin1") : null;
-      const operatorAuthorized = candidate !== null &&
-        candidate.byteLength === secretBuf.byteLength && crypto.timingSafeEqual(candidate, secretBuf);
-      const keys = isConsoleRoute ? parsedUrl.searchParams.getAll("key") : [];
-      const grant = keys.length === 1 ? this.watchGrants.get(keys[0]!) : undefined;
-      if (!operatorAuthorized && (
-        headerSecrets.length > 0 || !grant ||
-        parsedUrl.pathname !== WATCH_PAGES[grant.page].path
-      )) {
-        sendResponse(res, 401, { error: "caller_not_authorized" });
-        return;
-      }
-
-      // 3. Enforce GET-only read-only surface
-      if (req.method !== "GET") {
-        sendResponse(res, 405, { error: "read_only" });
-        return;
-      }
-
-      const singleParams = (allowed: ReadonlySet<string>): Record<string, string> => {
-        const out: Record<string, string> = {};
-        for (const [k, v] of parsedUrl.searchParams.entries()) {
-          if (!allowed.has(k) || Object.prototype.hasOwnProperty.call(out, k)) {
-            throwDataPlaneError(400, "invalid_query", `Unknown or duplicate query parameter '${k}'`);
-          }
-          out[k] = v;
-        }
-        return out;
-      };
-
-      const pathname = parsedUrl.pathname;
-
       try {
+        // 1. Host header check FIRST (defeats DNS rebinding before testing secret or parsing URL!)
+        const rawHosts = req.headersDistinct.host ?? (req.headers.host ? [req.headers.host] : []);
+        const expectedHost = `127.0.0.1:${boundPort}`;
+        if (rawHosts.length !== 1 || rawHosts[0] !== expectedHost) {
+          sendResponse(res, 403, { error: "host_not_allowed" });
+          return;
+        }
+
+        // Extract origin-form path/query safely WITHOUT calling `new URL()` yet
+        const rawUrl = typeof req.url === "string" ? req.url : "";
+        const isOriginForm =
+          rawUrl.startsWith("/") && !rawUrl.startsWith("//") && !rawUrl.includes("#");
+        const qIdx = rawUrl.indexOf("?");
+        const rawPathname = isOriginForm ? (qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx)) : "";
+        const rawQuery = isOriginForm && qIdx !== -1 ? rawUrl.slice(qIdx + 1) : "";
+        const isConsolePath = CONSOLE_PATHS.has(rawPathname);
+
+        // 2. Authenticate caller SECOND (operator secret OR page-bound Watch grant)
+        const headerSecrets = req.headersDistinct["x-hunt-lab-secret"] ?? [];
+        const candidate = headerSecrets.length === 1 ? Buffer.from(headerSecrets[0]!, "latin1") : null;
+        const operatorAuthorized =
+          candidate !== null &&
+          candidate.byteLength === secretBuf.byteLength &&
+          crypto.timingSafeEqual(candidate, secretBuf);
+        const keys = isConsolePath ? new URLSearchParams(rawQuery).getAll("key") : [];
+        const grant = keys.length === 1 ? this.watchGrants.get(keys[0]!) : undefined;
+        if (
+          !operatorAuthorized &&
+          (headerSecrets.length > 0 || !grant || rawPathname !== WATCH_PAGES[grant.page].path)
+        ) {
+          sendResponse(res, 401, { error: "caller_not_authorized" });
+          return;
+        }
+
+        // 3. Enforce GET-only read-only surface THIRD
+        if (req.method !== "GET") {
+          sendResponse(res, 405, { error: "read_only" });
+          return;
+        }
+
+        // 4. Strictly validate origin-form request target (`/...`, rejecting `//authority`, schemes, and fragments)
+        if (!isOriginForm) {
+          sendResponse(res, 400, { error: "invalid_request" });
+          return;
+        }
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(rawUrl, "http://127.0.0.1");
+        } catch {
+          sendResponse(res, 400, { error: "invalid_request" });
+          return;
+        }
+        if (
+          parsedUrl.origin !== "http://127.0.0.1" ||
+          !parsedUrl.pathname.startsWith("/") ||
+          parsedUrl.pathname.startsWith("//")
+        ) {
+          sendResponse(res, 400, { error: "invalid_request" });
+          return;
+        }
+
+        const singleParams = (allowed: ReadonlySet<string>): Record<string, string> => {
+          const out: Record<string, string> = {};
+          for (const [k, v] of parsedUrl.searchParams.entries()) {
+            if (!allowed.has(k) || Object.prototype.hasOwnProperty.call(out, k)) {
+              throwDataPlaneError(400, "invalid_query", `Unknown or duplicate query parameter '${k}'`);
+            }
+            out[k] = v;
+          }
+          return out;
+        };
+
+        const pathname = parsedUrl.pathname;
         if (pathname === "/case") {
           if ([...parsedUrl.searchParams.keys()].length > 0) {
             throwDataPlaneError(400, "invalid_query", "No /case parameters supported");
@@ -2235,6 +2549,9 @@ export class EmbeddedHuntDataPlane implements HuntDataPlane {
 
         sendResponse(res, 404, { error: "not_found" });
       } catch (err) {
+        if (res.headersSent) {
+          return;
+        }
         const dpErr = extractDataPlaneError(err);
         if (dpErr) {
           if (dpErr.statusCode === 503) {

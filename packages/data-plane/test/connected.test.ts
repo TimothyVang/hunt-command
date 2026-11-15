@@ -1560,4 +1560,73 @@ describe("@hunt-command/data-plane — ConnectedHuntDataPlane (ADR 0005 10-Invar
     expect(dpReopened.verifyCitations([cite1, cite2]).allValid).toBe(true);
     await dpReopened.close();
   });
+
+  test("regression (pr1-v2 BLOCK 2 & connected parity): enforces analyze_wildcard:false, quoted/range leading-wildcard 400, and unbounded [100 TO *] allowance", async () => {
+    const { transport: baseTransport } = createMockEsTransport({
+      onSearch: () => ({
+        status: 200,
+        response: {
+          pit_id: "pit-gen-1",
+          timed_out: false,
+          _shards: { total: 1, successful: 1, skipped: 0, failed: 0 },
+          hits: {
+            total: { value: 2, relation: "eq" },
+            hits: [
+              {
+                _index: "logs-win-2026.11.01",
+                _id: "shared-doc-42",
+                sort: ["2026-11-14T14:00:00.123456789Z", 10],
+                _source: {
+                  "@timestamp": "2026-11-14T14:00:00.123456789Z",
+                  host: { name: "wkstn-01" },
+                },
+              },
+            ],
+          },
+        },
+      }),
+    });
+    const rawSearchBodies: string[] = [];
+    const wrappedTransport: ConnectedHttpsTransport = async (method, url, headers, bodyBytes) => {
+      if (method === "POST" && url.includes("/_search?allow_partial_search_results=false")) {
+        const reqText = bodyBytes ? Buffer.from(bodyBytes).toString("utf8") : "";
+        rawSearchBodies.push(reqText);
+      }
+      return baseTransport(method, url, headers, bodyBytes);
+    };
+
+    const stateDir = makeTempDir("hunt-conn-wc-");
+    const dp = await ConnectedHuntDataPlane.open({
+      config: makeValidConfig(),
+      caseDefinition: makeValidCase(),
+      environ: { HUNT_ELASTIC_API_KEY: TEST_API_KEY },
+      stateDir,
+      transport: wrappedTransport,
+      nowEpochMs: FIXED_NOW_MS,
+    });
+
+    for (const badQ of ['"*evil"', 'host.name:["*a" TO "z"]', 'message:"?foo"']) {
+      try {
+        await dp.elasticSearch({ q: badQ });
+        throw new Error(`Expected leading_wildcard_not_supported for ${badQ}`);
+      } catch (err) {
+        const dpErr = extractDataPlaneError(err);
+        expect(dpErr?.statusCode).toBe(400);
+        expect(dpErr?.errorCode).toBe("leading_wildcard_not_supported");
+      }
+    }
+
+    const page1 = await dp.elasticSearch({ q: "destination.port:[100 TO *]", size: 1 });
+    expect(rawSearchBodies[0]).toContain('"analyze_wildcard":false');
+    expect(page1.next_after).toBeTruthy();
+
+    await dp.elasticSearch({
+      q: "destination.port:[100 TO *]",
+      size: 1,
+      after: page1.next_after!,
+    });
+    expect(rawSearchBodies[1]).toContain('"search_after":["2026-11-14T14:00:00.123456789Z",10]');
+
+    await dp.close();
+  });
 });

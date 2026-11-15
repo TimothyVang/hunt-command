@@ -110,6 +110,7 @@ export function ensureNetworkTables(db: Database): void {
 
 export function createNetworkIndexes(db: Database): void {
   db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_packets_ts_frame ON packets(ts_ns, frame_number);
     CREATE INDEX IF NOT EXISTS idx_packet_kv_field_str ON packet_kv(field, val_str, frame_number);
     CREATE INDEX IF NOT EXISTS idx_packet_kv_field_num ON packet_kv(field, val_num, frame_number);
     CREATE INDEX IF NOT EXISTS idx_packet_ips_lookup ON packet_ips(field, ip_bin, frame_number);
