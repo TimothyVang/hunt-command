@@ -107,6 +107,19 @@ export interface ReconcileDispatchContext {
   reasonCode: "previous_dispatch_unknown";
   /** Further reserved-but-unknown dispatches beyond the one shown. */
   additionalReceiptCount?: number;
+  affectedStep?: ReconcileAffectedStep;
+}
+
+/**
+ * The step a reconcile gate decides, as the daemon engine resolves it (`planGateTransition`):
+ * approving drops an optional step (`reconcile_drop`) or fails the run for a required one (`reconcile_halt`).
+ */
+export interface ReconcileAffectedStep {
+  stepId: string;
+  profile: ProfileId;
+  wave: HuntWave;
+  optional: boolean;
+  approveTransition: "reconcile_drop" | "reconcile_halt";
 }
 
 /** Reconcile gate because the citation source could not be reached while verifying citations. */
@@ -114,6 +127,8 @@ export interface ReconcileCitationSourceContext {
   reasonCode: "citation_source_unavailable";
   unavailableSources: string[];
   citationReceipt: CitationVerificationReceipt;
+  /** Required before approval: without it nobody can say what Approve does. */
+  affectedStep?: ReconcileAffectedStep;
 }
 
 export type ReconcileReceiptContext = ReconcileDispatchContext | ReconcileCitationSourceContext;

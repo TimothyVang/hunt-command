@@ -6,7 +6,7 @@ import {
   PROFILE_DISPLAY_TITLES,
   type CaseMetadata,
 } from "@hunt-command/shared";
-import { missingGateContextReason, validateGateSubmission } from "../../../shared/gate-validation.ts";
+import { missingGateContextReason, reconcileOutcomeText, validateGateSubmission } from "../../../shared/gate-validation.ts";
 import { SafeForensicText } from "../components/SafeForensicText.tsx";
 import type { ActiveGatePrompt } from "../../../shared/workbench-types.ts";
 import type { GateDraftFields } from "../state/workbench-store.ts";
@@ -292,6 +292,12 @@ export function AuthorityGateCard({
               ? ` ${activeGate.reconcileContext.additionalReceiptCount} more unknown dispatch(es) are covered by this gate.`
               : ""}
           </div>
+          {activeGate.reconcileContext.affectedStep && (
+            <ul data-testid="reconcile-outcomes" className="list-disc pl-4 text-slate-300 space-y-0.5">
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).approve}</li>
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).reject}</li>
+            </ul>
+          )}
         </div>
       )}
 
@@ -301,11 +307,26 @@ export function AuthorityGateCard({
           className="rounded border border-amber-500/50 bg-amber-950/30 p-2.5 font-mono text-[11px] space-y-1"
         >
           <div className="font-bold text-amber-200">
-            reason_code: citation_source_unavailable — the citation source could not be reached, so the
-            cited records below could not all be verified.
+            reason_code: citation_source_unavailable — the citation source could not be reached while
+            verifying this step&apos;s citations, so its handoff was not accepted.
           </div>
+          {activeGate.reconcileContext.affectedStep ? (
+            <div data-testid="reconcile-affected-step" className="text-slate-200">
+              affected step: {activeGate.reconcileContext.affectedStep.stepId} (
+              {activeGate.reconcileContext.affectedStep.profile}) · wave{" "}
+              {activeGate.reconcileContext.affectedStep.wave} ·{" "}
+              {activeGate.reconcileContext.affectedStep.optional ? "optional" : "required"}
+            </div>
+          ) : (
+            <div data-testid="reconcile-affected-step-missing" className="text-rose-300">
+              affected step: not identified by the daemon
+            </div>
+          )}
           <div className="text-slate-300">
-            unavailable sources: {activeGate.reconcileContext.unavailableSources.join(", ") || "(not named)"}
+            unavailable sources:{" "}
+            {activeGate.reconcileContext.unavailableSources.length > 0
+              ? activeGate.reconcileContext.unavailableSources.join(", ")
+              : "none now (the source is reachable again; statuses below are re-checked)"}
           </div>
           <div className="text-slate-300">
             citations: {activeGate.reconcileContext.citationReceipt.verifiedCount}/
@@ -325,6 +346,12 @@ export function AuthorityGateCard({
               </button>
             ))}
           </div>
+          {activeGate.reconcileContext.affectedStep && (
+            <ul data-testid="reconcile-outcomes" className="list-disc pl-4 text-slate-300 space-y-0.5">
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).approve}</li>
+              <li>{reconcileOutcomeText(activeGate.reconcileContext.affectedStep).reject}</li>
+            </ul>
+          )}
         </div>
       )}
 
