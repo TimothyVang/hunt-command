@@ -9,6 +9,8 @@ import {
   GateContextError,
   buildGateContext,
   buildGateEvidencePage,
+  buildRunEvidence,
+  buildRunEvidencePage,
   runHuntCli,
   type CitationVerificationReceipt,
   type HuntDataPlanePort,
@@ -218,7 +220,9 @@ describe("hunt.gateContext over serve with the default case data plane", () => {
     const bad = responses.find((response) => response.id === "bad");
     const unknown = responses.find((response) => response.id === "unknown");
     expect(reloaded!.error).toBeUndefined();
-    expect(reloaded!.result).toMatchObject({ run_id: "hunt-gc-1", case_id: CASE_ID, evidence_truncated: false });
+    expect(reloaded!.result).toMatchObject({ run_id: "hunt-gc-1", case_id: CASE_ID, evidence_total: 2, evidence_next_cursor: null });
+    expect(reloaded!.result.cited.map((c: { id: string }) => c.id)).toEqual(["evt-gc-1", "evt-gc-2"]);
+    expect(reloaded!.result.evidence_truncated).toBeUndefined();
     expect(reloaded!.result.evidence.map((e: { status: string }) => e.status)).toEqual(["verified", "verified"]);
     expect(JSON.stringify(reloaded!.result)).not.toContain(LEAK);
     expect(Object.keys(reloaded!.result.evidence[1].fields).length).toBeLessThanOrEqual(64);
@@ -350,6 +354,39 @@ describe("buildGateContext", () => {
     expect(await codeOf(page({ ...run, status: "running", open_gate: null }, cursor))).toBe("no_open_gate");
     expect(await codeOf(page(run, "gev1.not-json"))).toBe("invalid_arguments");
     expect(await codeOf(page(run, "something-else"))).toBe("invalid_arguments");
+  });
+
+  test("completed-run evidence: 1,200 cited ids page back exactly once; foreign and stale cursors are refused", async () => {
+    const ids = Array.from({ length: 1_200 }, (_, i) => `evt-${String(i).padStart(5, "0")}`);
+    const present = ids.filter((_, i) => i % 5 !== 0);
+    const run = { ...withCited(ids), status: "completed", open_gate: null } as PersistedHuntRun;
+    const first = await buildRunEvidence({ run, resolveDataPlane: () => plane(present) });
+    expect(first.cited.map((c) => c.id)).toEqual(ids);
+    expect(first.cited.filter((c) => c.status === "verified").map((c) => c.id)).toEqual(present);
+    expect(first.evidence).toHaveLength(GATE_CONTEXT_FIRST_PAGE);
+    expect(first.evidence_total).toBe(1_200);
+    const seen = [...first.evidence];
+    let cursor = first.evidence_next_cursor;
+    while (cursor) {
+      const page = await buildRunEvidencePage({ run, cursor, limit: 500, resolveDataPlane: () => plane(present) });
+      expect(page.run_id).toBe("hunt-x");
+      seen.push(...page.evidence);
+      cursor = page.evidence_next_cursor;
+    }
+    expect(seen.map((e) => e.id)).toEqual(ids);
+    expect(seen.map((e) => e.status)).toEqual(first.cited.map((c) => c.status));
+
+    const codeOf = async (p: Promise<unknown>) => p.then(() => "ok", (err) => (err instanceof GateContextError ? err.errorCode : "other"));
+    const c0 = first.evidence_next_cursor!;
+    const page = (r: PersistedHuntRun, c: string) => buildRunEvidencePage({ run: r, cursor: c, limit: 10, resolveDataPlane: () => plane(present) });
+    expect(await codeOf(page(run, c0))).toBe("ok");
+    expect(await codeOf(page({ ...run, run_id: "hunt-other" }, c0))).toBe("invalid_arguments");
+    expect(await codeOf(page({ ...run, status: "failed" }, c0))).toBe("stale_cursor");
+    // A gate evidence cursor is not a run evidence cursor, and vice versa.
+    const gateRun = withCited(ids);
+    const gateCursor = (await buildGateContext({ run: gateRun, receipts: [], resolveDataPlane: () => plane(present) })).incident!.evidence_next_cursor!;
+    expect(await codeOf(page(gateRun, gateCursor))).toBe("invalid_arguments");
+    expect(await codeOf(buildGateEvidencePage({ run: gateRun, cursor: c0, limit: 10, resolveDataPlane: () => plane(present) }))).toBe("stale_cursor");
   });
 
   test("more than 20,000 cited ids fails closed instead of truncating", async () => {
@@ -687,5 +724,23 @@ describe("paged incident evidence over the real serve binary", () => {
     expect(foreign.error!.error_code).toBe("hunt_not_found");
     const bad = await binary(rpc("b", "hunt.gateEvidencePage", { run_id: "hunt-page", cursor: inc.evidence_next_cursor, limit: 501 }));
     expect(bad.error!.error_code).toBe("invalid_arguments");
+
+    // After approval the completed run's evidence pages through the binary the same way.
+    const [approved] = await serveRt([rpc("a", "hunt.decideGate", {
+      hunt_id: "hunt-page", gate: "incident", action: "approve", operator_token: tokenOut.join("").trim(),
+      payload_sha256: (decided!.result as PersistedHuntRun).open_gate!.payload_sha256, check_note: "Reviewed.",
+    })], true);
+    expect((approved!.result as PersistedHuntRun).status).toBe("completed");
+    const ev = await binary(rpc("b", "hunt.evidence", { run_id: "hunt-page" }));
+    expect(ev.error).toBeUndefined();
+    expect(ev.result).toMatchObject({ run_id: "hunt-page", case_id: PAGE_CASE, evidence_total: N });
+    expect(ev.result.cited).toHaveLength(N);
+    expect(ev.result.evidence).toHaveLength(GATE_CONTEXT_FIRST_PAGE);
+    const evPage = await binary(rpc("b", "hunt.evidencePage", { run_id: "hunt-page", cursor: ev.result.evidence_next_cursor, limit: 500 }));
+    expect(evPage.error).toBeUndefined();
+    expect(evPage.result.evidence_next_cursor).toBeNull();
+    expect([...ev.result.evidence, ...evPage.result.evidence].map((e: { id: string }) => e.id)).toEqual(ids);
+    const staleGateCursor = await binary(rpc("b", "hunt.gateEvidencePage", { run_id: "hunt-page", cursor: inc.evidence_next_cursor, limit: 10 }));
+    expect(staleGateCursor.error!.error_code).toBe("no_open_gate");
   }, 120_000);
 });

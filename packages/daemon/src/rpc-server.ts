@@ -19,6 +19,7 @@ import {
   buildGateContext,
   buildGateEvidencePage,
   buildRunEvidence,
+  buildRunEvidencePage,
 } from "./gate-context.ts";
 import {
   TRANSCRIPT_PAGE_DEFAULT_BYTES,
@@ -385,6 +386,34 @@ export class HuntDaemonRpcServer {
             const evidence = await buildRunEvidence({ run, resolveDataPlane: this.resolveDataPlane });
             return { jsonrpc: "2.0", id: req.id, result: evidence };
           } catch (err) {
+            throw new RpcRequestError(-32010, "evidence_unavailable", err instanceof Error ? err.message : String(err));
+          }
+        }
+
+        case "hunt.evidencePage": {
+          // Read-only: the next records of a run's evidence (cursor from hunt.evidence).
+          const parsed = GateEvidencePageParamsSchema.safeParse(params);
+          if (!parsed.success) {
+            throw new RpcRequestError(
+              -32602,
+              "invalid_arguments",
+              `hunt.evidencePage requires exactly { run_id, cursor, limit: 1..${GATE_EVIDENCE_PAGE_MAX} }`,
+            );
+          }
+          const run = this.engine.stateStore.getRun(parsed.data.run_id);
+          if (!run) throw new RpcRequestError(-32004, "hunt_not_found", `Unknown hunt '${parsed.data.run_id}'`);
+          try {
+            const page = await buildRunEvidencePage({
+              run,
+              cursor: parsed.data.cursor,
+              limit: parsed.data.limit,
+              resolveDataPlane: this.resolveDataPlane,
+            });
+            return { jsonrpc: "2.0", id: req.id, result: page };
+          } catch (err) {
+            if (err instanceof GateContextError && (err.errorCode === "stale_cursor" || err.errorCode === "invalid_arguments")) {
+              throw toGateContextRpcError(err);
+            }
             throw new RpcRequestError(-32010, "evidence_unavailable", err instanceof Error ? err.message : String(err));
           }
         }

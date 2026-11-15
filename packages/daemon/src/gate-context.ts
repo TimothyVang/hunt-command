@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import {
   RECONCILE_GATE,
   extractInlineCitations,
@@ -12,7 +13,6 @@ import type { DispatchReceiptRow, PersistedHuntRun } from "./state-store.ts";
 import { profileForRunStep } from "./transcript.ts";
 import { assertDataPlaneBindsRun, planReconcileApproval } from "./wave-engine.ts";
 
-export const GATE_CONTEXT_MAX_EVIDENCE = 500;
 export const GATE_CONTEXT_MAX_FIELDS = 64;
 export const GATE_CONTEXT_MAX_VALUE_BYTES = 1024;
 
@@ -185,85 +185,9 @@ type Resolver = (caseId: string) => Promise<HuntDataPlanePort> | HuntDataPlanePo
 const SOURCE_OF_KIND = { evt: "events", frame: "packets", ioc: "intel" } as const;
 export type EvidenceSourceKind = (typeof SOURCE_OF_KIND)[keyof typeof SOURCE_OF_KIND];
 
-async function readRecords(run: PersistedHuntRun, ids: readonly string[], resolve?: Resolver) {
-  if (!resolve) throw new Error("no data plane resolver is configured");
-  const dataPlane = await resolve(run.case_id);
-  assertDataPlaneBindsRun(run, dataPlane);
-  if (!dataPlane.readCitedRecords) throw new Error("the case data plane cannot read cited records");
-  return dataPlane.readCitedRecords(ids);
-}
-
-/** One evidence entry per id: receipt status first, then whether the case holds the record. */
-function toEvidence(
-  ids: readonly string[],
-  records: readonly CitedEvidenceRecord[],
-  receipt: CitationVerificationReceipt,
-): GateContextEvidence[] {
-  const byId = new Map(records.filter((r) => ids.includes(r.id)).map((r) => [r.id, r]));
-  const missing = new Set([...receipt.missing_event_ids, ...receipt.missing_frame_ids, ...receipt.missing_ioc_ids]);
-  const outOfScope = new Set(receipt.out_of_scope_ids);
-  const ambiguous = new Set(receipt.ambiguous_ids);
-  return ids.map((id): GateContextEvidence => {
-    const rec = byId.get(id);
-    const status: GateContextEvidence["status"] = outOfScope.has(id)
-      ? "out_of_scope"
-      : ambiguous.has(id)
-        ? "ambiguous"
-        : missing.has(id) || !rec
-          ? "unresolved"
-          : "verified";
-    if (status !== "verified" || !rec) {
-      return { id, kind: kindOf(id), status, timestamp_iso: null, title: "", fields: {} };
-    }
-    return {
-      id,
-      kind: rec.kind,
-      status,
-      timestamp_iso: rec.timestamp_iso,
-      title: clean(rec.title),
-      fields: flattenEvidenceFields(rec.record),
-    };
-  });
-}
-
 function unavailable(run: PersistedHuntRun, what: string, err?: unknown): GateContextError {
   const why = err === undefined ? "" : `: ${err instanceof Error ? err.message : String(err)}`;
   return new GateContextError("gate_context_unavailable", `${what} for hunt '${run.run_id}' is unavailable${why}`);
-}
-
-/** Reloadable, case-bound evidence for the incident and reviewed handoffs of a run. */
-export async function buildRunEvidence(params: {
-  readonly run: PersistedHuntRun;
-  readonly resolveDataPlane?: Resolver;
-}): Promise<{
-  run_id: string;
-  case_id: string;
-  citation_receipt: CitationVerificationReceipt;
-  evidence: GateContextEvidence[];
-  evidence_truncated: boolean;
-}> {
-  const { run } = params;
-  const receipt = run.citation_receipt;
-  if (!receipt || !run.results["incident"]?.handoff) throw unavailable(run, "The incident handoff and citation receipt");
-  if (receipt.case_id !== run.case_id || receipt.source_status !== "ok") {
-    throw unavailable(run, "The incident citation verification");
-  }
-  const handoffs = [run.results["incident"].handoff, ...Object.values(run.reviewed_handoffs)];
-  const allIds = citedIds(handoffs);
-  const ids = allIds.slice(0, GATE_CONTEXT_MAX_EVIDENCE);
-  let records: CitedEvidenceRecord[];
-  try {
-    records = await readRecords(run, ids, params.resolveDataPlane);
-  } catch (err) {
-    throw unavailable(run, "Cited evidence", err);
-  }
-  return {
-    run_id: run.run_id,
-    case_id: run.case_id,
-    citation_receipt: scrubSecretValue(receipt),
-    evidence: toEvidence(ids, records, receipt),
-    evidence_truncated: allIds.length > ids.length,
-  };
 }
 
 /** Every distinct cited id gets a status; above this the context fails closed instead of truncating. */
@@ -427,7 +351,12 @@ function decodeCursor(cursor: string): CursorBody {
 }
 
 /** Statuses of every cited id plus the first record page, shared by incident and citation reconcile. */
-async function citedContext(run: PersistedHuntRun, c: GateCitations, resolve?: Resolver) {
+async function citedContext(
+  run: PersistedHuntRun,
+  c: GateCitations,
+  resolve: Resolver | undefined,
+  bind: { readonly gate: string; readonly payload_sha256: string },
+) {
   if (c.ids.length > GATE_CONTEXT_MAX_CITED) {
     throw unavailable(
       run,
@@ -451,7 +380,6 @@ async function citedContext(run: PersistedHuntRun, c: GateCitations, resolve?: R
   } catch (err) {
     throw unavailable(run, "Cited evidence", err);
   }
-  const gate = run.open_gate!;
   return {
     citation_receipt: scrubSecretValue(c.receipt),
     cited,
@@ -459,7 +387,7 @@ async function citedContext(run: PersistedHuntRun, c: GateCitations, resolve?: R
     evidence_total: cited.length,
     evidence_next_cursor:
       first.length < cited.length
-        ? encodeCursor({ v: 1, run_id: run.run_id, gate: gate.gate, payload_sha256: gate.payload_sha256, offset: first.length })
+        ? encodeCursor({ v: 1, run_id: run.run_id, gate: bind.gate, payload_sha256: bind.payload_sha256, offset: first.length })
         : null,
     unavailable_sources:
       plane === null ? [...new Set(c.ids.map((id) => SOURCE_OF_KIND[kindOf(id)]))].sort() : [],
@@ -503,7 +431,7 @@ export async function buildGateContext(params: {
 
   const citations = gateCitations(run);
   if (citations) {
-    const ctx = await citedContext(run, citations, params.resolveDataPlane);
+    const ctx = await citedContext(run, citations, params.resolveDataPlane, gate);
     const page = {
       citation_receipt: ctx.citation_receipt,
       cited: ctx.cited,
@@ -578,13 +506,31 @@ export async function buildGateEvidencePage(params: {
   if (!citations) {
     throw new GateContextError("gate_context_unavailable", `Gate '${gate.gate}' has no cited evidence`);
   }
+  const next = await pageCited(run, citations, body, params.limit, params.resolveDataPlane);
+  return {
+    run_id: run.run_id,
+    gate: citations.kind,
+    payload_sha256: gate.payload_sha256,
+    ...next,
+  };
+}
+
+/** Records for `[offset, offset + limit)` of the cited ids, and the cursor for what follows. */
+async function pageCited(
+  run: PersistedHuntRun,
+  citations: GateCitations,
+  body: CursorBody,
+  limit: number,
+  resolve: Resolver | undefined,
+): Promise<Pick<GateEvidencePage, "evidence" | "evidence_total" | "evidence_next_cursor">> {
   if (citations.ids.length > GATE_CONTEXT_MAX_CITED) {
     throw unavailable(run, "Cited evidence over the review cap");
   }
   if (body.offset > citations.ids.length) {
     throw new GateContextError("invalid_arguments", "Evidence cursor is past the end of the cited records");
   }
-  const sliceIds = citations.ids.slice(body.offset, body.offset + params.limit);
+  const sliceIds = citations.ids.slice(body.offset, body.offset + limit);
+  const params = { resolveDataPlane: resolve };
   let evidence: GateContextEvidence[];
   try {
     let plane: HuntDataPlanePort | null;
@@ -603,12 +549,101 @@ export async function buildGateEvidencePage(params: {
   }
   const end = body.offset + sliceIds.length;
   return {
-    run_id: run.run_id,
-    gate: citations.kind,
-    payload_sha256: gate.payload_sha256,
     evidence,
     evidence_total: citations.ids.length,
-    evidence_next_cursor:
-      end < citations.ids.length ? encodeCursor({ ...body, offset: end }) : null,
+    evidence_next_cursor: end < citations.ids.length ? encodeCursor({ ...body, offset: end }) : null,
   };
 }
+
+// ---------------------------------------------------------------------------------------------
+// Run evidence (`hunt.evidence`): the incident's cited records after the gate, for review and
+// reload. Same complete statuses and paging as gate evidence; the cursor is bound to the run and
+// a digest of its evidence state, so it goes stale if that state changes.
+// ---------------------------------------------------------------------------------------------
+
+const RUN_EVIDENCE_BINDING = "run_evidence";
+
+export interface RunEvidence {
+  readonly run_id: string;
+  readonly case_id: string;
+  readonly citation_receipt: CitationVerificationReceipt;
+  readonly cited: GateCitedStatus[];
+  readonly evidence: GateContextEvidence[];
+  readonly evidence_total: number;
+  readonly evidence_next_cursor: string | null;
+}
+
+export interface RunEvidencePage {
+  readonly run_id: string;
+  readonly evidence: GateContextEvidence[];
+  readonly evidence_total: number;
+  readonly evidence_next_cursor: string | null;
+}
+
+function runEvidenceCitations(run: PersistedHuntRun): GateCitations {
+  const receipt = run.citation_receipt;
+  const handoff = run.results["incident"]?.handoff;
+  if (!receipt || !handoff) throw unavailable(run, "The incident handoff and citation receipt");
+  if (receipt.case_id !== run.case_id || receipt.source_status !== "ok") {
+    throw unavailable(run, "The incident citation verification");
+  }
+  return {
+    kind: "incident",
+    ids: citedIds([handoff, ...Object.values(run.reviewed_handoffs)]),
+    receipt,
+    tolerateUnavailable: false,
+  };
+}
+
+/** Digest of what run evidence is computed from: the run's status, its receipt and its cited ids. */
+function runEvidenceDigest(run: PersistedHuntRun, c: GateCitations): string {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify([run.run_id, run.status, c.receipt.checked_at, c.ids]))
+    .digest("hex");
+}
+
+/** Read-only, case-bound evidence for the incident and reviewed handoffs of a run. */
+export async function buildRunEvidence(params: {
+  readonly run: PersistedHuntRun;
+  readonly resolveDataPlane?: Resolver;
+}): Promise<RunEvidence> {
+  const { run } = params;
+  const c = runEvidenceCitations(run);
+  const ctx = await citedContext(run, c, params.resolveDataPlane, {
+    gate: RUN_EVIDENCE_BINDING,
+    payload_sha256: runEvidenceDigest(run, c),
+  });
+  return {
+    run_id: run.run_id,
+    case_id: run.case_id,
+    citation_receipt: ctx.citation_receipt,
+    cited: ctx.cited,
+    evidence: ctx.evidence,
+    evidence_total: ctx.evidence_total,
+    evidence_next_cursor: ctx.evidence_next_cursor,
+  };
+}
+
+/** The next run-evidence records; a cursor from another run is refused, a stale one is `stale_cursor`. */
+export async function buildRunEvidencePage(params: {
+  readonly run: PersistedHuntRun;
+  readonly cursor: string;
+  readonly limit: number;
+  readonly resolveDataPlane?: Resolver;
+}): Promise<RunEvidencePage> {
+  const { run } = params;
+  const body = decodeCursor(params.cursor);
+  if (body.run_id !== run.run_id) {
+    throw new GateContextError("invalid_arguments", `Evidence cursor belongs to another hunt, not '${run.run_id}'`);
+  }
+  if (body.gate !== RUN_EVIDENCE_BINDING) {
+    throw new GateContextError("invalid_arguments", "Cursor is a gate evidence cursor; use hunt.gateEvidencePage");
+  }
+  const c = runEvidenceCitations(run);
+  if (body.payload_sha256 !== runEvidenceDigest(run, c)) {
+    throw new GateContextError("stale_cursor", `Run evidence of '${run.run_id}' changed since the cursor was issued`);
+  }
+  return { run_id: run.run_id, ...(await pageCited(run, c, body, params.limit, params.resolveDataPlane)) };
+}
+
