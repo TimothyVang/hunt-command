@@ -3,13 +3,14 @@ import {
   extractInlineCitations,
   scrubSecretValue,
   type Handoff,
+  type HuntWave,
   type ProfileId,
 } from "@hunt-command/shared";
 import type { CitationVerificationReceipt, CitedEvidenceRecord, HuntDataPlanePort } from "./ports.ts";
 import { sanitizeUntrustedText, truncateUtf8Safe } from "./scrubber-and-fence.ts";
 import type { DispatchReceiptRow, PersistedHuntRun } from "./state-store.ts";
 import { profileForRunStep } from "./transcript.ts";
-import { assertDataPlaneBindsRun } from "./wave-engine.ts";
+import { assertDataPlaneBindsRun, planReconcileApproval } from "./wave-engine.ts";
 
 export const GATE_CONTEXT_MAX_EVIDENCE = 500;
 export const GATE_CONTEXT_MAX_FIELDS = 64;
@@ -47,14 +48,30 @@ export interface GateContext {
   readonly reconcile?: GateContextReconcile;
 }
 
+/**
+ * The step a reconcile gate decides on and what each decision does, computed by the engine's own
+ * `planReconcileApproval`, so the operator's card cannot disagree with the transition applied.
+ */
+export interface GateAffectedStep {
+  readonly step_id: string;
+  readonly profile: ProfileId;
+  readonly wave: HuntWave;
+  readonly optional: boolean;
+  /** `reconcile_drop`: the optional step is dropped and the hunt continues; `reconcile_halt`: the hunt fails. */
+  readonly approve_transition: "reconcile_drop" | "reconcile_halt";
+  readonly reject_reason_code: "reconcile_rejected";
+}
+
 /** Tagged by `reason_code`: why the step became unknown decides what the operator must see. */
 export type GateContextReconcile =
   | {
       readonly reason_code: "previous_dispatch_unknown";
+      readonly affected_step: GateAffectedStep;
       readonly receipts: GateContextReconcileReceipt[];
     }
   | {
       readonly reason_code: "citation_source_unavailable";
+      readonly affected_step: GateAffectedStep;
       /** Source kinds that could not be read while building this context (statuses are `unchecked`). */
       readonly unavailable_sources: Array<"events" | "packets" | "intel">;
     } & GateCitedEvidence;
@@ -469,6 +486,21 @@ export async function buildGateContext(params: {
     return { ...base, gate: "scope", scope: { scope_text: clean(run.config.scopeText, 64 * 1024) } };
   }
 
+  const affectedStep = (): GateAffectedStep => {
+    const plan = planReconcileApproval(run, gate);
+    if (!plan.unknownStepId || !plan.spec) {
+      throw unavailable(run, `The step decided by reconcile gate (${String(gate.unknown_step_id ?? "none")})`);
+    }
+    return {
+      step_id: plan.unknownStepId,
+      profile: plan.spec.profile,
+      wave: plan.spec.wave,
+      optional: plan.spec.optional,
+      approve_transition: plan.approve,
+      reject_reason_code: "reconcile_rejected",
+    };
+  };
+
   const citations = gateCitations(run);
   if (citations) {
     const ctx = await citedContext(run, citations, params.resolveDataPlane);
@@ -485,6 +517,7 @@ export async function buildGateContext(params: {
       gate: "reconcile",
       reconcile: {
         reason_code: "citation_source_unavailable",
+        affected_step: affectedStep(),
         unavailable_sources: ctx.unavailable_sources as EvidenceSourceKind[],
         ...page,
       },
@@ -492,7 +525,8 @@ export async function buildGateContext(params: {
   }
 
   if (gate.gate === RECONCILE_GATE) {
-    const stepId = gate.unknown_step_id;
+    const affected = affectedStep();
+    const stepId = affected.step_id;
     const receipts = params.receipts
       .filter((r) => r.run_id === run.run_id && r.step_id === stepId && r.status === "previous_dispatch_unknown")
       .map((r): GateContextReconcileReceipt => {
@@ -511,7 +545,7 @@ export async function buildGateContext(params: {
     if (receipts.length === 0) {
       throw unavailable(run, `The reconcile context (${gate.reason_code ?? "unknown"})`);
     }
-    return { ...base, gate: "reconcile", reconcile: { reason_code: "previous_dispatch_unknown", receipts } };
+    return { ...base, gate: "reconcile", reconcile: { reason_code: "previous_dispatch_unknown", affected_step: affected, receipts } };
   }
 
   throw new GateContextError("gate_context_unavailable", `Gate '${gate.gate}' has no decision context`);

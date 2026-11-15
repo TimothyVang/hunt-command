@@ -42,6 +42,7 @@ import {
 import {
   computeDispatchFingerprint,
   type DurableStateStore,
+  type OpenGateState,
   type PersistedHuntRun,
   type StepResultRecord,
   type TokenLedgerSummary,
@@ -478,6 +479,27 @@ export type DataPlaneResolver = (
 ) => Promise<HuntDataPlanePort> | HuntDataPlanePort;
 
 /**
+ * What approving a `reconcile` gate does, from the run's own wave graph: an optional unknown step
+ * is dropped (`reconcile_drop`); a required or unidentifiable one halts the run
+ * (`reconcile_halt`). The engine's transition and the desktop's gate context both use this.
+ */
+export function planReconcileApproval(
+  run: Pick<PersistedHuntRun, "config">,
+  gate: Pick<OpenGateState, "unknown_step_id">,
+): { unknownStepId?: string; spec?: WaveStepSpec; approve: "reconcile_drop" | "reconcile_halt" } {
+  const unknownStepId = gate.unknown_step_id;
+  const spec = unknownStepId
+    ? buildEightWaveGraph({
+        followUps: run.config.followUps,
+        optionalOverrides: run.config.optionalOverrides,
+      })
+        .flat()
+        .find((s) => s.stepId === unknownStepId)
+    : undefined;
+  return { unknownStepId, spec, approve: unknownStepId && spec?.optional ? "reconcile_drop" : "reconcile_halt" };
+}
+
+/**
  * Fails closed (`case_mismatch` / `case_origin_mismatch`) unless `dataPlane` serves the exact case
  * and data origin a persisted run was started on. Every path that binds a resolved data plane to
  * an existing run calls this before it changes any state.
@@ -902,13 +924,8 @@ export class HuntWaveEngine {
 
     if (activeGate.gate === RECONCILE_GATE) {
       // Human operator explicitly reconciled an unknown step
-      const unknownStepId = activeGate.unknown_step_id;
-      const waves = buildEightWaveGraph({
-        followUps: run.config.followUps,
-        optionalOverrides: run.config.optionalOverrides,
-      });
-      const spec = waves.flat().find((s) => s.stepId === unknownStepId);
-      if (unknownStepId && spec?.optional) {
+      const { unknownStepId, spec, approve } = planReconcileApproval(run, activeGate);
+      if (approve === "reconcile_drop" && unknownStepId && spec) {
         return {
           kind: "reconcile_drop",
           resume: true,

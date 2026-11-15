@@ -387,6 +387,12 @@ describe("buildGateContext", () => {
       open_gate: { gate: "reconcile", wave: "analysis", requires_human: true, payload_sha256: "cd".repeat(32), opened_at: "t", expires_at: "t", check_note_cleared: true, unknown_step_id: "scope", reason_code: "previous_dispatch_unknown" } as never,
     });
     expect(await codeOf(buildGateContext({ run: reconcileRun, receipts: [] }))).toBe("gate_context_unavailable");
+    // The affected step must be identifiable in the run's own graph.
+    const noStep = baseRun({ open_gate: { ...reconcileRun.open_gate!, unknown_step_id: undefined } });
+    const ghostStep = baseRun({ open_gate: { ...reconcileRun.open_gate!, unknown_step_id: "follow-9" } });
+    const pdu = [{ execution_id: "hunt-x:follow-9", run_id: "hunt-x", step_id: "follow-9", session_id: "s", input_id: "i", fingerprint: "f", status: "previous_dispatch_unknown" as const, reason_code: "previous_dispatch_unknown", output_text: null, usage: null, refusal: null, diagnostic: null, reserved_at: "t", finished_at: null }];
+    expect(await codeOf(buildGateContext({ run: noStep, receipts: pdu }))).toBe("gate_context_unavailable");
+    expect(await codeOf(buildGateContext({ run: ghostStep, receipts: pdu }))).toBe("gate_context_unavailable");
     const ctx = await buildGateContext({
       run: reconcileRun,
       receipts: [
@@ -394,7 +400,9 @@ describe("buildGateContext", () => {
         { execution_id: "hunt-other:scope", run_id: "hunt-other", step_id: "scope", session_id: "s2", input_id: "i2", fingerprint: "f", status: "previous_dispatch_unknown", reason_code: "previous_dispatch_unknown", output_text: null, usage: null, refusal: null, diagnostic: null, reserved_at: "2026-11-14T10:00:00Z", finished_at: null },
       ],
     });
-    expect(ctx.reconcile).toEqual({ reason_code: "previous_dispatch_unknown", receipts: [
+    expect(ctx.reconcile).toEqual({ reason_code: "previous_dispatch_unknown",
+      affected_step: { step_id: "scope", profile: "framework-coordinator", wave: "scope", optional: false, approve_transition: "reconcile_halt", reject_reason_code: "reconcile_rejected" },
+      receipts: [
       { execution_id: "hunt-x:scope", session_id: "s1", input_id: "i1", step_id: "scope", profile: "framework-coordinator", reserved_at: "2026-11-14T10:00:00Z", reason_code: "previous_dispatch_unknown" },
     ] });
   });
@@ -402,8 +410,12 @@ describe("buildGateContext", () => {
 
 describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () => {
   /** The real case data plane, except that citation verification reports its source unavailable. */
-  async function flakyPlane(readable: boolean): Promise<{ plane: HuntDataPlanePort; close: () => Promise<void>; recover: () => void }> {
+  async function flakyPlane(
+    readable: boolean,
+    healthyVerifyCalls = 0,
+  ): Promise<{ plane: HuntDataPlanePort; close: () => Promise<void>; recover: () => void }> {
     let recovered = false;
+    let verifyCalls = 0;
     const { createCaseDirDataPlaneResolver } = await import("../src/index.ts");
     const resolver = createCaseDirDataPlaneResolver({ casesDir, cacheDir: makeTmpDir("hunt-gatectx-cache-") });
     const real = await resolver.resolve(CASE_ID);
@@ -411,7 +423,7 @@ describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () 
       caseMetadata: real.caseMetadata,
       capabilities: () => real.capabilities(),
       executeTool: (...a) => real.executeTool(...a),
-      verifyCitations: async (r) => recovered ? real.verifyCitations(r) : ({
+      verifyCitations: async (r) => (recovered || ++verifyCalls <= healthyVerifyCalls) ? real.verifyCitations(r) : ({
         verified: false,
         checked_at: new Date().toISOString(),
         case_id: r.case_id,
@@ -484,12 +496,102 @@ describe("hunt.gateContext on a citation_source_unavailable reconcile gate", () 
         expect(reconcile.unavailable_sources).toEqual(["events"]);
         expect(reconcile.evidence[0]).toMatchObject({ title: "", fields: {}, timestamp_iso: null });
       }
+      // Required step: the card says Approve halts the hunt, and the engine agrees.
+      expect(reconcile.affected_step).toEqual({
+        step_id: "scope",
+        profile: "framework-coordinator",
+        wave: "scope",
+        optional: false,
+        approve_transition: "reconcile_halt",
+        reject_reason_code: "reconcile_rejected",
+      });
+      if (readable) {
+        const approved = await approveThroughServe(runtimeDir, plane, "hunt-csu", "reconcile", parked.open_gate!.payload_sha256);
+        expect(approved).toMatchObject({ status: "failed", reason_code: "reconciled_halt_required_step" });
+      }
       } finally {
         await close();
       }
     });
   }
+
+  test("an optional step's reconcile gate says Approve drops it, and the engine drops it", async () => {
+    runtimeDir = makeTmpDir("hunt-gatectx-opt-rt-");
+    // Scope's verification succeeds; the evidence step's verification finds its source down.
+    const { plane, close } = await flakyPlane(false, 1);
+    try {
+      const out: string[] = [];
+      await runHuntCli(
+        ["serve", "--runtime-dir", runtimeDir],
+        { writeStdout: (t) => void out.push(t), writeStderr: () => {} },
+        {
+          modelRunner: runner,
+          resolveDataPlane: () => plane,
+          stdin: linesOf(rpc("s", "hunt.start", { run_id: "hunt-opt", case_id: CASE_ID, scope: "Scope.", follow_ups: 0 })),
+        },
+      );
+      const started = out.join("").trim().split("\n").map((l) => JSON.parse(l) as RpcLine).find((l) => l.id === "s")!;
+      const scopeGate = (started.result as PersistedHuntRun).open_gate!;
+      expect(scopeGate.gate).toBe("scope");
+      const parked = await approveThroughServe(runtimeDir, plane, "hunt-opt", "scope", scopeGate.payload_sha256);
+      expect(parked.open_gate).toMatchObject({ gate: "reconcile", reason_code: "citation_source_unavailable", unknown_step_id: "evidence" });
+
+      const ctxOut: string[] = [];
+      await runHuntCli(
+        ["serve", "--runtime-dir", runtimeDir],
+        { writeStdout: (t) => void ctxOut.push(t), writeStderr: () => {} },
+        { resolveDataPlane: () => plane, stdin: linesOf(rpc("g", "hunt.gateContext", { run_id: "hunt-opt" })) },
+      );
+      const ctx = ctxOut.join("").trim().split("\n").map((l) => JSON.parse(l) as RpcLine).find((l) => l.id === "g")!;
+      expect(ctx.error).toBeUndefined();
+      expect(ctx.result.reconcile.affected_step).toEqual({
+        step_id: "evidence",
+        profile: "framework-researcher",
+        wave: "investigation",
+        optional: true,
+        approve_transition: "reconcile_drop",
+        reject_reason_code: "reconcile_rejected",
+      });
+
+      const after = await approveThroughServe(runtimeDir, plane, "hunt-opt", "reconcile", parked.open_gate!.payload_sha256);
+      expect(after.step_states.evidence).toBe("dropped");
+      expect(after.results.evidence).toMatchObject({ status: "dropped", reason_code: "reconciled_drop" });
+      expect(after.status).not.toBe("failed");
+    } finally {
+      await close();
+    }
+  });
 });
+
+async function approveThroughServe(
+  rt: string,
+  plane: HuntDataPlanePort,
+  runId: string,
+  gate: string,
+  payloadSha256: string,
+): Promise<PersistedHuntRun> {
+  const tokenOut: string[] = [];
+  await runHuntCli(["token", "--principal", "alice", "--role", "analyst", "--runtime-dir", rt], {
+    writeStdout: (t) => void tokenOut.push(t),
+    writeStderr: () => {},
+  });
+  const out: string[] = [];
+  await runHuntCli(
+    ["serve", "--runtime-dir", rt],
+    { writeStdout: (t) => void out.push(t), writeStderr: () => {} },
+    {
+      modelRunner: runner,
+      resolveDataPlane: () => plane,
+      stdin: linesOf(rpc("d", "hunt.decideGate", {
+        hunt_id: runId, gate, action: "approve", operator_token: tokenOut.join("").trim(),
+        payload_sha256: payloadSha256, check_note: "Reviewed the gate context.",
+      })),
+    },
+  );
+  const line = out.join("").trim().split("\n").map((l) => JSON.parse(l) as RpcLine).find((l) => l.id === "d")!;
+  expect(line.error).toBeUndefined();
+  return line.result as PersistedHuntRun;
+}
 
 describe("paged incident evidence over the real serve binary", () => {
   const PAGE_CASE = "gate-page-001";
