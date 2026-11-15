@@ -6,7 +6,7 @@ import { resolveRuntimeDir } from "@hunt-command/shared";
 import { HuntDaemonSidecar } from "../src/main/daemon/daemon-sidecar.ts";
 import { createLogger } from "../src/main/logger.ts";
 import { SecretVault } from "../src/main/secret-vault.ts";
-import { createWatchScope } from "../src/main/watch/browser-policy.ts";
+import { createWatchScope, decideWatchRequest } from "../src/main/watch/browser-policy.ts";
 import { WorkbenchService } from "../src/main/workbench-service.ts";
 import { buildWatchOpenRequest } from "../src/renderer/src/lib/watch-open.ts";
 import { buildFixtureWorkbenchSnapshot } from "../src/shared/fixture-workbench.ts";
@@ -34,6 +34,32 @@ describe("Watch tab opens the fenced session", () => {
     for (const bad of ["http://localhost:18400/", "https://example.invalid/", "file:///C:/x", "nope"]) {
       expect(buildWatchOpenRequest(snap, bad).ok).toBe(false);
     }
+  });
+
+  test("the UI's default same-origin scope fences Arkime requests", () => {
+    const snap = buildFixtureWorkbenchSnapshot({ huntId: "hunt-x" });
+    const built = buildWatchOpenRequest(snap, "http://127.0.0.1:18400/watch/arkime_sessions?key=fixture");
+    expect(built.ok).toBe(true);
+    if (!built.ok) throw new Error(built.error);
+    const scope = createWatchScope({
+      ...built.request,
+      arkimeOrigin: built.request.arkimeOrigin ?? built.request.labOrigin,
+    });
+    const verdict = decideWatchRequest(
+      scope,
+      "GET",
+      "http://127.0.0.1:18400/api/sessions?date=-1&startTime=1&stopTime=9999999999",
+    );
+    expect(verdict.block).toBeUndefined();
+    expect(verdict.url).toBeDefined();
+    const query = new URL(verdict.url!).searchParams;
+    expect(query.get("expression")).toBe(`tags == "case:${scope.caseId}"`);
+    expect(query.get("startTime")).toBe(String(scope.startSec));
+    expect(query.get("stopTime")).toBe(String(scope.stopSec));
+    expect(query.has("date")).toBe(false);
+    expect(decideWatchRequest(scope, "GET", "http://127.0.0.1:18400/api/sessions.pcap").block)
+      .toBe("arkime_route_denied");
+    expect(decideWatchRequest(scope, "GET", built.request.initialUrl!).block).toBeUndefined();
   });
 
   test("WorkbenchService.openWatch validates and forwards to the controller's open handler", async () => {

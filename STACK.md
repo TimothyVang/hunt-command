@@ -78,7 +78,7 @@ hunt-command/
 
 ### Slice 2 (`feat/slice2-wave-engine`) — `packages/daemon`
 - **`packages/daemon` (`@hunt-command/daemon`):**
-  - Durable SQLite WAL (`PRAGMA synchronous=FULL`) 8-wave DAG orchestrator checkpointing waves, handoffs, rejections, `decisions.jsonl`, and pre-prompt `ReceiptStore` reservations (`previous_dispatch_unknown` -> human `reconcile` gate), `max_total_tokens` (`results + handoff_rejections`), 5-hunt concurrency cap, and Global Stop.
+  - Durable SQLite WAL (`PRAGMA synchronous=FULL`) 8-wave DAG orchestrator checkpointing waves, handoffs, rejections, `decisions.jsonl`, and pre-prompt `ReceiptStore` reservations (`previous_dispatch_unknown` -> human `reconcile` gate), `max_total_tokens` (`results + handoff_rejections`), 5-hunt concurrency cap, and Global Stop. Case directory resolution rejects packs whose case ID differs from the requested run.
   - Isolated `K=6` `@oh-my-pi@18.20.0` hunter pool: `installSqliteLockShim()`, 1 shared `AuthStorage` with pre-wave token refresh, `oauthAccountPools` (`restricted = true`) + stripped `*_API_KEY` env vars, per-hunter `new AgentRegistry()`, unique `agentId`, `bindProcessState: false`, `taskDepth: 1`, `restrictToolNames: true`, `allowRestrictedCustomTools: true`, `spawns: []`, `cacheWarming: false`, `noContextFiles: true`, `skills: []`, `enableMCP: false`, `>=25`-char constant `messages[0]` header for `1h` Claude sibling cache sharing (`stage_guidance <= 600B`), and terminal `AssistantMessage` `cyber` refusal classifier.
   - 128-bit nonce `<untrusted_tool_result_${nonce}>` tool output fence (`<= 24 KiB` pre-capped, control-char stripped), closure-bound HMAC-SHA256 role guard (`403 tool_not_owned` / `405 read_only`), dynamic `_typed_output_caps`, `scope` no-delegation, `follow-1..K` single-claim `focus`, `_MERGE_FALLBACK_PATCH`, `hunt_lab_batch`, and `delegate_task`.
   - Authenticated Gate 1 (`scope`) & Gate 2 (`incident`) (`SHA-256` payload digest, RBAC, replay `decision_id`, expiry), outbound-only Slack Socket Mode (via `EgressGuard`), CLI `drive_gates`, and stdio NDJSON RPC server.
@@ -88,7 +88,7 @@ hunt-command/
 - **`apps/desktop` (`@hunt-command/desktop`):**
   - Hardened Electron 36 + React 19 shell spawning `hunt-daemon` (`windowsHide: true`, unpacked `PI_NATIVES_DIR`), `33ms` preload IPC batcher, DPAPI secret vault, stripped `terminal`/`mcp`/`connectors`/`workspace` IPC, removed `shell.openExternal` (`hxxps://` defanged copy-only pills), `worker-src 'self' blob:`.
   - Synchronized 4-pane DFIR Workbench: (1) 8-Wave DAG + Gantt Hunt Flight Recorder + Cache/`$0`-vs-Shadow-API gauges, (2) Claims Matrix + Authority Gate 1/2 Cards, (3) `uPlot` 60fps Timeline + Virtualized Event/Packet Dissector, (4) `Sigma.js` v3 WebGL Attack Graph + Evidence Lineage Drawer.
-  - Main-process `Fetch.enable` + `127.0.0.1:1` proxy-fenced Watch `WebContentsView` (`hunt-watch:` ephemeral partitions, `Fetch.*` blocked in CDP filter).
+  - Main-process `Fetch.enable` + `127.0.0.1:1` proxy-fenced Watch `WebContentsView` (`hunt-watch:` ephemeral partitions, `Fetch.*` blocked in CDP filter), enforcing case and time scope for Arkime requests.
   - Cited Markdown, PDF, and provenance JSON customer report export.
   - Windows 11 DWM-proof hidden `1920x1080` offscreen `BrowserWindow` paint recorder -> single-pass CFR `30fps` `ffmpeg` (`cwd: outDir`, `windowsHide: true`, relative `ass=filename=video.ass`) producing `1x` and `5x` `.mp4`/`.ass` artifacts.
 - **`.agents/skills/verify-hunt-command`:** Live desktop/daemon/film verification workflow skill.
@@ -96,7 +96,7 @@ hunt-command/
 ### Slice 4 (`feat/slice4-coach-eval`) — `packages/coach`
 - **`packages/coach` (`@hunt-command/coach`):**
   - Canonical `scenario` scorer + `review_reports` + `cost_arms` with differential parity for Story A/B & DEDALE (entity-scoped citations, `frame-*` / `ioc-*` / `evt-*` alternatives, `evidence_sibling_groups`, contrast-aware decoy non-blame, `g2_1_pass`).
-  - Out-of-process Clean-Room Two-Tier Coach running `@oh-my-pi` proposers and verifiers in an empty temporary directory outside `repo/` and `../runtime/` with **zero tools** (hard-aborting on `tool_execution_start`), consuming only scrubbed numeric/enum `packet.json` diagnostics.
+  - Out-of-process Clean-Room Two-Tier Coach running `@oh-my-pi` proposers and verifiers in an empty temporary directory outside `repo/` and `../runtime/` with **zero tools** (hard-aborting on `tool_execution_start`), consuming only scrubbed numeric/enum `packet.json` diagnostics. Case-vocabulary leak guards retain terms from one-shot iterables.
   - Strict positive file allowlist keeping `story_b_holdout`, `DEDALE`, and `runtime/operator-only/truth.json` completely sealed, governed by a 3-stage `probe -> pass^2 -> 3-verifier` promotion gate.
 
 ---

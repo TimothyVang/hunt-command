@@ -158,7 +158,21 @@ export function createCaseDirDataPlaneResolver(
         throwDataPlaneError(404, "not_found", `No case pack at '${caseDir}'`);
       }
       port = EmbeddedHuntDataPlane.open(caseDir, { cacheDir: options.cacheDir }).then(
-        (dataPlane) => new CaseDataPlanePort(dataPlane, dataPlane.describeCase()),
+        async (dataPlane) => {
+          try {
+            if (dataPlane.caseId !== caseId) {
+              throwDataPlaneError(
+                400,
+                "case_mismatch",
+                `Case pack '${dataPlane.caseId}' does not match requested case '${caseId}'`,
+              );
+            }
+            return new CaseDataPlanePort(dataPlane, dataPlane.describeCase());
+          } catch (error) {
+            await dataPlane.close();
+            throw error;
+          }
+        },
       );
       open.set(caseId, port);
       port.catch(() => open.delete(caseId));
