@@ -179,13 +179,78 @@ describe("WorkbenchService live runs", () => {
   const run = (runId: string) => ({
     run_id: runId, case_id: input.caseId, data_origin: "synthetic", synthetic_only: true,
     wave: "scope", wave_index: 0, status: "awaiting_gate", reason_code: null,
-    step_states: {}, results: {}, reviewed_handoffs: {}, decisions: [],
+    step_states: {}, results: { scope: { step_id: "scope", wave: "scope", profile: "framework-coordinator",
+      status: "done", attempts: 1, finished_at: "2026-01-01T00:00:00Z", handoff: {
+        schema_version: 1, case_id: input.caseId, step_id: "scope", profile: "framework-coordinator",
+        claims: [], reviews: [], disposition: "review_ready", limitations: [], requested_decisions: [],
+      } } }, reviewed_handoffs: {}, decisions: [],
     token_ledger: { max_total_tokens: 100_000, consumed_total_tokens: 300, rejections_tokens: 0,
       actual_billed_usd: 0, shadow_api_usd: 0, cache_savings_usd: 0 },
     open_gate: { gate: "scope", payload_sha256: "a".repeat(64),
       opened_at: "2026-01-01T00:00:00Z", expires_at: "2099-01-01T00:00:00Z" },
     citation_receipt: null, snapshot: null,
     config: { scopeText: input.scope, followUps: input.followUps, maxTotalTokens: input.maxTotalTokens },
+  });
+
+  test("incident approval and reopening reload case evidence; unavailable reads never reuse verified data", async () => {
+    const id = "hunt-reload-evidence";
+    const citation = "evt-0000000000000001";
+    const handoff = {
+      schema_version: 1, case_id: input.caseId, step_id: "incident", profile: "framework-coordinator",
+      claims: [{ claim_id: "incident:c1", kind: "finding", statement: `Observed ${citation}.`,
+        evidence_ids: ["events.jsonl"], entity_ids: [], contradicts: [] }],
+      reviews: [], disposition: "review_ready", limitations: [], requested_decisions: [],
+    };
+    const receipt = {
+      verified: true, case_id: input.caseId, total_checked: 1, source_status: "ok",
+      missing_event_ids: [], missing_frame_ids: [], missing_ioc_ids: [], ambiguous_ids: [], out_of_scope_ids: [],
+    };
+    const record = { id: citation, kind: "evt", status: "verified", timestamp_iso: "2026-01-01T01:00:00Z",
+      title: "Process", fields: { "host.name": "host-one", message: "Process observed" } };
+    const base = run(id);
+    let current = {
+      ...base, wave: "incident", results: { ...base.results, incident: {
+        step_id: "incident", wave: "incident", profile: "framework-coordinator", status: "done",
+        attempts: 1, finished_at: "2026-01-01T00:00:00Z", handoff,
+      } }, reviewed_handoffs: { incident: handoff }, citation_receipt: receipt,
+      open_gate: { ...base.open_gate, gate: "incident" },
+    };
+    let offline = false;
+    const request = async (method: string) => {
+      if (method === "hunt.status") return current;
+      if (method === "case.metadata") return metadata;
+      if (method === "hunt.gateContext") return {
+        run_id: id, case_id: input.caseId, gate: "incident", payload_sha256: current.open_gate!.payload_sha256,
+        incident: { citation_receipt: receipt, evidence: [record], evidence_truncated: false },
+      };
+      if (method === "hunt.decideGate") {
+        current = { ...current, status: "completed", open_gate: null as unknown as typeof current.open_gate };
+        return current;
+      }
+      if (method === "hunt.evidence") {
+        if (offline) throw new Error("evidence_unavailable");
+        return { run_id: id, case_id: input.caseId, citation_receipt: receipt, evidence: [record], evidence_truncated: false };
+      }
+      throw new Error(method);
+    };
+    const service = makeService(true, request);
+    const before = await service.getWorkbenchState({ huntId: id });
+    const after = await service.submitGateDecision({
+      huntId: id, gate: "incident", action: "approve", operatorName: "analyst", rbacRole: "incident_commander",
+      checkNote: "Reviewed the evidence.", payloadSha256: before.activeGate!.payloadSha256, operatorToken: "token",
+    });
+    expect(after.activeGate).toBeNull();
+    expect(after.evidenceCatalog[citation]?.verified).toBe(true);
+    expect(after.events[0]?.hostName).toBe("host-one");
+    const reopened = await makeService(true, request).getWorkbenchState({ huntId: id });
+    expect(reopened.evidenceCatalog[citation]?.verified).toBe(true);
+    expect(reopened.claims[0]?.inlineCitations[0]?.status).toBe("verified");
+    offline = true;
+    const unavailable = await service.getWorkbenchState({ huntId: id });
+    expect(unavailable.evidenceCatalog).toEqual({});
+    expect(unavailable.events).toEqual([]);
+    expect(unavailable.citationReceipt.allVerified).toBe(false);
+    expect(unavailable.claims[0]?.inlineCitations[0]?.status).toBe("unresolved");
   });
 
   test("returns real metadata and empty evidence, and refreshes status", async () => {
@@ -205,7 +270,8 @@ describe("WorkbenchService live runs", () => {
     const snapshot = await service.startRun(input);
     expect(snapshot).toMatchObject({ huntId: id, provenanceMode: "live_daemon", caseMetadata: metadata,
       runStatus: "awaiting_human_gate", activeGate: { payloadSha256: "a".repeat(64) },
-      events: [], handoffs: [], claims: [], snapshot: { entities: [], relations: [] } });
+      events: [], claims: [], snapshot: { entities: [], relations: [] } });
+    expect(snapshot.handoffs.map((handoff) => handoff.step_id)).toEqual(["scope"]);
     expect((await service.getWorkbenchState({ huntId: id })).huntId).toBe(id);
     expect((await service.listRuns()).some((item) => item.huntId === id && item.title === metadata.title)).toBe(true);
     expect(calls.filter((call) => call === "hunt.start")).toHaveLength(1);

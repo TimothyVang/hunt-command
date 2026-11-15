@@ -192,6 +192,44 @@ describe("hunt.gateContext over serve with the default case data plane", () => {
     expect(line.result).toMatchObject({ run_id: "hunt-gc-1", gate: "incident", payload_sha256: incidentSha });
     expect(line.result.incident.evidence).toHaveLength(2);
   }, 60_000);
+  test("approved incident evidence reloads from its case after daemon restart and fails closed if unavailable", async () => {
+    const tokenOutput: string[] = [];
+    await runHuntCli(["token", "--principal", "alice", "--role", "analyst", "--runtime-dir", runtimeDir], {
+      writeStdout: (text) => void tokenOutput.push(text), writeStderr: () => {},
+    });
+    const [approved] = await serve([rpc("approve", "hunt.decideGate", {
+      hunt_id: "hunt-gc-1", gate: "incident", action: "approve", operator_token: tokenOutput.join("").trim(),
+      payload_sha256: incidentSha, check_note: "Reviewed incident evidence.",
+    })], true);
+    expect(approved!.error).toBeUndefined();
+    expect((approved!.result as PersistedHuntRun).open_gate).toBeNull();
+    const responses = await serve([
+      rpc("e", "hunt.evidence", { run_id: "hunt-gc-1" }),
+      rpc("bad", "hunt.evidence", { run_id: "hunt-gc-1", case_id: "other" }),
+      rpc("unknown", "hunt.evidence", { run_id: "unknown" }),
+    ]);
+    const reloaded = responses.find((response) => response.id === "e");
+    const bad = responses.find((response) => response.id === "bad");
+    const unknown = responses.find((response) => response.id === "unknown");
+    expect(reloaded!.error).toBeUndefined();
+    expect(reloaded!.result).toMatchObject({ run_id: "hunt-gc-1", case_id: CASE_ID, evidence_truncated: false });
+    expect(reloaded!.result.evidence.map((e: { status: string }) => e.status)).toEqual(["verified", "verified"]);
+    expect(JSON.stringify(reloaded!.result)).not.toContain(LEAK);
+    expect(Object.keys(reloaded!.result.evidence[1].fields).length).toBeLessThanOrEqual(64);
+    expect(bad!.error!.error_code).toBe("invalid_arguments");
+    expect(unknown!.error!.error_code).toBe("hunt_not_found");
+
+    const caseDir = path.join(casesDir, CASE_ID);
+    const moved = `${caseDir}-offline`;
+    fs.renameSync(caseDir, moved);
+    try {
+      const [offline] = await serve([rpc("offline", "hunt.evidence", { run_id: "hunt-gc-1" })]);
+      expect(offline!.error!.error_code).toBe("evidence_unavailable");
+      expect(offline!.result).toBeUndefined();
+    } finally {
+      fs.renameSync(moved, caseDir);
+    }
+  });
 });
 
 describe("buildGateContext", () => {

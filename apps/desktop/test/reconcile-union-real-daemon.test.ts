@@ -98,7 +98,20 @@ describe("desktop renders the daemon's real citation_source_unavailable reconcil
 
         // hunt.status types `gate` as string; the service narrows it with zod, here we assert it.
         const openGate = { ...run.open_gate!, gate: run.open_gate!.gate as "reconcile" };
-        const p = projectLiveGate(run.run_id, openGate, Object.values(run.reviewed_handoffs), ctx!.result);
+        // The workbench passes the affected step's unverified handoff, as WorkbenchService does.
+        const unknownStepId = run.open_gate?.unknown_step_id;
+        const reconcileHandoff = unknownStepId
+          ? (run.results[unknownStepId]?.unverified_handoff as Parameters<typeof projectLiveGate>[5])
+          : undefined;
+        expect(reconcileHandoff?.step_id).toBe(unknownStepId);
+        const p = projectLiveGate(
+          run.run_id,
+          openGate,
+          Object.values(run.reviewed_handoffs),
+          ctx!.result,
+          run.config.scopeText,
+          reconcileHandoff,
+        );
         expect(p.activeGate.contextError).toBeUndefined();
         const rc = p.activeGate.reconcileContext!;
         expect(rc.reasonCode).toBe("citation_source_unavailable");

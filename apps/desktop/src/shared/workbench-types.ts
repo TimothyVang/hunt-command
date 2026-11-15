@@ -125,6 +125,7 @@ export interface ActiveGatePrompt {
   expiresAtIso: string;
   payloadSha256: string;
   scopeText?: string;
+  scopeHandoff?: Handoff;
   scopeSummary?: {
     hostsInScope: string[];
     allowedRoleTools: Record<ProfileId, readonly HuntToolName[]>;

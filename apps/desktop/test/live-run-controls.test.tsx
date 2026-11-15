@@ -34,11 +34,27 @@ describe("live run controls", () => {
   test("shows the daemon's scope text on a live scope gate", () => {
     const snapshot = buildFixtureWorkbenchSnapshot({ openGate: "scope" });
     if (!snapshot.activeGate) throw new Error("Expected a scope gate");
-    const gate = { ...snapshot.activeGate, scopeSummary: undefined, scopeText: "Investigate workstation alpha" };
+    const scopeHandoff = { ...snapshot.handoffs[0]!, step_id: "scope", limitations: ["Scope excludes external hosts."] };
+    const gate = { ...snapshot.activeGate, scopeSummary: undefined, scopeText: "Investigate workstation alpha", scopeHandoff };
     const html = renderToStaticMarkup(<AuthorityGateCard activeGate={gate}
       caseMetadata={snapshot.caseMetadata} requiresToken draft={{ operatorName: "operator", rbacRole: "lead_hunter", checkNote: "checked" }}
       onUpdateDraft={() => {}} onSubmitDecision={() => {}} onSelectCitation={() => {}} />);
     expect(html).toContain("Investigate workstation alpha");
+    expect(html).toContain("Generated scope handoff");
+    expect(html).toContain("Scope excludes external hosts.");
+    expect(html).toContain(scopeHandoff.claims[0]!.claim_id);
+  });
+
+  test("reconcile gate explains the actual approval and rejection outcomes", () => {
+    const snapshot = buildFixtureWorkbenchSnapshot({ openGate: "reconcile" });
+    if (!snapshot.activeGate) throw new Error("Expected a reconcile gate");
+    const html = renderToStaticMarkup(<AuthorityGateCard activeGate={snapshot.activeGate}
+      caseMetadata={snapshot.caseMetadata} requiresToken={false} draft={{ operatorName: "operator", rbacRole: "lead_hunter", checkNote: "checked" }}
+      onUpdateDraft={() => {}} onSubmitDecision={() => {}} onSelectCitation={() => {}} />);
+    expect(html).toContain("approval drops an optional unknown");
+    expect(html).toContain("fails the run if the step is required");
+    expect(html).toContain("dispatch is not replayed");
+    expect(html).toContain("Rejection fails the run");
   });
 
   test("incident handoff claims and limitations remain visible when evidence is truncated", () => {

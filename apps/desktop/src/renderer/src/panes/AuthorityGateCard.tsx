@@ -114,6 +114,13 @@ export function AuthorityGateCard({
           <SafeForensicText text={activeGate.scopeText} className="whitespace-pre-wrap break-words text-slate-100" />
         </div>
       )}
+      {activeGate.gate === "scope" && activeGate.scopeHandoff && (
+        <section data-testid="scope-handoff" className="space-y-2 rounded border border-slate-800 bg-slate-950/80 p-2 text-xs">
+          <h3 className="font-semibold text-slate-100">Generated scope handoff</h3>
+          <SafeForensicText text={JSON.stringify(activeGate.scopeHandoff, null, 2)} className="whitespace-pre-wrap break-words text-slate-100" />
+        </section>
+      )}
+
 
       {/* Gate 1: Scope Details + Read-Only Role Tool Ownership Matrix */}
       {activeGate.gate === "scope" && activeGate.scopeSummary && (
@@ -278,8 +285,9 @@ export function AuthorityGateCard({
             input_id: {activeGate.reconcileContext.inputId}
           </div>
           <div className="text-slate-400">
-            reserved_at: {activeGate.reconcileContext.reservedAtIso} — approve to replay or reject to halt
-            the run cleanly.
+            reserved_at: {activeGate.reconcileContext.reservedAtIso} — approval drops an optional unknown
+            step and resumes the run, or fails the run if the step is required. The dispatch is not replayed.
+            Rejection fails the run.
             {activeGate.reconcileContext.additionalReceiptCount
               ? ` ${activeGate.reconcileContext.additionalReceiptCount} more unknown dispatch(es) are covered by this gate.`
               : ""}

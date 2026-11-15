@@ -168,37 +168,106 @@ describe("F4: gate approval requires the gate's decision context", () => {
       reconcile: {
         reason_code: "citation_source_unavailable",
         citation_receipt: { ...inc.citation_receipt, verified: false, source_status: "unavailable" },
-        unavailable_sources: ["elastic"],
+        unavailable_sources: ["events"],
         evidence: [{ ...inc.evidence[0]!, status: "unresolved", timestamp_iso: null, title: "", fields: {} }],
         evidence_truncated: false,
       },
-    });
+    }, undefined, HANDOFFS[0]);
     expect(p.activeGate.contextError).toBeUndefined();
     const rc = p.activeGate.reconcileContext!;
     expect(rc.reasonCode).toBe("citation_source_unavailable");
     if (rc.reasonCode !== "citation_source_unavailable") throw new Error("narrowing");
-    expect(rc.unavailableSources).toEqual(["elastic"]);
+    expect(rc.unavailableSources).toEqual(["events"]);
     expect(rc.citationReceipt.entries.map((e) => [e.citationId, e.status])).toEqual([[EVT, "unresolved"]]);
     expect(missingGateContextReason(p.activeGate)).toBeNull();
     expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(true);
   });
 
-  test("citation_source_unavailable with the source still down lists cited ids as unresolved and stays approvable", () => {
+  test("an outage projects only affected cited IDs as unresolved without inventing evidence", () => {
+    const failed = {
+      ...HANDOFFS[0]!,
+      claims: [{ ...HANDOFFS[0]!.claims[0]!, statement: `Process ${EVT} and packet frame-42.` }],
+      limitations: ["Intel ioc-00123 could not be checked."],
+    };
     const inc = incidentContext().incident;
-    const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, {
+    const context = {
       run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
       reconcile: {
         reason_code: "citation_source_unavailable",
-        citation_receipt: { ...inc.citation_receipt, verified: false, source_status: "unavailable", diagnostic: "events backend down" },
-        unavailable_sources: ["events"], evidence: [], evidence_truncated: false,
+        citation_receipt: { ...inc.citation_receipt, verified: false, source_status: "unavailable" },
+        unavailable_sources: ["events", "packets", "intel"],
+        evidence: [], evidence_truncated: false,
       },
-    });
+    };
+    const open = { ...OPEN, gate: "reconcile" as const };
+    const p = projectLiveGate("run-1", open, [], context, undefined, failed);
     expect(p.activeGate.contextError).toBeUndefined();
-    const rc = p.activeGate.reconcileContext!;
-    if (rc.reasonCode !== "citation_source_unavailable") throw new Error("narrowing");
-    expect(rc.unavailableSources).toEqual(["events"]);
-    expect(rc.citationReceipt.entries.map((e) => [e.citationId, e.status])).toEqual([[EVT, "unresolved"]]);
+    expect(p.citationReceipt).toMatchObject({ totalCited: 3, verifiedCount: 0, unresolvedCount: 3, allVerified: false });
+    expect(p.citationReceipt?.entries).toEqual([
+      { citationId: EVT, kind: "evt", status: "unresolved", referencedIn: [{ sourceKind: "claim", sourceId: "incident:c1", stepId: "incident" }] },
+      { citationId: "frame-42", kind: "frame", status: "unresolved", referencedIn: [{ sourceKind: "claim", sourceId: "incident:c1", stepId: "incident" }] },
+      { citationId: "ioc-00123", kind: "ioc", status: "unresolved", referencedIn: [{ sourceKind: "limitation", sourceId: "incident:limitation-1", stepId: "incident" }] },
+    ]);
+    expect([...p.citationStatus.values()]).toEqual(["unresolved", "unresolved", "unresolved"]);
+    expect(p.evidenceCatalog).toEqual({});
+    expect(p.events).toEqual([]);
     expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(true);
+
+    const partial = projectLiveGate("run-1", open, [], {
+      ...context,
+      reconcile: { ...context.reconcile, unavailable_sources: ["packets", "intel"], evidence: inc.evidence },
+    }, undefined, failed);
+    expect(partial.activeGate.contextError).toBeUndefined();
+    expect(partial.citationReceipt).toMatchObject({ verifiedCount: 1, unresolvedCount: 2, allVerified: false });
+    expect(partial.evidenceCatalog[EVT]?.fields["host.name"]).toBe("wks-01");
+    expect(Object.keys(partial.evidenceCatalog)).toEqual([EVT]);
+    expect(partial.events.map((event) => event.eventId)).toEqual([EVT]);
+
+    const cases = [
+      { ...context.reconcile, unavailable_sources: ["events", "packets"] },
+      { ...context.reconcile, unavailable_sources: [] },
+      { ...context.reconcile, unavailable_sources: ["unrelated"] },
+      { ...context.reconcile, evidence_truncated: true },
+      { ...context.reconcile, evidence_truncated: undefined },
+      { ...context.reconcile, citation_receipt: { ...context.reconcile.citation_receipt, case_id: "other-case" } },
+      { ...context.reconcile, evidence: [{ ...inc.evidence[0]!, kind: "ioc" }] },
+    ];
+    for (const reconcile of cases) {
+      const rejected = projectLiveGate("run-1", open, [], { ...context, reconcile }, undefined, failed);
+      expect(rejected.activeGate.contextError).toBeDefined();
+      expect(rejected.citationReceipt).toBeNull();
+      expect(validateGateSubmission(rejected.activeGate, draft("approve")).valid).toBe(false);
+      expect(validateGateSubmission(rejected.activeGate, draft("reject")).valid).toBe(true);
+    }
+  });
+
+  test("reconcile evidence covers only the failed step, not earlier reviewed handoffs", () => {
+    const failed = HANDOFFS[0]!;
+    const earlier = {
+      ...failed,
+      step_id: "scope",
+      claims: [{ ...failed.claims[0]!, claim_id: "scope:c1", statement: "Earlier evt-0000000000000099." }],
+    };
+    const inc = incidentContext().incident;
+    const ctx = { run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
+      reconcile: { reason_code: "citation_source_unavailable", citation_receipt: inc.citation_receipt,
+        unavailable_sources: [], evidence: inc.evidence, evidence_truncated: false } };
+    const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, [earlier], ctx, undefined, failed);
+    expect(p.activeGate.contextError).toBeUndefined();
+    expect(p.citationReceipt?.entries.map((entry) => entry.citationId)).toEqual([EVT]);
+    expect(validateGateSubmission(p.activeGate, draft("approve")).valid).toBe(true);
+    const missing = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, [earlier], ctx);
+    expect(validateGateSubmission(missing.activeGate, draft("approve")).valid).toBe(false);
+  });
+
+  test("scope approval requires the generated scope handoff, not just the operator text", () => {
+    const open = { ...OPEN, gate: "scope" as const };
+    const missing = projectLiveGate("run-1", open, [], null, "Investigate the host.");
+    expect(validateGateSubmission(missing.activeGate, draft("approve")).valid).toBe(false);
+    const scope = { ...HANDOFFS[0]!, step_id: "scope", limitations: ["Limited collection."] };
+    const ready = projectLiveGate("run-1", open, [scope], null, "Investigate the host.");
+    expect(ready.activeGate.scopeHandoff).toEqual(scope);
+    expect(validateGateSubmission(ready.activeGate, draft("approve")).valid).toBe(true);
   });
 
   test("an unparseable reconcile context (no receipts) fails closed", () => {
@@ -239,7 +308,11 @@ ${t}
 
 /** In-process daemon (real engine, store, gates, RPC server) behind a sidecar-shaped adapter. */
 /** `gateContext` may override hunt.gateContext; returning `undefined` uses the real daemon RPC. */
-async function liveHarness(gateContext: (params: Record<string, unknown>, store: DurableStateStore) => unknown) {
+async function liveHarness(
+  gateContext: (params: Record<string, unknown>, store: DurableStateStore) => unknown,
+  citedRecordsUnavailable = false,
+  incidentCitation = false,
+) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "hc-live-gate-"));
   const caseId = "gate-case";
   const caseDir = path.join(root, "cases", caseId);
@@ -261,16 +334,28 @@ async function liveHarness(gateContext: (params: Record<string, unknown>, store:
       status: "completed",
       output_text: JSON.stringify({
         schema_version: 1, case_id: req.caseId, step_id: req.stepId, profile: req.profile,
-        claims: [{ claim_id: `${req.stepId}:c1`, kind: "observed", statement: req.stepId === "incident" ? "Incident-specific process finding." : "The process was observed.", evidence_ids: ["events.jsonl"], entity_ids: [], contradicts: [] }],
+        claims: [{ claim_id: `${req.stepId}:c1`, kind: "observed", statement: req.stepId === "incident" ? (incidentCitation ? "Incident process finding in evt-1." : "Incident-specific process finding.") : "The process was observed.", evidence_ids: ["events.jsonl"], entity_ids: [], contradicts: [] }],
         reviews: [], disposition: "review_ready", limitations: req.stepId === "incident" ? ["Incident-specific collection limitation."] : [], requested_decisions: [],
       }),
       usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 2, turns: 1, provider: "anthropic", model: "stub", billing_mode: "oauth_subscription", actual_billed_usd: 0, shadow_api_usd: 0, cache_savings_usd: 0 },
     }),
   };
   const engine = new HuntWaveEngine({ stateStore: store, gateAuthority: gates, modelRunner: runner, telemetry: new InMemoryTelemetrySink(), resolveDataPlane: resolver.resolve });
+  const rpcResolver = citedRecordsUnavailable
+    ? async (caseId: string) => {
+        const plane = await resolver.resolve(caseId);
+        return new Proxy(plane, {
+          get(target, key) {
+            if (key === "readCitedRecords") return async () => { throw new Error("citation source unavailable"); };
+            const value = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      }
+    : resolver.resolve;
   const replies = new Map<number, { result?: unknown; error?: { message: string; error_code?: string } }>();
   const rpc = new HuntDaemonRpcServer({
-    engine, resolveDataPlane: resolver.resolve,
+    engine, resolveDataPlane: rpcResolver,
     writeLine: (line) => {
       const msg = JSON.parse(line) as { id?: number; result?: unknown; error?: { message: string; error_code?: string } };
       if (typeof msg.id === "number") replies.set(msg.id, msg);
@@ -304,13 +389,16 @@ async function liveHarness(gateContext: (params: Record<string, unknown>, store:
     await resolver.close();
     fs.rmSync(root, { recursive: true, force: true });
   };
-  return { service, sidecar, store, gates, calls, recorded, caseId, close };
+  return { service, runtimePaths, sidecar, store, gates, calls, recorded, caseId, close };
 }
 
 async function toIncidentGate(h: Awaited<ReturnType<typeof liveHarness>>) {
   const started = await h.service.startRun({ caseId: h.caseId, dataOrigin: "synthetic", scope: "Investigate the process.", followUps: 0, maxTotalTokens: 100_000 });
   expect(started.activeGate?.gate).toBe("scope");
   expect(started.activeGate?.scopeText).toBe("Investigate the process.");
+  expect(started.activeGate?.scopeHandoff?.step_id).toBe("scope");
+  expect(started.handoffs.filter((handoff) => handoff.step_id === "scope")).toHaveLength(1);
+  expect(started.claims.some((claim) => claim.stepId === "scope")).toBe(true);
   const atIncident = await h.service.submitGateDecision({
     huntId: started.huntId, gate: "scope", action: "approve", operatorName: "x", rbacRole: "incident_commander",
     checkNote: "Reviewed the scope.", payloadSha256: started.activeGate!.payloadSha256,
@@ -321,6 +409,48 @@ async function toIncidentGate(h: Awaited<ReturnType<typeof liveHarness>>) {
 }
 
 describe("F4 end to end through WorkbenchService and the real daemon engine", () => {
+  test("real daemon source outage projects the failed step and permits safe reconciliation", async () => {
+    const h = await liveHarness(() => undefined, true);
+    try {
+      const started = await h.service.startRun({ caseId: h.caseId, dataOrigin: "synthetic", scope: "Investigate the process.", followUps: 0, maxTotalTokens: 100_000 });
+      const run = h.store.getRun(started.huntId)!;
+      const source = run.results.scope!.handoff!;
+      const prior = { ...source, claims: [{ ...source.claims[0]!, statement: "Earlier evt-0000000000000099." }] };
+      const failed = { ...source, step_id: "analysis", claims: [{ ...source.claims[0]!, claim_id: "analysis:c1", statement: `Failed step ${EVT}.` }] };
+      run.reviewed_handoffs.scope = prior;
+      run.results.analysis = { ...run.results.scope!, step_id: "analysis", status: "unknown",
+        reason_code: "citation_source_unavailable", unverified_handoff: failed,
+        citation_receipt: { ...incidentContext().incident.citation_receipt, case_id: run.case_id, verified: false, source_status: "unavailable" } };
+      run.open_gate = { ...run.open_gate!, gate: "reconcile", reason_code: "citation_source_unavailable", unknown_step_id: "analysis" };
+      h.store.saveRun(run);
+      const context = await h.sidecar.request("hunt.gateContext", { run_id: run.run_id }) as {
+        reconcile: { unavailable_sources: string[]; evidence: unknown[]; evidence_truncated: boolean };
+      };
+      expect(context.reconcile.unavailable_sources).toEqual(["events"]);
+      expect(context.reconcile.evidence).toEqual([]);
+      expect(context.reconcile.evidence_truncated).toBe(false);
+      const snapshot = await h.service.getWorkbenchState({ huntId: run.run_id });
+      expect(snapshot.activeGate?.contextError).toBeUndefined();
+      expect(snapshot.activeGate?.reconcileContext?.reasonCode).toBe("citation_source_unavailable");
+      expect(snapshot.citationReceipt.entries.map((entry) => entry.citationId)).toEqual([EVT]);
+      expect(snapshot.citationReceipt.entries[0]?.status).toBe("unresolved");
+      expect(snapshot.citationReceipt.allVerified).toBe(false);
+      expect(snapshot.activeGate?.reconcileContext?.reasonCode === "citation_source_unavailable" &&
+        snapshot.activeGate.reconcileContext.unavailableSources).toEqual(["events"]);
+      expect(missingGateContextReason(snapshot.activeGate!)).toBeNull();
+      await h.service.submitGateDecision({
+        huntId: run.run_id, gate: "reconcile", action: "approve", operatorName: "x", rbacRole: "incident_commander",
+        checkNote: "Reviewed the unavailable source.", payloadSha256: snapshot.activeGate!.payloadSha256,
+        operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
+      });
+      const reconciled = h.store.getRun(run.run_id)!;
+      expect(reconciled.decisions.at(-1)?.action).toBe("approve");
+      expect(reconciled.status).toBe("failed");
+      expect(reconciled.reason_code).toBe("reconciled_halt_required_step");
+    } finally {
+      await h.close();
+    }
+  });
   test("the incident gate shows the real daemon's hunt.gateContext and can be approved", async () => {
     const h = await liveHarness(() => undefined);
     try {
@@ -343,6 +473,39 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
       await h.close();
     }
   });
+  test("completed incident evidence survives approval and a fresh WorkbenchService", async () => {
+    const h = await liveHarness(() => undefined, false, true);
+    try {
+      const incident = await toIncidentGate(h);
+      expect(incident.activeGate?.incidentSummary?.citationReceipt.allVerified).toBe(true);
+      const completed = await h.service.submitGateDecision({
+        huntId: incident.huntId, gate: "incident", action: "approve", operatorName: "x", rbacRole: "incident_commander",
+        checkNote: "Checked the cited process event.", payloadSha256: incident.activeGate!.payloadSha256,
+        operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
+      });
+      const reopenedService = new WorkbenchService({
+        runtimePaths: h.runtimePaths, sidecar: h.sidecar, vault: {} as WorkbenchServiceDeps["vault"],
+      });
+      const reopened = await reopenedService.getWorkbenchState({ huntId: incident.huntId });
+      for (const snapshot of [completed, reopened]) {
+        expect(snapshot.activeGate).toBeNull();
+        expect(snapshot.citationReceipt.allVerified).toBe(true);
+        expect(snapshot.citationReceipt.entries).toEqual([
+          expect.objectContaining({ citationId: "evt-1", kind: "evt", status: "verified" }),
+        ]);
+        expect(snapshot.evidenceCatalog["evt-1"]).toMatchObject({
+          id: "evt-1", kind: "evt", verified: true, fields: { "host.name": "gate-host" },
+        });
+        expect(snapshot.events).toEqual([
+          expect.objectContaining({ eventId: "evt-1", hostName: "gate-host", message: "Process executed." }),
+        ]);
+      }
+      expect(h.calls).toContain("hunt.evidence");
+    } finally {
+      await h.close();
+    }
+  });
+
   test("a truncated context cannot be approved through the service, but can be rejected", async () => {
     const h = await liveHarness((params, store) => {
       const run = store.getRun(String(params.run_id))!;

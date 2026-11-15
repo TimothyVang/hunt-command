@@ -92,9 +92,9 @@ export const GateContextResultSchema = z
           .object({
             reason_code: z.literal("citation_source_unavailable"),
             citation_receipt: DaemonCitationReceiptSchema,
-            unavailable_sources: z.array(z.string()),
+            unavailable_sources: z.array(z.enum(["events", "packets", "intel"])),
             evidence: z.array(EvidenceSchema).max(500),
-            evidence_truncated: z.boolean().optional(),
+            evidence_truncated: z.boolean(),
           })
           .strict(),
       ])
@@ -103,6 +103,14 @@ export const GateContextResultSchema = z
   .strict();
 
 export type GateContextResult = z.infer<typeof GateContextResultSchema>;
+
+const LiveEvidenceResultSchema = z.object({
+  run_id: z.string().min(1),
+  case_id: z.string().min(1),
+  citation_receipt: DaemonCitationReceiptSchema,
+  evidence: z.array(EvidenceSchema).max(500),
+  evidence_truncated: z.boolean(),
+}).strict();
 
 export const LiveTranscriptPageSchema = z
   .object({
@@ -210,8 +218,8 @@ function citedReferences(handoffs: readonly Handoff[]) {
 
 /**
  * Builds the active gate prompt (and incident evidence) from `hunt.status`'s open gate plus the
- * `hunt.gateContext` result. `rawContext` is the RPC result, or the Error the RPC failed with. Scope
- * gates use `statusScopeText` (hunt.status `config.scopeText`, the text the scope digest covers).
+ * `hunt.gateContext` result. `rawContext` is the RPC result, or the Error the RPC failed with.
+ * Scope gates show both the operator's original text and the generated handoff.
  */
 export function projectLiveGate(
   runId: string,
@@ -219,6 +227,7 @@ export function projectLiveGate(
   handoffs: readonly Handoff[],
   rawContext: unknown,
   statusScopeText?: string,
+  reconcileHandoff?: Handoff,
 ): LiveGateProjection {
   const base: ActiveGatePrompt = {
     gate: openGate.gate,
@@ -239,8 +248,10 @@ export function projectLiveGate(
 
   if (openGate.gate === "scope") {
     const text = statusScopeText?.trim() ? statusScopeText : undefined;
+    const scopeHandoff = handoffs.find((h) => h.step_id === "scope");
     if (!text) return fail("hunt.status has no scope text for the open scope gate");
-    return { activeGate: { ...base, scopeText: text }, citationReceipt: null, evidenceCatalog: {}, events: [], citationStatus: new Map() };
+    if (!scopeHandoff) return fail("The scope handoff is unavailable or invalid.");
+    return { activeGate: { ...base, scopeText: text, scopeHandoff }, citationReceipt: null, evidenceCatalog: {}, events: [], citationStatus: new Map() };
   }
 
   if (rawContext instanceof Error) {
@@ -284,16 +295,11 @@ export function projectLiveGate(
     }
     // citation_source_unavailable: the reason itself is the context; show what could and could not be checked.
     if (reconcile.evidence_truncated) return fail("Reconcile evidence is truncated; the full decision context is unavailable.");
-    // While a source is still down the daemon sends no evidence for it, so every cited id it could not
-    // read is listed as unresolved instead of failing closed (the gate exists to decide exactly this).
-    const evidence = [...reconcile.evidence];
-    if (reconcile.unavailable_sources.length > 0) {
-      const have = new Set(evidence.map((e) => e.id));
-      for (const [id, ref] of citedReferences(handoffs)) {
-        if (!have.has(id)) evidence.push({ id, kind: ref.kind, status: "unresolved", timestamp_iso: null, title: "", fields: {} });
-      }
+    if (!reconcileHandoff) return fail("The unverified handoff for the affected step is unavailable.");
+    if (reconcileHandoff.case_id !== ctx.case_id || reconcile.citation_receipt.case_id !== ctx.case_id) {
+      return fail("Reconcile handoff or citation receipt is for a different case.");
     }
-    const projected = projectEvidence(handoffs, evidence, reconcile.evidence_truncated ?? false, reconcile.citation_receipt.verified);
+    const projected = projectEvidence([reconcileHandoff], reconcile.evidence, reconcile.citation_receipt.verified, reconcile.unavailable_sources);
     if (projected.uncovered) {
       return fail(`gate context does not cover cited ids: ${projected.uncovered.slice(0, 5).join(", ")}`);
     }
@@ -320,7 +326,10 @@ export function projectLiveGate(
   if (incident.citation_receipt.source_status !== "ok") {
     return fail(`citation backend unavailable: ${incident.citation_receipt.diagnostic ?? "source_status=unavailable"}`);
   }
-  const projected = projectEvidence(handoffs, incident.evidence, incident.evidence_truncated, incident.citation_receipt.verified);
+  if (incident.citation_receipt.case_id !== ctx.case_id || handoffs.some((h) => h.case_id !== ctx.case_id)) {
+    return fail("Incident handoff or citation receipt is for a different case.");
+  }
+  const projected = projectEvidence(handoffs, incident.evidence, incident.citation_receipt.verified);
   if (projected.uncovered) {
     return fail(`gate context does not cover cited ids: ${projected.uncovered.slice(0, 5).join(", ")}`);
   }
@@ -351,12 +360,37 @@ export function projectLiveGate(
   };
 }
 
+export type LiveEvidenceProjection = Pick<LiveGateProjection, "citationReceipt" | "evidenceCatalog" | "events" | "citationStatus">;
+
+/** Projects completed-run evidence only when its identity and full citation coverage are intact. */
+export function projectLiveEvidence(
+  runId: string,
+  caseId: string,
+  handoffs: readonly Handoff[],
+  raw: unknown,
+): LiveEvidenceProjection | null {
+  const parsed = LiveEvidenceResultSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  const data = parsed.data;
+  if (data.run_id !== runId || data.case_id !== caseId || data.citation_receipt.case_id !== caseId ||
+      data.evidence_truncated || data.citation_receipt.source_status !== "ok") return null;
+  if (handoffs.some((h) => h.case_id !== caseId)) return null;
+  const projected = projectEvidence(handoffs, data.evidence, data.citation_receipt.verified);
+  if (projected.uncovered) return null;
+  return {
+    citationReceipt: projected.receipt,
+    evidenceCatalog: projected.evidenceCatalog,
+    events: projected.events,
+    citationStatus: projected.status,
+  };
+}
+
 /** Citation receipt, evidence catalog and Dissector events from the daemon's evidence entries. */
 function projectEvidence(
   handoffs: readonly Handoff[],
   evidence: z.infer<typeof EvidenceSchema>[],
-  truncated: boolean,
   receiptVerified: boolean,
+  unavailableSources: readonly ("events" | "packets" | "intel")[] = [],
 ):
   | { uncovered: string[] }
   | {
@@ -368,12 +402,13 @@ function projectEvidence(
     } {
   const refs = citedReferences(handoffs);
   const byId = new Map(evidence.map((e) => [e.id, e]));
-  if (!truncated) {
-    const uncovered = [...refs.keys()].filter((id) => !byId.has(id));
-    if (uncovered.length > 0) {
-      return { uncovered };
-    }
-  }
+  const sourceOfKind = { evt: "events", frame: "packets", ioc: "intel" } as const;
+  const unavailable = new Set(unavailableSources);
+  const uncovered = [...refs].filter(([id, ref]) => {
+    const entry = byId.get(id);
+    return entry ? entry.kind !== ref.kind : !unavailable.has(sourceOfKind[ref.kind]);
+  }).map(([id]) => id);
+  if (byId.size !== evidence.length || uncovered.length > 0) return { uncovered };
 
   const status = new Map<string, "verified" | "unresolved" | "out_of_scope">();
   const entries: CitationStatusEntry[] = [];
@@ -427,6 +462,15 @@ function projectEvidence(
       });
     }
   }
+  // The daemon cannot read records from unavailable sources. Represent only the cited IDs
+  // from those sources in the receipt; do not fabricate evidence records or event fields.
+  for (const [id, ref] of refs) {
+    if (byId.has(id)) continue;
+    status.set(id, "unresolved");
+    unresolved++;
+    entries.push({ citationId: id, kind: ref.kind, status: "unresolved", referencedIn: ref.referencedIn });
+  }
+  entries.sort((a, b) => (a.citationId < b.citationId ? -1 : a.citationId > b.citationId ? 1 : 0));
   const receipt: CitationVerificationReceipt = {
     totalCited: entries.length,
     verifiedCount: verified,
