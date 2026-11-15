@@ -31,6 +31,13 @@ export interface StepResultRecord {
   readonly usage?: StepTokenUsage;
   readonly refusal?: ModelRefusalReport;
   readonly diagnostic?: string;
+  /**
+   * Set only on `unknown` / `citation_source_unavailable` results: the validated handoff whose
+   * citations could not be checked, and the unavailable receipt. Never used as a step output;
+   * kept so the reconcile gate can show the operator what is being decided.
+   */
+  readonly unverified_handoff?: Handoff;
+  readonly citation_receipt?: CitationVerificationReceipt;
   readonly finished_at: string;
 }
 
