@@ -167,6 +167,26 @@ describe("Prompt-Injection 128-Bit Nonce Tool Fence & Scrubber", () => {
 });
 
 describe("RoleCapabilityAuthority & hunt_lab_batch Ownership", () => {
+  test("never exposes its HMAC master secret through serialization or reflection", () => {
+    const secret = "synthetic-master-secret-0123456789";
+    const auth = new RoleCapabilityAuthority(secret);
+    const secretHex = Buffer.from(secret, "utf8").toString("hex");
+    const views = [
+      JSON.stringify(auth),
+      JSON.stringify({ ...auth }),
+      JSON.stringify(Object.getOwnPropertyNames(auth).map((k) => (auth as unknown as Record<string, unknown>)[k])),
+      Bun.inspect(auth),
+    ];
+    for (const view of views) {
+      expect(view).not.toContain(secret);
+      expect(view).not.toContain(secretHex);
+      expect(view).not.toContain('"type":"Buffer"');
+    }
+    expect(Object.keys(auth)).toEqual([]);
+    // Still mints verifiable tokens.
+    auth.verifyToken(auth.mint("run-1", "scope", "framework-coordinator"));
+  });
+
   test("enforces HMAC capability token, 403 tool_not_owned, scope delegate_task block, and 405 read_only", () => {
     const auth = new RoleCapabilityAuthority("0123456789abcdef0123456789abcdef");
     const researcherTok = auth.mint("run-1", "evidence", "framework-researcher");

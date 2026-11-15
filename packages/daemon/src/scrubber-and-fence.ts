@@ -245,27 +245,27 @@ export function detectMutatingToolParams(params: Record<string, unknown>): boole
  * so tool execution NEVER trusts an LLM-supplied `profile` argument.
  */
 export class RoleCapabilityAuthority {
-  private readonly masterSecret: Buffer;
+  readonly #masterSecret: Buffer;
 
   constructor(masterSecret?: Buffer | string) {
     if (masterSecret === undefined) {
-      this.masterSecret = crypto.randomBytes(32);
+      this.#masterSecret = crypto.randomBytes(32);
     } else if (typeof masterSecret === "string") {
       if (Buffer.byteLength(masterSecret, "utf8") < 16) {
         throw new Error("RoleCapabilityAuthority masterSecret string must be >= 16 bytes");
       }
-      this.masterSecret = Buffer.from(masterSecret, "utf8");
+      this.#masterSecret = Buffer.from(masterSecret, "utf8");
     } else {
       if (masterSecret.byteLength < 16) {
         throw new Error("RoleCapabilityAuthority masterSecret buffer must be >= 16 bytes");
       }
-      this.masterSecret = Buffer.from(masterSecret);
+      this.#masterSecret = Buffer.from(masterSecret);
     }
   }
 
   private computeMacHex(runId: string, stepId: string, profile: ProfileId): string {
     return crypto
-      .createHmac("sha256", this.masterSecret)
+      .createHmac("sha256", this.#masterSecret)
       .update(`${runId}\0${stepId}\0${profile}`, "utf8")
       .digest("hex");
   }
