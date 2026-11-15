@@ -53,6 +53,62 @@ describe("shared credential scrubber", () => {
     expect(out.host).toBe("workstation-01");
   });
 
+  test("redacts credentials in JSON nested inside strings at any depth up to the cap", () => {
+    const M = "NESTEDLEAK";
+    const inner = JSON.stringify({ user: "a", password: `${M} two words`, access_token: `${M}at` });
+    let wrapped = inner;
+    const shapes: unknown[] = [];
+    // 1..MAX levels of JSON-in-a-string, plus JSON strings inside arrays.
+    for (let level = 1; level <= 8; level++) {
+      shapes.push({ message: wrapped });
+      wrapped = JSON.stringify({ body: wrapped });
+    }
+    shapes.push({ hits: [[inner]] }, [JSON.stringify([inner])]);
+    for (const shape of shapes) {
+      expect(JSON.stringify(scrubSecretValue(shape))).not.toContain(M);
+    }
+    // Non-credential content in an embedded document survives.
+    const out = scrubSecretValue({ message: JSON.stringify({ body: JSON.stringify({ host: "workstation-01", password: "x" }) }) });
+    expect(JSON.parse(JSON.parse(out.message).body)).toEqual({ host: "workstation-01", password: "[REDACTED_SECRET]" });
+  });
+
+  test("redacts credential-named keys whatever the value type", () => {
+    const M = "TYPEDLEAK";
+    const out = JSON.stringify(
+      scrubSecretValue({
+        password: [`${M}hunter2`],
+        client_secret: { value: `${M}cs` },
+        token: [`${M}123456`],
+        api_key: 1234567890123,
+        empty: { password: "" },
+      }),
+    );
+    expect(out).not.toContain(M);
+    expect(out).not.toContain("1234567890123");
+    expect(JSON.parse(out).password).toBe("[REDACTED_SECRET]");
+    expect(JSON.parse(out).empty).toEqual({ password: "" });
+  });
+
+  test("text that only looks like JSON is still scrubbed as text, and deep nesting stays linear", () => {
+    expect(scrubSecretValue("{not json password=synthTextPass}")).not.toContain("synthTextPass");
+    const deep = "[".repeat(200_000) + "]".repeat(200_000);
+    const started = performance.now();
+    scrubSecretValue({ message: deep });
+    let big = JSON.stringify({ password: "x", filler: "y".repeat(1024 * 1024) });
+    for (let i = 0; i < 8; i++) big = JSON.stringify({ body: big });
+    scrubSecretValue({ message: big });
+    expect(performance.now() - started).toBeLessThan(1_500);
+  });
+
+  test("is idempotent: scrubbing scrubbed text changes nothing", () => {
+    const once = scrubSecretText(cases.map(([, input]) => input).join("\n") + "\nCookie: a=b\nX-Api-Key: synthKey");
+    expect(scrubSecretText(once)).toBe(once);
+    const header = "Authorization:" + " ".repeat(1024 * 1024);
+    const started = performance.now();
+    scrubSecretText(header);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
   test("scrubs adversarial 1 MB inputs in linear time", () => {
     const MB = 1024 * 1024;
     const inputs = [
