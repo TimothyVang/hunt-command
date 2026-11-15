@@ -15,6 +15,7 @@ import { z } from "zod";
 import {
   AuthenticatedGateDecisionSchema,
   CaseMetadataSchema,
+  extractInlineCitations,
   HUNT_WAVES,
   HandoffSchema,
   SnapshotSchema,
@@ -23,7 +24,8 @@ import {
   type RuntimePaths,
 } from "@hunt-command/shared";
 import { buildFixtureWorkbenchSnapshot } from "../shared/fixture-workbench.ts";
-import { validateGateSubmission } from "../shared/gate-validation.ts";
+import { missingGateContextReason, validateGateSubmission } from "../shared/gate-validation.ts";
+import { projectLiveGate, projectTranscriptPage } from "./live-gate-context.ts";
 import {
   ExportReportInputSchema,
   FilmCutInputSchema,
@@ -340,6 +342,14 @@ export class WorkbenchService {
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
     if (current.provenanceMode === "live_daemon") {
       if (!parsed.operatorToken?.trim()) throw new Error("An operator token is required for a live gate decision.");
+      if (!current.activeGate || current.activeGate.gate !== parsed.gate) {
+        throw new Error(`No active '${parsed.gate}' gate is currently open for hunt '${parsed.huntId}'.`);
+      }
+      if (parsed.action === "approve") {
+        // Fail closed: never forward an approval for a gate whose decision context is not on screen.
+        const missing = missingGateContextReason(current.activeGate);
+        if (missing) throw new Error(missing);
+      }
       try {
         await this.#deps.sidecar.request("hunt.decideGate", {
           hunt_id: parsed.huntId,
@@ -442,7 +452,13 @@ export class WorkbenchService {
     const current = await this.getWorkbenchState({ huntId: parsed.huntId });
 
     if (current.provenanceMode === "live_daemon") {
-      return await this.#deps.sidecar.request<TranscriptPageSlice>("hunt.inspectTranscriptPage", parsed);
+      const page = await this.#deps.sidecar.request("hunt.inspectTranscriptPage", {
+        run_id: parsed.huntId,
+        step_id: parsed.stepId,
+        byte_offset: parsed.byteOffset,
+        byte_limit: parsed.byteLimit,
+      });
+      return projectTranscriptPage(page, parsed.huntId, parsed.stepId);
     }
 
     const fullText = buildStepTranscriptText(current, parsed.stepId);
@@ -676,6 +692,20 @@ export class WorkbenchService {
       allVerified: receipt?.verified ?? false,
       entries: [],
     };
+    let gate: ReturnType<typeof projectLiveGate> | null = null;
+    if (checked.open_gate) {
+      // Scope text is part of hunt.status (the text the daemon digested); incident and reconcile
+      // context (citations, cited records, dispatch receipts) comes from hunt.gateContext.
+      let rawContext: unknown = null;
+      if (checked.open_gate.gate !== "scope") {
+        try {
+          rawContext = await this.#deps.sidecar.request("hunt.gateContext", { run_id: run.run_id });
+        } catch (error) {
+          rawContext = error instanceof Error ? error : new Error(String(error));
+        }
+      }
+      gate = projectLiveGate(run.run_id, checked.open_gate, handoffs, rawContext, run.config.scopeText);
+    }
     const snapshot: WorkbenchSnapshot = {
       provenanceMode: "live_daemon",
       huntId: run.run_id,
@@ -714,21 +744,21 @@ export class WorkbenchService {
         endedAtIso: result.finished_at,
       })),
       ganttSpans: [],
-      activeGate: run.open_gate ? {
-        gate: checked.open_gate!.gate,
-        huntId: run.run_id,
-        openedAtIso: run.open_gate.opened_at,
-        expiresAtIso: run.open_gate.expires_at,
-        payloadSha256: run.open_gate.payload_sha256,
-        ...(run.open_gate.gate === "scope" ? { scopeText: run.config.scopeText } : {}),
-      } : null,
+      activeGate: gate?.activeGate ?? null,
       gateHistory: run.decisions,
       claims: handoffs.flatMap((handoff) => handoff.claims.map((claim) => ({
         claim,
         stepId: handoff.step_id,
         waveNumber: waveNumber(run.results[handoff.step_id]?.wave ?? run.wave),
         profile: handoff.profile,
-        inlineCitations: [],
+        inlineCitations: (() => {
+          const ex = extractInlineCitations(claim.statement);
+          return [
+            ...ex.event_ids.map((id) => ({ id, kind: "evt" as const })),
+            ...ex.frame_ids.map((id) => ({ id, kind: "frame" as const })),
+            ...ex.ioc_ids.map((id) => ({ id, kind: "ioc" as const })),
+          ].map((c) => ({ ...c, status: gate?.citationStatus.get(c.id) ?? ("unresolved" as const) }));
+        })(),
         reviews: reviews.filter((review) => review.claim_ids.includes(claim.claim_id)),
       }))),
       limitations: handoffs.flatMap((handoff) => handoff.limitations.map((text) => ({
@@ -736,9 +766,9 @@ export class WorkbenchService {
       }))),
       handoffs,
       snapshot: run.snapshot ?? { schema_version: 1, case_id: run.case_id, entities: [], relations: [] },
-      citationReceipt,
+      citationReceipt: gate?.citationReceipt ?? citationReceipt,
       histogram: { bucketTimestampsSec: [], ecsEventCounts: [], networkFlowCounts: [], intervalSec: 60 },
-      events: [], arkimeFlows: [], packets: [], evidenceCatalog: {},
+      events: gate?.events ?? [], arkimeFlows: [], packets: [], evidenceCatalog: gate?.evidenceCatalog ?? {},
       watchState: this.#standbyWatchState(run.run_id),
     };
     this.#liveRunIds.add(run.run_id);

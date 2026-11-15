@@ -125,6 +125,27 @@ export interface GateValidationOutcome {
 }
 
 /**
+ * Why `approve` must be refused because the gate's decision context is not on screen, or `null`.
+ * Fail closed: nobody may approve a gate whose context (scope text or summary, incident citation
+ * summary, reconcile receipt) failed to load or was never provided. Rejecting stays possible.
+ */
+export function missingGateContextReason(activeGate: ActiveGatePrompt): string | null {
+  if (activeGate.contextError) {
+    return `Gate context could not be loaded, so approval is disabled: ${sanitizeSingleLine(activeGate.contextError).slice(0, 300)}`;
+  }
+  if (activeGate.gate === "scope" && !activeGate.scopeText && !activeGate.scopeSummary) {
+    return "Gate 1 scope text is not available, so approval is disabled.";
+  }
+  if (activeGate.gate === "incident" && !activeGate.incidentSummary) {
+    return "Gate 2 incident summary and citations are not available, so approval is disabled.";
+  }
+  if (activeGate.gate === "reconcile" && !activeGate.reconcileContext) {
+    return "Reconcile dispatch receipt is not available, so approval is disabled.";
+  }
+  return null;
+}
+
+/**
  * Validates human Gate 1 (`scope`), Gate 2 (`incident`), and `reconcile` submissions:
  * - Strips bidi/zero-width/ANSI control characters from operator principal and check-note.
  * - Requires `1..1000` chars in `"What did you check?"` (`checkNote`).
@@ -158,6 +179,11 @@ export function validateGateSubmission(
   const expiresMs = Date.parse(activeGate.expiresAtIso);
   if (!Number.isNaN(expiresMs) && nowMs > expiresMs) {
     errors.push("Gate prompt has expired; refresh workbench state to obtain a current gate token.");
+  }
+
+  if (draft.action === "approve") {
+    const missing = missingGateContextReason(activeGate);
+    if (missing) errors.push(missing);
   }
 
   if (

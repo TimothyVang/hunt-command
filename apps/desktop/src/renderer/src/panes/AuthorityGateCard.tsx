@@ -6,7 +6,7 @@ import {
   PROFILE_DISPLAY_TITLES,
   type CaseMetadata,
 } from "@hunt-command/shared";
-import { validateGateSubmission } from "../../../shared/gate-validation.ts";
+import { missingGateContextReason, validateGateSubmission } from "../../../shared/gate-validation.ts";
 import { SafeForensicText } from "../components/SafeForensicText.tsx";
 import type { ActiveGatePrompt } from "../../../shared/workbench-types.ts";
 import type { GateDraftFields } from "../state/workbench-store.ts";
@@ -50,6 +50,8 @@ export function AuthorityGateCard({
     payloadSha256: activeGate.payloadSha256,
     action: "reject",
   });
+
+  const contextMissing = missingGateContextReason(activeGate);
 
   const citationBlocked =
     activeGate.gate === "incident" &&
@@ -338,6 +340,16 @@ export function AuthorityGateCard({
         </div>
       )}
 
+      {contextMissing && (
+        <div
+          role="alert"
+          data-testid="gate-context-unavailable"
+          className="rounded border border-rose-500/70 bg-rose-950/60 px-2.5 py-1.5 text-[11px] font-medium text-rose-200"
+        >
+          {contextMissing} You can still reject this gate.
+        </div>
+      )}
+
       {/* Action Buttons */}
       <div className="flex items-center justify-end gap-2 pt-1">
         <button
@@ -353,7 +365,7 @@ export function AuthorityGateCard({
         <button
           type="button"
           data-testid="gate-approve-button"
-          disabled={!approveValidation.valid || (requiresToken && !operatorToken.trim())}
+          disabled={contextMissing !== null || !approveValidation.valid || (requiresToken && !operatorToken.trim())}
           onClick={() => submit("approve")}
           className="inline-flex items-center gap-1.5 rounded border border-emerald-400/70 bg-emerald-700 px-3.5 py-1.5 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-40 cursor-pointer"
         >

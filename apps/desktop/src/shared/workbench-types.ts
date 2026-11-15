@@ -133,6 +133,11 @@ export interface ActiveGatePrompt {
     };
   };
   reconcileContext?: ReconcileReceiptContext;
+  /**
+   * Set when the gate's decision context (scope text, incident citations and evidence, or reconcile
+   * receipt) could not be loaded. Approval is refused while it is set or the context is absent.
+   */
+  contextError?: string;
 }
 
 export interface EnrichedClaimRow {
