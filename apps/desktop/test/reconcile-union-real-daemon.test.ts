@@ -129,16 +129,11 @@ describe("desktop renders the daemon's real citation_source_unavailable reconcil
         const approve = validateGateSubmission(p.activeGate, {
           operatorName: "a", rbacRole: "lead_hunter", checkNote: "Checked the source status.", payloadSha256: run.open_gate!.payload_sha256, action: "approve",
         });
-        if (rc.affectedStep) {
-          // F17: the daemon named the step, so the card can state the outcome and approval is allowed.
-          expect(rc.affectedStep.stepId).toBe(String(unknownStepId));
-          expect(missingGateContextReason(p.activeGate)).toBeNull();
-          expect(approve.valid).toBe(true);
-        } else {
-          // F17: without the daemon's affected_step the outcome cannot be stated, so approval stays disabled.
-          expect(String(missingGateContextReason(p.activeGate))).toContain("could not be identified");
-          expect(approve.valid).toBe(false);
-        }
+        // F17: the daemon names the affected step and its engine outcome, so approval is allowed.
+        expect(rc.affectedStep?.stepId).toBe(String(unknownStepId));
+        expect(rc.affectedStep?.approveTransition).toBe(rc.affectedStep?.optional ? "reconcile_drop" : "reconcile_halt");
+        expect(missingGateContextReason(p.activeGate)).toBeNull();
+        expect(approve.valid).toBe(true);
       } finally {
         await resolver.close();
       }

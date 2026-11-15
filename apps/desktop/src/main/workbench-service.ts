@@ -27,6 +27,7 @@ import { buildFixtureWorkbenchSnapshot } from "../shared/fixture-workbench.ts";
 import { missingGateContextReason, validateGateSubmission } from "../shared/gate-validation.ts";
 import {
   EVIDENCE_PAGE_LIMIT,
+  RUN_EVIDENCE_PAGE_LIMIT,
   type GateEvidencePaging,
   projectEvidencePage,
   projectEvidenceRecords,
@@ -781,7 +782,8 @@ export class WorkbenchService {
     if (!checked.open_gate && incidentHandoff.success && incidentHandoff.data.step_id === "incident") {
       try {
         const rawEvidence = await this.#deps.sidecar.request("hunt.evidence", { run_id: run.run_id });
-        evidence = projectLiveEvidence(run.run_id, run.case_id, handoffs, rawEvidence);
+        evidence = await projectLiveEvidence(run.run_id, run.case_id, handoffs, rawEvidence, (cursor) =>
+          this.#deps.sidecar.request("hunt.evidencePage", { run_id: run.run_id, cursor, limit: RUN_EVIDENCE_PAGE_LIMIT }));
       } catch {
         // A failed read must not retain stale evidence or claim verified citations.
       }

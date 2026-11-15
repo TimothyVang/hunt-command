@@ -174,11 +174,14 @@ describe("F4: gate approval requires the gate's decision context", () => {
     const open = { ...OPEN, gate: "reconcile" as const };
     const p = projectLiveGate("run-1", open, HANDOFFS, {
       run_id: "run-1", case_id: "c1", gate: "reconcile", payload_sha256: DIGEST,
-      reconcile: { reason_code: "previous_dispatch_unknown", receipts: [{ execution_id: "exec-1", session_id: "sess-1", input_id: "in-1", step_id: "analysis", profile: "framework-coordinator", reserved_at: "2026-11-14T10:00:05Z", reason_code: "previous_dispatch_unknown" }] },
+      reconcile: { reason_code: "previous_dispatch_unknown",
+        affected_step: { step_id: "analysis", profile: "framework-coordinator", wave: "analysis", optional: false, approve_transition: "reconcile_halt", reject_reason_code: "reconcile_rejected" },
+        receipts: [{ execution_id: "exec-1", session_id: "sess-1", input_id: "in-1", step_id: "analysis", profile: "framework-coordinator", reserved_at: "2026-11-14T10:00:05Z", reason_code: "previous_dispatch_unknown" }] },
     });
     expect(p.activeGate.reconcileContext).toEqual({
       executionId: "exec-1", sessionId: "sess-1", inputId: "in-1", stepId: "analysis",
       profile: "framework-coordinator", reservedAtIso: "2026-11-14T10:00:05Z", reasonCode: "previous_dispatch_unknown",
+      affectedStep: { stepId: "analysis", profile: "framework-coordinator", wave: "analysis", optional: false, approveTransition: "reconcile_halt" },
     });
     expect(missingGateContextReason(p.activeGate)).toBeNull();
   });
@@ -219,7 +222,13 @@ describe("F4: gate approval requires the gate's decision context", () => {
         ...(affected_step ? { affected_step } : {}),
       },
     });
-    for (const affected of [undefined, { ...AFFECTED_OPTIONAL, step_id: "other-step" }, { ...AFFECTED_OPTIONAL, approve_transition: "reconcile_halt" }]) {
+    // Missing affected_step: the context itself is invalid (fail closed).
+    const missing = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, ctx(undefined), undefined, HANDOFFS[0]);
+    expect(missing.activeGate.contextError).toBeDefined();
+    expect(validateGateSubmission(missing.activeGate, draft("approve")).valid).toBe(false);
+    expect(validateGateSubmission(missing.activeGate, draft("reject")).valid).toBe(true);
+    // Present but for another step, or inconsistent (optional with a halt transition): step not identified.
+    for (const affected of [{ ...AFFECTED_OPTIONAL, step_id: "other-step" }, { ...AFFECTED_OPTIONAL, approve_transition: "reconcile_halt" }]) {
       const p = projectLiveGate("run-1", { ...OPEN, gate: "reconcile" }, HANDOFFS, ctx(affected), undefined, HANDOFFS[0]);
       expect(p.activeGate.contextError).toBeUndefined();
       expect(String(missingGateContextReason(p.activeGate))).toContain("could not be identified");
@@ -516,25 +525,15 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
         operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
       });
       const rc = snapshot.activeGate?.reconcileContext;
-      if (rc?.reasonCode === "citation_source_unavailable" && rc.affectedStep) {
-        // Daemon names the affected step (F17): analysis is required, so approval halts the run.
-        expect(rc.affectedStep).toMatchObject({ stepId: "analysis", optional: false, approveTransition: "reconcile_halt" });
-        expect(missingGateContextReason(snapshot.activeGate!)).toBeNull();
-        await decide("approve");
-        const reconciled = h.store.getRun(run.run_id)!;
-        expect(reconciled.decisions.at(-1)?.action).toBe("approve");
-        expect(reconciled.status).toBe("failed");
-        expect(reconciled.reason_code).toBe("reconciled_halt_required_step");
-      } else {
-        // Without the daemon's affected_step nobody can say what Approve does (F17): refused, reject still works.
-        expect(String(missingGateContextReason(snapshot.activeGate!))).toContain("could not be identified");
-        await expect(decide("approve")).rejects.toThrow(/could not be identified/);
-        expect(h.store.getRun(run.run_id)!.decisions.some((d) => d.gate === "reconcile")).toBe(false);
-        await decide("reject");
-        const reconciled = h.store.getRun(run.run_id)!;
-        expect(reconciled.status).toBe("failed");
-        expect(reconciled.reason_code).toBe("reconcile_rejected");
-      }
+      if (rc?.reasonCode !== "citation_source_unavailable") throw new Error("expected a citation reconcile");
+      // The daemon names the affected step (F17): analysis is required, so approval halts the run.
+      expect(rc.affectedStep).toEqual({ stepId: "analysis", profile: rc.affectedStep!.profile, wave: rc.affectedStep!.wave, optional: false, approveTransition: "reconcile_halt" });
+      expect(missingGateContextReason(snapshot.activeGate!)).toBeNull();
+      await decide("approve");
+      const reconciled = h.store.getRun(run.run_id)!;
+      expect(reconciled.decisions.at(-1)?.action).toBe("approve");
+      expect(reconciled.status).toBe("failed");
+      expect(reconciled.reason_code).toBe("reconciled_halt_required_step");
     } finally {
       await h.close();
     }
@@ -679,6 +678,29 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
       });
       expect(done.gateHistory.map((d) => `${d.gate}:${d.action}`)).toEqual(["scope:approve", "incident:approve"]);
       expect(h.store.getRun(huntId)!.status).toBe("completed");
+
+      // The completed run has no Load more: every one of its 1,200 records is read through hunt.evidencePage.
+      expect(Object.keys(done.evidenceCatalog)).toHaveLength(1_200);
+      expect(done.events).toHaveLength(1_200);
+      expect([done.citationReceipt.totalCited, done.citationReceipt.allVerified]).toEqual([1_200, true]);
+      expect(h.calls.filter((c) => c === "hunt.evidencePage")).toHaveLength(2);
+
+      // A page that fails, or that does not continue the cited list, leaves no evidence rather than a partial list.
+      const realRequest = h.sidecar.request.bind(h.sidecar);
+      for (const tamper of [
+        async () => { throw new Error("evidence_unavailable"); },
+        async (params: Record<string, unknown>) => {
+          const page = await realRequest("hunt.evidencePage", params) as { evidence: Array<{ id: string }> };
+          return { ...page, evidence: page.evidence.slice(1) };
+        },
+      ]) {
+        (h.sidecar as { request: unknown }).request = (method: string, params?: Record<string, unknown>) =>
+          method === "hunt.evidencePage" ? tamper(params ?? {}) : realRequest(method, params);
+        const broken = await h.service.getWorkbenchState({ huntId });
+        expect(broken.evidenceCatalog).toEqual({});
+        expect(broken.events).toEqual([]);
+        expect(broken.citationReceipt.allVerified).toBe(false);
+      }
     } finally {
       await h.close();
     }

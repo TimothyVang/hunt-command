@@ -232,7 +232,11 @@ describe("WorkbenchService live runs", () => {
       }
       if (method === "hunt.evidence") {
         if (offline) throw new Error("evidence_unavailable");
-        return { run_id: id, case_id: input.caseId, citation_receipt: receipt, evidence: [record], evidence_truncated: false };
+        return {
+          run_id: id, case_id: input.caseId, citation_receipt: receipt,
+          cited: [{ id: record.id, kind: record.kind, status: record.status }],
+          evidence: [record], evidence_total: 1, evidence_next_cursor: null,
+        };
       }
       throw new Error(method);
     };

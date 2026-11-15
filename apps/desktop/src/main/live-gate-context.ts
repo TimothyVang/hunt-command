@@ -50,10 +50,13 @@ const CitedSchema = z
 /** Records arrive in pages of at most this many on hunt.gateContext; hunt.gateEvidencePage returns more. */
 export const FIRST_EVIDENCE_PAGE_MAX = 200;
 export const EVIDENCE_PAGE_LIMIT = 200;
+/** Page size for reading the rest of a completed run's records (the daemon's maximum). */
+export const RUN_EVIDENCE_PAGE_LIMIT = 500;
 
 /**
  * The step a reconcile gate decides, resolved by the daemon exactly as planGateTransition does (F17).
- * Optional on the wire; when it is absent the card cannot say what Approve does, so approval is disabled.
+ * Required on the wire; if it does not match the step the gate is about, the card cannot say what
+ * Approve does, so approval is disabled.
  */
 const AffectedStepSchema = z
   .object({
@@ -129,7 +132,7 @@ export const GateContextResultSchema = z
                   .strict(),
               )
               .min(1),
-            affected_step: AffectedStepSchema.optional(),
+            affected_step: AffectedStepSchema,
           })
           .strict(),
         z
@@ -141,7 +144,7 @@ export const GateContextResultSchema = z
             evidence: z.array(EvidenceSchema).max(FIRST_EVIDENCE_PAGE_MAX),
             evidence_total: z.number().int().nonnegative(),
             evidence_next_cursor: z.string().min(1).nullable(),
-            affected_step: AffectedStepSchema.optional(),
+            affected_step: AffectedStepSchema,
           })
           .strict(),
       ])
@@ -151,12 +154,15 @@ export const GateContextResultSchema = z
 
 export type GateContextResult = z.infer<typeof GateContextResultSchema>;
 
+/** Completed-run evidence (hunt.evidence): the same complete `cited` statuses and paged records as a gate. */
 const LiveEvidenceResultSchema = z.object({
   run_id: z.string().min(1),
   case_id: z.string().min(1),
   citation_receipt: DaemonCitationReceiptSchema,
-  evidence: z.array(EvidenceSchema.extend({ status: z.enum(["verified", "unresolved", "out_of_scope", "ambiguous"]) })).max(500),
-  evidence_truncated: z.boolean(),
+  cited: z.array(CitedSchema.extend({ status: z.enum(["verified", "unresolved", "out_of_scope", "ambiguous"]) })).max(MAX_CITED_IDS),
+  evidence: z.array(EvidenceSchema.extend({ status: z.enum(["verified", "unresolved", "out_of_scope", "ambiguous"]) })).max(FIRST_EVIDENCE_PAGE_MAX),
+  evidence_total: z.number().int().nonnegative(),
+  evidence_next_cursor: z.string().min(1).nullable(),
 }).strict();
 
 export const GateEvidencePageSchema = z
@@ -165,6 +171,16 @@ export const GateEvidencePageSchema = z
     gate: z.enum(["incident", "reconcile"]),
     payload_sha256: z.string().regex(/^[a-f0-9]{64}$/i),
     evidence: z.array(EvidenceSchema).max(500),
+    evidence_total: z.number().int().nonnegative(),
+    evidence_next_cursor: z.string().min(1).nullable(),
+  })
+  .strict();
+
+/** One hunt.evidencePage result: further records of a completed run, in `cited` order. */
+const RunEvidencePageSchema = z
+  .object({
+    run_id: z.string().min(1),
+    evidence: z.array(EvidenceSchema).max(RUN_EVIDENCE_PAGE_LIMIT),
     evidence_total: z.number().int().nonnegative(),
     evidence_next_cursor: z.string().min(1).nullable(),
   })
@@ -498,96 +514,55 @@ export function projectLiveGate(
 
 export type LiveEvidenceProjection = Pick<LiveGateProjection, "citationReceipt" | "evidenceCatalog" | "events" | "citationStatus">;
 
-/** Projects completed-run evidence only when its identity and full citation coverage are intact. */
-export function projectLiveEvidence(
+/**
+ * Projects completed-run evidence only when its identity and full citation coverage are intact.
+ * A completed run has no "Load more": `fetchPage` (hunt.evidencePage) is called until every cited record
+ * is loaded. Each page must continue the complete `cited` list exactly; any failed or mismatched page
+ * yields null, so a partial record list is never shown as the run's evidence.
+ */
+export async function projectLiveEvidence(
   runId: string,
   caseId: string,
   handoffs: readonly Handoff[],
   raw: unknown,
-): LiveEvidenceProjection | null {
+  fetchPage: (cursor: string) => Promise<unknown>,
+): Promise<LiveEvidenceProjection | null> {
   const parsed = LiveEvidenceResultSchema.safeParse(raw);
   if (!parsed.success) return null;
   const data = parsed.data;
   if (data.run_id !== runId || data.case_id !== caseId || data.citation_receipt.case_id !== caseId ||
-      data.evidence_truncated || data.citation_receipt.source_status !== "ok") return null;
+      data.citation_receipt.source_status !== "ok") return null;
   if (handoffs.some((h) => h.case_id !== caseId)) return null;
-  const projected = projectEvidence(handoffs, data.evidence, data.citation_receipt.verified);
-  if (projected.uncovered) return null;
+  if (data.evidence_total !== data.cited.length || checkEvidenceSlice(data.cited, 0, data.evidence)) return null;
+  const records: EvidenceEntry[] = [...data.evidence];
+  let cursor = data.evidence_next_cursor;
+  while (cursor !== null) {
+    let page: z.infer<typeof RunEvidencePageSchema>;
+    try {
+      const result = RunEvidencePageSchema.safeParse(await fetchPage(cursor));
+      if (!result.success) return null;
+      page = result.data;
+    } catch {
+      return null;
+    }
+    // A page with a cursor still open must add records, so the loop ends within `cited.length` records.
+    if (page.run_id !== runId || page.evidence_total !== data.cited.length || page.evidence.length === 0 ||
+        checkEvidenceSlice(data.cited, records.length, page.evidence)) return null;
+    records.push(...page.evidence);
+    cursor = page.evidence_next_cursor;
+  }
+  const projected = projectCitedEvidence(
+    handoffs,
+    { cited: data.cited, evidence: records, evidence_total: data.evidence_total, evidence_next_cursor: null },
+    data.citation_receipt.verified,
+  );
+  if (projected.error !== undefined) return null;
   return {
     citationReceipt: projected.receipt,
     evidenceCatalog: projected.evidenceCatalog,
     events: projected.events,
     citationStatus: projected.status,
   };
-}
-
-/** Citation receipt, evidence catalog and Dissector events from the daemon's evidence entries. */
-function projectEvidence(
-  handoffs: readonly Handoff[],
-  evidence: z.infer<typeof EvidenceSchema>[],
-  receiptVerified: boolean,
-  unavailableSources: readonly ("events" | "packets" | "intel")[] = [],
-):
-  | { uncovered: string[] }
-  | {
-      uncovered?: undefined;
-      receipt: CitationVerificationReceipt;
-      evidenceCatalog: Record<string, EvidenceRecordDetail>;
-      events: DissectorEventRow[];
-      status: Map<string, "verified" | "unresolved" | "out_of_scope">;
-    } {
-  const refs = citedReferences(handoffs);
-  const byId = new Map(evidence.map((e) => [e.id, e]));
-  const sourceOfKind = { evt: "events", frame: "packets", ioc: "intel" } as const;
-  const unavailable = new Set(unavailableSources);
-  const uncovered = [...refs].filter(([id, ref]) => {
-    const entry = byId.get(id);
-    return entry ? entry.kind !== ref.kind : !unavailable.has(sourceOfKind[ref.kind]);
-  }).map(([id]) => id);
-  if (byId.size !== evidence.length || uncovered.length > 0) return { uncovered };
-
-  const status = new Map<string, "verified" | "unresolved" | "out_of_scope">();
-  const entries: CitationStatusEntry[] = [];
-  const evidenceCatalog: Record<string, EvidenceRecordDetail> = {};
-  const events: DissectorEventRow[] = [];
-  let verified = 0;
-  let unresolved = 0;
-  let outOfScope = 0;
-  for (const ev of [...evidence].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-    const s = receiptStatus(ev.status);
-    status.set(ev.id, s);
-    if (s === "verified") verified++;
-    else if (s === "out_of_scope") outOfScope++;
-    else unresolved++;
-    const ref = refs.get(ev.id);
-    entries.push({
-      citationId: ev.id,
-      kind: ev.kind,
-      status: s,
-      referencedIn: ref?.referencedIn ?? [],
-      ...(ev.timestamp_iso ? { timestampIso: ev.timestamp_iso } : {}),
-      ...(ev.title ? { summary: ev.title } : {}),
-    });
-    addRecord(ev, ref, evidenceCatalog, events);
-  }
-  // The daemon cannot read records from unavailable sources. Represent only the cited IDs
-  // from those sources in the receipt; do not fabricate evidence records or event fields.
-  for (const [id, ref] of refs) {
-    if (byId.has(id)) continue;
-    status.set(id, "unresolved");
-    unresolved++;
-    entries.push({ citationId: id, kind: ref.kind, status: "unresolved", referencedIn: ref.referencedIn });
-  }
-  entries.sort((a, b) => (a.citationId < b.citationId ? -1 : a.citationId > b.citationId ? 1 : 0));
-  const receipt: CitationVerificationReceipt = {
-    totalCited: entries.length,
-    verifiedCount: verified,
-    unresolvedCount: unresolved,
-    outOfScopeCount: outOfScope,
-    allVerified: receiptVerified && unresolved === 0 && outOfScope === 0,
-    entries,
-  };
-  return { receipt, evidenceCatalog, events: events.sort((a, b) => a.timestampMs - b.timestampMs), status };
 }
 
 type CitedRef = { kind: "evt" | "frame" | "ioc"; referencedIn: CitationStatusEntry["referencedIn"][number][]; claimIds: Set<string> };
