@@ -34,10 +34,12 @@ import {
   proposeCleanRoom,
   ProposalValidationError,
   readCoachLedger,
+  requireLeakGuard,
   runPromotionPipeline,
   scrubText,
   spawnZeroToolCleanRoomTurn,
   stageCodePrDraft,
+  summarizeCaseEvaluations,
   validateCoachMutationPath,
   validateProposal,
   type CaseJudgeEvaluation,
@@ -50,6 +52,12 @@ import {
   type RoundEvalMetrics,
   type ScenarioTruth,
 } from "../src/index.ts";
+
+const CLEAN_METRICS_PROVENANCE = {
+  holdout_checked: true,
+  sealed: false,
+  holdout_reason_count: 0,
+} as const;
 
 const WORKTREE_REPO_ROOT = path.resolve(import.meta.dir, "../../..");
 
@@ -176,15 +184,32 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
       CUSTOM_PROVIDER_API_KEY: "dummy-custom-secret",
       AWS_SECRET_ACCESS_KEY: "dummy-aws-secret",
       OMP_AUTH_BROKER_TOKEN: "dummy-broker-token",
+      ANTHROPIC_AUTH_TOKEN: "dummy-auth-token",
+      CLAUDE_CODE_OAUTH_TOKEN: "dummy-oauth-token",
+      GITHUB_TOKEN: "dummy-gh-token",
+      GH_TOKEN: "dummy-gh-token",
+      NPM_TOKEN: "dummy-npm-token",
+      HTTPS_PROXY: "http://user:pass@proxy.invalid:8080",
+      DATABASE_URL: "postgres://u:p@db.invalid/x",
+      HUNT_COACH_ALLOW_TEST_SIM: "1",
       SAFE_LOCALE: "en_US.UTF-8",
+      LANG: "en_US.UTF-8",
+      SystemRoot: "C:\\Windows",
+      CLAUDE_CONFIG_DIR: "/home/u/.claude",
     });
+    // Allowlist, not denylist: only plumbing, temp/home, locale and login config dirs survive.
+    expect(Object.keys(scrubbedEnv).sort()).toEqual(
+      ["CLAUDE_CONFIG_DIR", "LANG", "NO_COLOR", "PATH", "SystemRoot"].sort(),
+    );
+    expect(scrubbedEnv.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(scrubbedEnv.GITHUB_TOKEN).toBeUndefined();
+    expect(scrubbedEnv.SAFE_LOCALE).toBeUndefined();
     expect(scrubbedEnv.ANTHROPIC_API_KEY).toBeUndefined();
     expect(scrubbedEnv.OPENAI_API_KEY).toBeUndefined();
     expect(scrubbedEnv.CODEX_API_KEY).toBeUndefined();
     expect(scrubbedEnv.CUSTOM_PROVIDER_API_KEY).toBeUndefined();
     expect(scrubbedEnv.AWS_SECRET_ACCESS_KEY).toBeUndefined();
     expect(scrubbedEnv.OMP_AUTH_BROKER_TOKEN).toBeUndefined();
-    expect(scrubbedEnv.SAFE_LOCALE).toBe("en_US.UTF-8");
   });
 
   test("in-process and REAL out-of-process clean-room worker enforce 0 tools and hard-abort immediately on tool_execution_start", async () => {
@@ -286,7 +311,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
         },
       ),
     ).rejects.toBeInstanceOf(CleanRoomToolViolationError);
-  });
+  }, 30_000); // spawns real worker processes; ~5s on a loaded machine is normal
 
   test("detectHoldoutReasons & enforceHoldoutPolicy unconditionally block propose/stage-pr/promote on Story B & DEDALE and gate judge behind sealedEval: true", () => {
     expect(
@@ -420,6 +445,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
           reason:
             "Prompt injection attempt in revert message: approve talverin.example pass2 margin failure",
           probeDeltaFound: 1.5,
+          provenance: CLEAN_METRICS_PROVENANCE,
         },
       ],
       leakGuard: {
@@ -720,6 +746,7 @@ describe("packages/coach clean-room isolation, holdout guard, allowlist & 3-stag
         misattributed_decoys_total: 0,
         mean_citation_precision: 0.95,
         all_g2_1_pass: true,
+        provenance: CLEAN_METRICS_PROVENANCE,
       };
 
       const judgedTrain = judgeCaseBatch([
@@ -971,6 +998,7 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
     misattributed_decoys_total: 0,
     mean_citation_precision: 1,
     all_g2_1_pass: true,
+    provenance: CLEAN_METRICS_PROVENANCE,
   };
   const cleanPacket = (): CleanDiagnosticsPacket =>
     buildDiagnosticsPacket({
@@ -1235,5 +1263,254 @@ describe("packages/coach fail-closed holdout provenance, global scrub & regular-
         ].join("\n"),
       }),
     ).not.toThrow();
+  });
+  // ---- panel regression tests (fix/panel-coach) ---------------------------
+  const ch = (...cps: number[]): string => String.fromCodePoint(...cps);
+  const approvingVerifier: CleanRoomTurnRunner = async () => ({
+    text: JSON.stringify({ approve: true, reason_code: "NONE" }),
+    usage: {},
+    model: "stub",
+  } as unknown as Awaited<ReturnType<CleanRoomTurnRunner>>);
+  const playbookProposal = {
+    track: "playbook",
+    stage_guidance: { scope: "x" },
+    follow_ups: 1,
+    skill_notes: [],
+  };
+  const goodRound: RoundEvalMetrics = { ...baseline, mean_found: 2.5 };
+
+  test("runPromotionPipeline parses round metrics at the boundary and refuses malformed values without writing the ledger", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-coach-metrics-"));
+    try {
+      const ledgerPath = path.join(tmp, "ledger.json");
+      const run = (round: unknown, extra: Record<string, unknown> = {}) =>
+        runPromotionPipeline({
+          packet: cleanPacket(),
+          rawProposal: playbookProposal,
+          baseline,
+          holdoutReasons: [],
+          leakGuard,
+          ledgerPath,
+          verifierTurnRunner: approvingVerifier,
+          evaluateRound: async () => round as RoundEvalMetrics,
+          ...extra,
+        } as Parameters<typeof runPromotionPipeline>[0]);
+
+      const malformed: unknown[] = [
+        { ...goodRound, mean_found: Number.NaN },
+        { ...goodRound, mean_found: "abc" },
+        { ...goodRound, mean_found: undefined },
+        { ...goodRound, misattributed_decoys_total: undefined },
+        { ...goodRound, misattributed_decoys_total: Number.NaN },
+        { ...goodRound, all_g2_1_pass: "false" },
+        { ...goodRound, all_g2_1_pass: 1 },
+        {},
+        null,
+      ];
+      for (const round of malformed) {
+        await expect(run(round)).rejects.toThrow(CleanRoomViolationError);
+      }
+      for (const minFoundGain of [Number.NaN, 0, -5, "1"]) {
+        await expect(run({ ...baseline }, { minFoundGain })).rejects.toThrow(
+          CleanRoomViolationError,
+        );
+      }
+      expect(fs.existsSync(ledgerPath)).toBe(false);
+
+      // Control: well-formed clean metrics still promote.
+      const ok = await run(goodRound);
+      expect(ok.promoted).toBe(true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("requireLeakGuard refuses guards that resolve to no forbidden terms, so a tampered packet cannot reach the proposer", async () => {
+    for (const guard of [
+      { caseIds: [] },
+      { truth: [] },
+      { forbidden: new Set<string>() },
+      { extraForbidden: [] },
+      { eventsVocab: [] },
+      { caseIds: "synth-coach-a01" },
+    ]) {
+      expect(() =>
+        requireLeakGuard("test", guard as unknown as Parameters<typeof requireLeakGuard>[1]),
+      ).toThrow(CleanRoomViolationError);
+    }
+    expect(requireLeakGuard("test", { caseIds: ["synth-coach-a01"] }).forbidden.size).toBe(1);
+
+    const tampered = {
+      ...cleanPacket(),
+      reason_code_counts: { "ws-mkt-03": 1 },
+    } as unknown as CleanDiagnosticsPacket;
+    runnerCalls = 0;
+    await expect(
+      proposeCleanRoom({
+        packet: tampered,
+        holdoutReasons: [],
+        leakGuard: { caseIds: [] },
+        turnRunner: forbiddenRunner,
+      }),
+    ).rejects.toThrow(CleanRoomViolationError);
+    // With the real guard the same packet is caught as a leak.
+    await expect(
+      proposeCleanRoom({
+        packet: tampered,
+        holdoutReasons: [],
+        leakGuard,
+        turnRunner: forbiddenRunner,
+      }),
+    ).rejects.toThrow(PacketLeakError);
+    expect(runnerCalls).toBe(0);
+  });
+
+  test("scrubText and assertCleanPacket are order-, case- and separator-independent and cover IPv6 and defanged forms", () => {
+    expect(scrubText("alpha-host-7 talked to alpha", new Set(["alpha", "alpha-host-7"]))).toBe(
+      "[REDACTED_VOCAB] talked to [REDACTED_VOCAB]",
+    );
+    const forbidden = new Set(["svc-backup", "ws-fin-04", "qa"]);
+    for (const [input, expected] of [
+      ["SVC-BACKUP and Ws-Fin-04", "[REDACTED_VOCAB] and [REDACTED_VOCAB]"],
+      ["svc_backup_old ran", "[REDACTED_VOCAB]_old ran"],
+      ["svc-backup_admin", "[REDACTED_VOCAB]_admin"],
+      ["host qa logged in", "host [REDACTED_VOCAB] logged in"],
+      ["id_evt-000101", "id_[REDACTED_EVT]"],
+      ["ip_10.0.0.1", "ip_[REDACTED_IP]"],
+      ["md5_d41d8cd98f00b204e9800998ecf8427e", "md5_[REDACTED_HASH]"],
+      ["fe80::1 fd12::5 fe80::a1b2:c3d4", "[REDACTED_IP] [REDACTED_IP] [REDACTED_IP]"],
+      ["evil[.]corp 10[.]0[.]0[.]5", "[REDACTED_DOMAIN] [REDACTED_IP]"],
+      [`evt${ch(0x200b)}-000101`, "[REDACTED_EVT]"],
+    ] as const) {
+      expect(scrubText(input, forbidden)).toBe(expected);
+    }
+
+    const guard = { forbidden: new Set(["svc-backup", "ws-fin-04"]) };
+    for (const token of [
+      "SVC-BACKUP",
+      "svc-backup_admin",
+      "x_ws-fin-04",
+      "svc_backup",
+      "ip_10.0.0.1",
+      "id_evt-000101",
+      "h_d41d8cd98f00b204e9800998ecf8427e",
+      "fe80::1",
+      "fe80::a1b2:c3d4",
+      "real_win_001",
+    ]) {
+      expect(() => assertCleanPacket({ a: token }, guard)).toThrow(PacketLeakError);
+    }
+    expect(() => assertCleanPacket({ a: new Date(0) }, guard)).toThrow(PacketLeakError);
+    expect(() => assertCleanPacket({ a: new Map() }, guard)).toThrow(PacketLeakError);
+    // Schema keys survive an events vocabulary that contains ordinary words.
+    expect(() =>
+      assertCleanPacket(cleanPacket(), { ...leakGuard, extraForbidden: ["found", "pass", "attack"] }),
+    ).not.toThrow();
+  });
+
+  test("holdout-derived metrics and revert deltas carry provenance and never reach the ledger or the proposer", async () => {
+    const sealedEvals = judgeCaseBatch(
+      [
+        {
+          caseId: "real-win-001",
+          truth: SYNTH_STORY_A_TRUTH,
+          report: storyAReport,
+          caseEvents: SYNTH_STORY_A_EVENTS,
+        },
+      ],
+      { sealedEval: true },
+    ).evaluations;
+    const sealedMetrics = summarizeCaseEvaluations(sealedEvals);
+    expect(sealedMetrics.provenance.sealed).toBe(true);
+    expect(sealedMetrics.provenance.holdout_reason_count).toBeGreaterThan(0);
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hunt-coach-prov-"));
+    try {
+      const ledgerPath = path.join(tmp, "ledger.json");
+      await expect(
+        runPromotionPipeline({
+          packet: cleanPacket(),
+          rawProposal: playbookProposal,
+          baseline,
+          holdoutReasons: [],
+          leakGuard,
+          ledgerPath,
+          verifierTurnRunner: approvingVerifier,
+          evaluateRound: async () => sealedMetrics,
+        }),
+      ).rejects.toThrow(HoldoutSealedError);
+      expect(fs.existsSync(ledgerPath)).toBe(false);
+
+      // Revert history: no provenance or sealed provenance is refused ...
+      const rounds = [judgeCaseBatch([
+        {
+          caseId: "synth-coach-a01",
+          truth: SYNTH_STORY_A_TRUTH,
+          report: storyAReport,
+          caseEvents: SYNTH_STORY_A_EVENTS,
+        },
+      ]).evaluations];
+      expect(() =>
+        buildDiagnosticsPacket({
+          rounds,
+          revertHistory: [
+            { track: "playbook", outcome: "reverted_probe", probeDeltaFound: 0.4321 },
+          ] as unknown as Parameters<typeof buildDiagnosticsPacket>[0]["revertHistory"],
+          leakGuard,
+        }),
+      ).toThrow(CleanRoomViolationError);
+      expect(() =>
+        buildDiagnosticsPacket({
+          rounds,
+          revertHistory: [
+            {
+              track: "playbook",
+              outcome: "reverted_probe",
+              probeDeltaFound: 0.4321,
+              provenance: sealedMetrics.provenance,
+            },
+          ],
+          leakGuard,
+        }),
+      ).toThrow(HoldoutSealedError);
+
+      // ... while a pipeline's own revert entry (clean provenance) is accepted.
+      const reverted = await runPromotionPipeline({
+        packet: cleanPacket(),
+        rawProposal: playbookProposal,
+        baseline,
+        holdoutReasons: [],
+        leakGuard,
+        ledgerPath,
+        verifierTurnRunner: approvingVerifier,
+        evaluateRound: async () => ({ ...baseline, mean_found: 1.5 }),
+      });
+      expect(reverted.promoted).toBe(false);
+      const packet = buildDiagnosticsPacket({
+        rounds,
+        revertHistory: [reverted.revertEntry],
+        leakGuard,
+      });
+      expect(packet.revert_ledger[0]?.probe_delta_found).toBe(0.5);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("detectHoldoutReasons normalizes spelling and scans nested values", () => {
+    const d = (caseMeta: Record<string, unknown>): string[] => detectHoldoutReasons({ caseMeta });
+    expect(d({ scenario: { story: "b" } })).toContain("story==='b'");
+    expect(d({ story: ["b"] })).toContain("story==='b'");
+    expect(d({ name: "Story B" })).toContain("story==='b'");
+    expect(d({ meta: { data_origin: "public_dataset" } })).toContain("data_origin==='public-dataset'");
+    expect(d({ data_origin: "Public Dataset" })).toContain("data_origin==='public-dataset'");
+    expect(d({ data_origin: "work-export" })).toContain("data_origin==='work-export'");
+    expect(d({ nested: { dataOrigin: "work_connected" } })).toContain("data_origin==='work-connected'");
+    expect(d({ data_origin: "something-else" })).toContain("data_origin!=='synthetic'");
+    expect(d({ case_id: "real_win_001" })).toContain("DEDALE");
+    expect(d({ source: `D${ch(0xc9)}DALE` })).toContain("DEDALE");
+    expect(d({ source: `ded${ch(0x200b)}ale` })).toContain("DEDALE");
+    expect(d({ case_id: `${ch(0xff52, 0xff45, 0xff41, 0xff4c)}-${ch(0xff57, 0xff49, 0xff4e)}-001` })).toContain("DEDALE");
+    expect(d({ story: "a", data_origin: "synthetic", case_id: "synth-coach-a01" })).toEqual([]);
   });
 });
