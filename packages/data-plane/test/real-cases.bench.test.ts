@@ -50,7 +50,8 @@ function makeTempDir(prefix: string): string {
 
 afterAll(() => {
   for (const dir of tempDirs) {
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Windows refuses to delete a cache file a just-closed SQLite handle still holds; retry briefly.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -414,5 +415,6 @@ describe("Real Case Integration & Latency Benchmarks (dns-lab-001 & lab-med-001)
     console.log(
       `[BENCHMARK] lab-med-001: cold=${coldMs.toFixed(1)}ms, warm=${warmMs.toFixed(2)}ms (<20ms), esSearch=${searchMs.toFixed(2)}ms, arkime=${arkMs.toFixed(2)}ms, packetFields=${pktMs.toFixed(2)}ms, sampleJA4=${firstJa4}`,
     );
-  }, 30_000);
+    // Cold indexing of the 48 MB case is measured, not asserted; it takes ~5 s idle and 30 s+ under load.
+  }, 180_000);
 });
