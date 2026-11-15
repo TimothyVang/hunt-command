@@ -64,6 +64,12 @@ export class WsConnection {
     socket.on("data", (chunk: Buffer) => this.#onData(chunk));
     socket.on("close", () => this.#finish());
     socket.on("error", () => this.#finish());
+    // `http.Server` sockets are half-open (`allowHalfOpen: true`): a client that drops or half-closes
+    // without a close frame only delivers `end`, never `close`. Treat it as a disconnect and finish our side.
+    socket.on("end", () => {
+      this.#finish();
+      socket.end();
+    });
   }
 
   get closed(): boolean {
@@ -209,10 +215,14 @@ export class WsConnection {
   }
 }
 
+/**
+ * Completes the RFC 6455 handshake. The returned connection has NOT consumed `head` yet: wire
+ * `onMessage`/`onClose` first, then call `feed(head)`, so a frame pipelined with the upgrade request
+ * reaches the real listener (and a bad pipelined frame's close reaches the real `onClose`).
+ */
 export function acceptUpgrade(
   req: IncomingMessage,
   socket: Duplex,
-  head: Buffer,
   options: WsOptions,
 ): WsConnection | null {
   const key = req.headers["sec-websocket-key"];
@@ -240,9 +250,7 @@ export function acceptUpgrade(
       "Connection: Upgrade\r\n" +
       `Sec-WebSocket-Accept: ${acceptKey(key)}\r\n\r\n`,
   );
-  const ws = new WsConnection(socket, options);
-  ws.feed(head);
-  return ws;
+  return new WsConnection(socket, options);
 }
 
 export function rejectUpgrade(socket: Duplex, status: number, text: string): void {

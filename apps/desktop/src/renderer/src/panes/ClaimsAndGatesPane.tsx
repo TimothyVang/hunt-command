@@ -7,6 +7,7 @@ import type {
 } from "../../../shared/workbench-types.ts";
 import { SafeForensicText } from "../components/SafeForensicText.tsx";
 import { invokeDesktop } from "../lib/bridge.ts";
+import { buildWatchOpenRequest } from "../lib/watch-open.ts";
 import type { CenterPaneTab, GateDraftFields } from "../state/workbench-store.ts";
 import { AuthorityGateCard } from "./AuthorityGateCard.tsx";
 
@@ -53,7 +54,30 @@ export function ClaimsAndGatesPane({
   const [transcriptPage, setTranscriptPage] = useState<TranscriptPageSlice | null>(null);
   const [byteOffset, setByteOffset] = useState(0);
   const [watchUrlInput, setWatchUrlInput] = useState("http://127.0.0.1:18400/");
+  const [watchError, setWatchError] = useState<string | null>(null);
   const watchViewportRef = useRef<HTMLDivElement | null>(null);
+
+  const handleWatchGo = () => {
+    setWatchError(null);
+    if (!workbench.watchState.enabled) {
+      const built = buildWatchOpenRequest(workbench, watchUrlInput);
+      if (!built.ok) {
+        setWatchError(built.error);
+        return;
+      }
+      void invokeDesktop("watch:open", built.request).then((res) => {
+        if (!res.ok) setWatchError(res.error?.message ?? "Watch session could not be opened");
+      });
+      return;
+    }
+    void invokeDesktop("watch:navigate", {
+      runId: workbench.watchState.runId,
+      role: workbench.watchState.role,
+      url: watchUrlInput,
+    }).then((res) => {
+      if (!res.ok) setWatchError(res.error?.message ?? "Navigation blocked");
+    });
+  };
 
   const citationStatusMap = useMemo(
     () =>
@@ -437,18 +461,18 @@ export function ClaimsAndGatesPane({
               />
               <button
                 type="button"
-                onClick={() => {
-                  void invokeDesktop("watch:navigate", {
-                    runId: workbench.watchState.runId,
-                    role: workbench.watchState.role,
-                    url: watchUrlInput,
-                  });
-                }}
+                onClick={handleWatchGo}
+                data-testid="watch-go"
                 className="rounded border border-cyan-500/50 bg-cyan-950/70 px-3 py-1 text-xs font-medium text-cyan-100 cursor-pointer"
               >
-                Navigate (Pinned 127.0.0.1)
+                {workbench.watchState.enabled ? "Navigate (Pinned 127.0.0.1)" : "Open Fenced Session"}
               </button>
             </div>
+            {watchError && (
+              <div role="alert" className="text-[11px] font-mono text-rose-300">
+                {watchError}
+              </div>
+            )}
 
             <div
               ref={watchViewportRef}

@@ -10,7 +10,33 @@ import { AttackGraphLineagePane } from "./panes/AttackGraphLineagePane.tsx";
 import { ClaimsAndGatesPane } from "./panes/ClaimsAndGatesPane.tsx";
 import { FlightRecorderHeader } from "./panes/FlightRecorderHeader.tsx";
 import { TimelineDissectorPane } from "./panes/TimelineDissectorPane.tsx";
-import { workbenchStore } from "./state/workbench-store.ts";
+import { type WorkbenchConnection, workbenchStore } from "./state/workbench-store.ts";
+
+function WorkbenchUnavailable({
+  connection,
+}: {
+  connection: Exclude<WorkbenchConnection, { kind: "ready" }>;
+}) {
+  return (
+    <div className="flex h-screen w-screen items-center justify-center bg-[#090d16] text-slate-100">
+      {connection.kind === "connecting" ? (
+        <p className="font-mono text-sm text-slate-400" role="status">
+          Connecting to the Hunt Command main process...
+        </p>
+      ) : (
+        <div
+          role="alert"
+          data-testid="workbench-unavailable"
+          className="max-w-xl rounded border border-rose-500/60 bg-rose-950/60 p-4 font-mono text-sm space-y-2"
+        >
+          <p className="font-semibold text-rose-100">Workbench unavailable ({connection.code})</p>
+          <p className="text-rose-200/90">{connection.message}</p>
+          <p className="text-slate-400 text-xs">No hunt data is displayed until the desktop bridge responds.</p>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function App() {
   const ui = useSyncExternalStore(workbenchStore.subscribe, workbenchStore.getState);
@@ -32,6 +58,11 @@ export function App() {
     ).then((res) => {
       if (res.ok && res.data) {
         workbenchStore.setWorkbenchSnapshot(res.data);
+      } else {
+        workbenchStore.setConnectionUnavailable(
+          res.error?.code ?? "WORKBENCH_UNAVAILABLE",
+          res.error?.message ?? "The main process returned no workbench snapshot.",
+        );
       }
     });
 
@@ -162,8 +193,22 @@ export function App() {
     });
   };
 
+  if (ui.connection.kind !== "ready") {
+    return <WorkbenchUnavailable connection={ui.connection} />;
+  }
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#090d16] text-slate-100">
+      {ui.workbench.provenanceMode === "fixture_preview" && (
+        <div
+          role="status"
+          data-testid="fixture-preview-banner"
+          className="px-3 py-1 text-xs font-mono font-semibold border-b shrink-0 bg-amber-950/90 border-amber-500/70 text-amber-100"
+        >
+          FIXTURE PREVIEW: built-in synthetic sample data, not results from a live hunt-daemon run.
+        </div>
+      )}
+
       {/* Pane 1: 8-Wave DAG + Gantt Flight Recorder + Gauges + Global Stop */}
       <FlightRecorderHeader
         workbench={ui.workbench}

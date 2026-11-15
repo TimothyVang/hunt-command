@@ -87,15 +87,22 @@ export const CDP_ERROR_METHOD_NOT_FOUND = -32601;
  * the hub may handle or forward it. `isOpenableUrl` is the session scope's allowed-document check;
  * without it every URL-carrying navigation is refused (fail closed).
  */
+/**
+ * Exact shape of every Chromium DevTools protocol method name (`Domain.method`, case-sensitive).
+ * Anything else (`io.read`, `Page.printToPDF `, a trailing NUL, `Page..x`) is refused before the
+ * allow/deny tables are consulted, so a near-miss spelling can never slip past an exact-match deny entry.
+ */
+export const CDP_METHOD_NAME_RE = /^[A-Z][A-Za-z]+\.[a-z][A-Za-z]+$/;
+
 export function deniedSessionCommand(
   method: string,
   params: Record<string, unknown> | undefined,
   isOpenableUrl?: (url: string) => boolean,
 ): string | null {
-  const dot = method.indexOf(".");
-  if (dot <= 0) {
-    return `'${method}' is not a valid CDP method`;
+  if (typeof method !== "string" || !CDP_METHOD_NAME_RE.test(method)) {
+    return `'${String(method).slice(0, 80)}' is not a valid CDP method`;
   }
+  const dot = method.indexOf(".");
   const domain = method.slice(0, dot);
 
   if (domain === "Target") {

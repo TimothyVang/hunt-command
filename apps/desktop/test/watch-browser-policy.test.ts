@@ -47,8 +47,32 @@ describe("Hardened Watch Browser request policy, proxy blackhole & CDP filter (#
     const proxy = buildWatchProxyConfig(TEST_SCOPE);
     expect(proxy.proxyRules).toBe("http://127.0.0.1:1");
     expect(proxy.proxyBypassRules).toBe(
-      "127.0.0.1:18400;127.0.0.1:18401;127.0.0.1:15601;<-loopback>",
+      "<-loopback>;127.0.0.1:18400;127.0.0.1:18401;127.0.0.1:15601",
     );
+
+    // Chromium (net/base/scheme_host_port_matcher.cc) evaluates bypass rules in REVERSE order and the
+    // first hit wins, so later rules override earlier ones; with no hit, loopback is implicitly bypassed.
+    // `<-loopback>` answers "do not bypass" for loopback hosts.
+    const routes = (bypassRules: string, url: string): "DIRECT" | "PROXY" => {
+      const u = new URL(url);
+      const port = u.port || (u.protocol === "https:" ? "443" : "80");
+      const loopback = u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "[::1]";
+      for (const rule of bypassRules.split(";").reverse()) {
+        if (rule === "<-loopback>") {
+          if (loopback) return "PROXY";
+        } else if (rule === `${u.hostname}:${port}`) {
+          return "DIRECT";
+        }
+      }
+      return loopback ? "DIRECT" : "PROXY";
+    };
+    const rules = proxy.proxyBypassRules;
+    expect(routes(rules, "http://127.0.0.1:18400/")).toBe("DIRECT");
+    expect(routes(rules, "http://127.0.0.1:18401/api/sessions")).toBe("DIRECT");
+    expect(routes(rules, "http://127.0.0.1:15601/app/discover")).toBe("DIRECT");
+    expect(routes(rules, "http://127.0.0.1:18402/")).toBe("PROXY");
+    expect(routes(rules, "http://localhost:18400/")).toBe("PROXY");
+    expect(routes(rules, "https://example.invalid/")).toBe("PROXY");
   });
 
   test("documentAllowed permits only lab, Arkime, about:blank, and Kibana /app/discover", () => {

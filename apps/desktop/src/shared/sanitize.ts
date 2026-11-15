@@ -129,8 +129,12 @@ const FORENSIC_TOKEN_RE = new RegExp(
     "(\\b(?:(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)(?::\\d{1,5})?\\b)",
     "(\\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+(?:com|net|org|io|dev|app|cloud|gov|mil|edu|info|biz|xyz|top|ru|cn|ir|kp|uk|de|fr|nl|co|me|ai|test|example|invalid|localhost|local|internal|corp|lan)\\b)",
   ].join("|"),
-  "g",
+  // Case-insensitive: schemes and hostnames are case-insensitive, so `HTTPS://EVIL.EXAMPLE/Y`,
+  // `hTtP://Evil.Example/y`, and `WWW.EVIL.EXAMPLE` must be defanged like their lowercase forms.
+  "gi",
 );
+
+const CITATION_ID_RE = /^(?:evt-[A-Za-z0-9_-]+|frame-\d+|ioc-\d+)$/;
 
 function trimTrailingPunctuation(token: string): { core: string; trailing: string } {
   let end = token.length;
@@ -179,7 +183,7 @@ export function tokenizeForensicText(rawInput: string): ForensicTextToken[] {
     }
 
     const fullMatch = match[0];
-    if (match[1] !== undefined) {
+    if (match[1] !== undefined && CITATION_ID_RE.test(match[1])) {
       const id = match[1];
       const citationKind: CitationKind = id.startsWith("evt-")
         ? "evt"
@@ -187,6 +191,13 @@ export function tokenizeForensicText(rawInput: string): ForensicTextToken[] {
           ? "frame"
           : "ioc";
       tokens.push({ kind: "citation", id, citationKind });
+      cursor = matchIndex + fullMatch.length;
+      continue;
+    }
+
+    if (match[1] !== undefined) {
+      // Upper/mixed-case `EVT-*` etc. is not a provenance citation; keep it as plain text.
+      pushText(fullMatch);
       cursor = matchIndex + fullMatch.length;
       continue;
     }

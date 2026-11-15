@@ -4,7 +4,7 @@
  * Modified for Hunt Command v2 (#178 G1.3, #189):
  * - Uses ephemeral non-persistent partition `session.fromPartition("hunt-watch:${runId}:${role}", { cache: false })`
  *   eliminating cross-case cookie, cache, and storage leakage.
- * - Sets loopback blackhole proxy (`127.0.0.1:1` + `<allowed 127.0.0.1:ports>;<-loopback>`) before navigation.
+ * - Sets loopback blackhole proxy (`127.0.0.1:1` + `<-loopback>;<allowed 127.0.0.1:ports>`) before navigation.
  * - Attaches main-process `webContents.debugger` and enforces `Fetch.enable` (`decideWatchRequest` +
  *   `sanitizeWatchRequestHeaders`) on both the root page and all attached child targets.
  * - Denies all popups (`setWindowOpenHandler`), downloads (`will-download`), permissions, and out-of-scope navigations.
@@ -57,6 +57,7 @@ export class WatchBrowserController {
   #partition = "hunt-watch:standby:framework-researcher";
   #blockedRequestCount = 0;
   #lastBlockedReason: string | null = null;
+  #resetPending = false;
 
   constructor(options: WatchBrowserControllerOptions) {
     this.#win = options.window;
@@ -155,13 +156,22 @@ export class WatchBrowserController {
         this.#recordBlock("frame_navigation_outside_scope");
       }
     });
-    // Backstop for loads that skip the `will-*` events (CDP `Page.navigate`, history, browser-initiated):
-    // any main- or sub-frame navigation outside scope halts loading and resets the view to about:blank.
+    // Backstop for loads that skip the `will-*` events (CDP `Page.navigate`, history, browser-initiated).
+    // It must never touch the navigation synchronously: calling `wc.stop()` + `loadURL()` from inside
+    // `did-start-navigation` re-enters Chromium's NavigationRequest and crashed the main process (exit 139).
+    // Network loads outside scope are already failed by the `Fetch.enable` fence (`BlockedByClient`), and
+    // renderer-initiated sub-frame loads are cancelled by `will-frame-navigate`; a sub-frame is therefore
+    // only recorded here. An out-of-scope MAIN-frame document (e.g. `data:`/`file:` that the network fence
+    // never sees) is replaced with about:blank on a later macrotask, once Chromium has finished dispatching.
     wc.on("did-start-navigation", (details) => {
-      if (!documentAllowed(scope, details.url)) {
-        this.#recordBlock("navigation_outside_scope");
-        wc.stop();
-        void wc.loadURL("about:blank").catch(() => {});
+      if (details.isSameDocument || documentAllowed(scope, details.url)) {
+        return;
+      }
+      this.#recordBlock(
+        details.isMainFrame ? "navigation_outside_scope" : "frame_navigation_outside_scope",
+      );
+      if (details.isMainFrame) {
+        this.#scheduleBlankReset(wc);
       }
     });
 
@@ -370,6 +380,16 @@ export class WatchBrowserController {
       },
       send: (method, params, sessionId) => wc.debugger.sendCommand(method, params, sessionId),
     };
+  }
+
+  #scheduleBlankReset(wc: Electron.WebContents): void {
+    if (this.#resetPending) return;
+    this.#resetPending = true;
+    setTimeout(() => {
+      this.#resetPending = false;
+      if (wc.isDestroyed() || this.#view?.webContents !== wc) return;
+      void wc.loadURL("about:blank").catch(() => {});
+    }, 0);
   }
 
   #recordBlock(reason: string): void {

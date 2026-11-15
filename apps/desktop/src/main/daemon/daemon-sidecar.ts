@@ -6,6 +6,10 @@
  *   stripped paid API keys) speaking JSON-RPC 2.0 (`RpcRequestSchema` / `RpcResponseSchema` /
  *   `RpcEventNotificationSchema`) over stdio NDJSON.
  * - Relays streaming `hunt.event` notifications through the 33ms `EventBatcher`.
+ * - Reports `ready` only after the child answers `daemon.ping`. A child that exits (or stays silent)
+ *   before its first ping is a deterministic startup failure (bad arguments, missing data plane, held
+ *   runtime lock): the sidecar goes `failed` with the daemon's stderr and does NOT restart-loop.
+ *   Only a daemon that was serving and then died is restarted with exponential backoff.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import {
@@ -57,7 +61,11 @@ export interface HuntDaemonSidecarOptions {
   onEvent?: (notification: RpcEventNotification["params"]) => void;
   onStatusChanged?: (status: DaemonHealthStatus) => void;
   rpcTimeoutMs?: number;
+  /** How long a freshly spawned daemon may take to answer `daemon.ping` (default 30s). */
+  readyTimeoutMs?: number;
 }
+
+const STDERR_TAIL_LINES = 6;
 
 export class HuntDaemonSidecar {
   readonly #opts: HuntDaemonSidecarOptions;
@@ -74,6 +82,8 @@ export class HuntDaemonSidecar {
   #closing = false;
   #reqSeq = 0;
   #generation = 0;
+  #readyGeneration = -1;
+  #stderrTail: string[] = [];
 
   constructor(options: HuntDaemonSidecarOptions) {
     this.#opts = options;
@@ -111,15 +121,19 @@ export class HuntDaemonSidecar {
 
     const gen = ++this.#generation;
     const env = buildDaemonChildEnv(process.env, this.#opts.runtimeRootDir, launch.piNativesDir);
+    this.#stderrTail = [];
 
     try {
       const child = this.#spawn(launch.command, launch.args, this.#opts.runtimeRootDir, env);
       this.#child = child;
-      this.#status = "ready";
+      this.#status = "starting";
       this.#lastError = null;
-      this.#log.info(`Spawned hunt-daemon pid=${child.pid ?? "?"} (${launch.source})`);
+      this.#log.info(
+        `Spawned hunt-daemon pid=${child.pid ?? "?"} (${launch.source}) args=${JSON.stringify(launch.args)}`,
+      );
       this.#wireChild(child, gen);
       this.#emitStatus();
+      void this.#awaitReady(child, gen);
     } catch (err) {
       this.#status = "failed";
       this.#lastError = err instanceof Error ? err.message : String(err);
@@ -180,6 +194,49 @@ export class HuntDaemonSidecar {
     if (!child || this.#status !== "ready") {
       return Promise.reject(new Error(`hunt-daemon is not ready (status=${this.#status})`));
     }
+    return this.#send<T>(child, method, params, this.#opts.rpcTimeoutMs ?? 30_000);
+  }
+
+  async #awaitReady(child: DaemonProcess, gen: number): Promise<void> {
+    const timeoutMs = this.#opts.readyTimeoutMs ?? 30_000;
+    try {
+      await this.#send(child, "daemon.ping", undefined, timeoutMs);
+    } catch (err) {
+      if (gen !== this.#generation || this.#closing) return;
+      // Still running but not answering: a startup failure, not a crash worth restarting.
+      this.#generation += 1;
+      this.#child = null;
+      this.#failStartup(`did not answer daemon.ping (${err instanceof Error ? err.message : String(err)})`);
+      try {
+        child.kill();
+      } catch {
+        // Already gone.
+      }
+      return;
+    }
+    if (gen !== this.#generation || this.#closing) return;
+    this.#readyGeneration = gen;
+    this.#status = "ready";
+    this.#lastError = null;
+    this.#log.info(`hunt-daemon pid=${child.pid ?? "?"} answered daemon.ping; serving`);
+    this.#emitStatus();
+  }
+
+  #failStartup(reason: string): void {
+    const stderr = this.#stderrTail.join(" | ");
+    this.#status = "failed";
+    this.#lastError = `startup failed: ${reason}${stderr ? `; stderr: ${stderr}` : ""}`;
+    this.#rejectAllPending(new Error(`hunt-daemon ${this.#lastError}`));
+    this.#log.error(`hunt-daemon ${this.#lastError} (not restarting; use daemon:restart after fixing)`);
+    this.#emitStatus();
+  }
+
+  #send<T>(
+    child: DaemonProcess,
+    method: string,
+    params: Record<string, unknown> | undefined,
+    timeoutMs: number,
+  ): Promise<T> {
     const id = ++this.#reqSeq;
     const frame: RpcRequest = {
       jsonrpc: "2.0",
@@ -188,7 +245,6 @@ export class HuntDaemonSidecar {
       ...(params ? { params } : {}),
     };
 
-    const timeoutMs = this.#opts.rpcTimeoutMs ?? 30_000;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
@@ -228,6 +284,13 @@ export class HuntDaemonSidecar {
       const text = chunk.toString("utf8").trim();
       if (text.length > 0) {
         this.#log.warn(`stderr: ${text.slice(0, 300)}`);
+        if (gen === this.#generation) {
+          for (const line of text.split(/\r?\n/)) {
+            if (line.trim().length === 0) continue;
+            this.#stderrTail.push(line.trim().slice(0, 300));
+          }
+          this.#stderrTail = this.#stderrTail.slice(-STDERR_TAIL_LINES);
+        }
       }
     });
 
@@ -282,6 +345,13 @@ export class HuntDaemonSidecar {
     }
     this.#generation += 1;
     this.#child = null;
+
+    if (this.#readyGeneration !== gen) {
+      // Never served: deterministic startup failure. Surface it instead of restart-looping.
+      this.#failStartup(`${reason} before answering daemon.ping`);
+      return;
+    }
+
     this.#lastError = reason;
     this.#rejectAllPending(new Error(`hunt-daemon ${reason}`));
 
