@@ -28,6 +28,7 @@ export interface ClaimsAndGatesPaneProps {
   onSelectStep: (stepId: string) => void;
   onUpdateGateDraft: (patch: Partial<GateDraftFields>) => void;
   onSubmitGateDecision: (action: "approve" | "reject", operatorToken?: string) => void;
+  onLoadMoreEvidence?: () => Promise<string | null>;
 }
 
 const CLAIM_KIND_BADGE: Record<ClaimKind, string> = {
@@ -53,6 +54,7 @@ export function ClaimsAndGatesPane({
   onSelectStep,
   onUpdateGateDraft,
   onSubmitGateDecision,
+  onLoadMoreEvidence,
 }: ClaimsAndGatesPaneProps) {
   const [transcriptView, setTranscriptView] = useState<TranscriptView>({ kind: "loading" });
   const transcriptPage = transcriptView.kind === "page" ? transcriptView.page : null;
@@ -233,6 +235,7 @@ export function ClaimsAndGatesPane({
                 onUpdateDraft={onUpdateGateDraft}
                 onSubmitDecision={onSubmitGateDecision}
                 onSelectCitation={onSelectCitation}
+                onLoadMoreEvidence={onLoadMoreEvidence}
               />
             ) : (
               <div className="rounded border border-emerald-500/40 bg-emerald-950/25 p-4 text-xs text-emerald-200">

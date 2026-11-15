@@ -8,6 +8,7 @@
 import { z } from "zod";
 import {
   extractInlineCitations,
+  HUNT_WAVES,
   ProfileIdSchema,
   type Handoff,
   type ProfileId,
@@ -38,11 +39,51 @@ const DaemonCitationReceiptSchema = z
   })
   .passthrough();
 
+const CitedStatusSchema = z.enum(["verified", "unresolved", "out_of_scope", "ambiguous", "unchecked"]);
+
+/** Every distinct cited id with its status: complete, so approval coverage never depends on record pages. */
+export const MAX_CITED_IDS = 20_000;
+const CitedSchema = z
+  .object({ id: z.string().min(1).max(256), kind: z.enum(["evt", "frame", "ioc"]), status: CitedStatusSchema })
+  .strict();
+
+/** Records arrive in pages of at most this many on hunt.gateContext; hunt.gateEvidencePage returns more. */
+export const FIRST_EVIDENCE_PAGE_MAX = 200;
+export const EVIDENCE_PAGE_LIMIT = 200;
+
+/**
+ * The step a reconcile gate decides, resolved by the daemon exactly as planGateTransition does (F17).
+ * Optional on the wire; when it is absent the card cannot say what Approve does, so approval is disabled.
+ */
+const AffectedStepSchema = z
+  .object({
+    step_id: z.string().min(1),
+    profile: ProfileIdSchema,
+    wave: z.enum(HUNT_WAVES),
+    optional: z.boolean(),
+    approve_transition: z.enum(["reconcile_drop", "reconcile_halt"]),
+    reject_reason_code: z.literal("reconcile_rejected"),
+  })
+  .strict();
+
+function projectAffectedStep(raw: z.infer<typeof AffectedStepSchema> | undefined, expectedStepId?: string) {
+  if (!raw) return undefined;
+  if (expectedStepId !== undefined && raw.step_id !== expectedStepId) return undefined;
+  if ((raw.approve_transition === "reconcile_drop") !== raw.optional) return undefined;
+  return {
+    stepId: raw.step_id,
+    profile: raw.profile as ProfileId,
+    wave: raw.wave,
+    optional: raw.optional,
+    approveTransition: raw.approve_transition,
+  };
+}
+
 const EvidenceSchema = z
   .object({
     id: z.string().min(1).max(256),
     kind: z.enum(["evt", "frame", "ioc"]),
-    status: z.enum(["verified", "unresolved", "out_of_scope", "ambiguous"]),
+    status: CitedStatusSchema,
     timestamp_iso: z.string().nullable(),
     title: z.string().max(4096),
     fields: z.record(FieldValueSchema),
@@ -59,8 +100,10 @@ export const GateContextResultSchema = z
     incident: z
       .object({
         citation_receipt: DaemonCitationReceiptSchema,
-        evidence: z.array(EvidenceSchema).max(500),
-        evidence_truncated: z.boolean(),
+        cited: z.array(CitedSchema).max(MAX_CITED_IDS),
+        evidence: z.array(EvidenceSchema).max(FIRST_EVIDENCE_PAGE_MAX),
+        evidence_total: z.number().int().nonnegative(),
+        evidence_next_cursor: z.string().min(1).nullable(),
       })
       .strict()
       .optional(),
@@ -86,6 +129,7 @@ export const GateContextResultSchema = z
                   .strict(),
               )
               .min(1),
+            affected_step: AffectedStepSchema.optional(),
           })
           .strict(),
         z
@@ -93,8 +137,11 @@ export const GateContextResultSchema = z
             reason_code: z.literal("citation_source_unavailable"),
             citation_receipt: DaemonCitationReceiptSchema,
             unavailable_sources: z.array(z.enum(["events", "packets", "intel"])),
-            evidence: z.array(EvidenceSchema).max(500),
-            evidence_truncated: z.boolean(),
+            cited: z.array(CitedSchema).max(MAX_CITED_IDS),
+            evidence: z.array(EvidenceSchema).max(FIRST_EVIDENCE_PAGE_MAX),
+            evidence_total: z.number().int().nonnegative(),
+            evidence_next_cursor: z.string().min(1).nullable(),
+            affected_step: AffectedStepSchema.optional(),
           })
           .strict(),
       ])
@@ -108,9 +155,81 @@ const LiveEvidenceResultSchema = z.object({
   run_id: z.string().min(1),
   case_id: z.string().min(1),
   citation_receipt: DaemonCitationReceiptSchema,
-  evidence: z.array(EvidenceSchema).max(500),
+  evidence: z.array(EvidenceSchema.extend({ status: z.enum(["verified", "unresolved", "out_of_scope", "ambiguous"]) })).max(500),
   evidence_truncated: z.boolean(),
 }).strict();
+
+export const GateEvidencePageSchema = z
+  .object({
+    run_id: z.string().min(1),
+    gate: z.enum(["incident", "reconcile"]),
+    payload_sha256: z.string().regex(/^[a-f0-9]{64}$/i),
+    evidence: z.array(EvidenceSchema).max(500),
+    evidence_total: z.number().int().nonnegative(),
+    evidence_next_cursor: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export type CitedEntry = z.infer<typeof CitedSchema>;
+export type EvidenceEntry = z.infer<typeof EvidenceSchema>;
+
+/** Main-process paging state for a gate's cited records (the cursor never reaches the renderer). */
+export interface GateEvidencePaging {
+  readonly runId: string;
+  readonly gate: "incident" | "reconcile";
+  readonly payloadSha256: string;
+  readonly cited: readonly CitedEntry[];
+  loaded: number;
+  nextCursor: string | null;
+}
+
+/**
+ * Checks that `evidence` is exactly the next slice of `cited` starting at `offset` (same ids, kinds and
+ * statuses, in order). Returns an error message, or null when it is a faithful continuation.
+ */
+function checkEvidenceSlice(cited: readonly CitedEntry[], offset: number, evidence: readonly EvidenceEntry[]): string | null {
+  if (offset + evidence.length > cited.length) return "evidence page runs past the cited list";
+  for (let i = 0; i < evidence.length; i++) {
+    const c = cited[offset + i]!;
+    const e = evidence[i]!;
+    if (c.id !== e.id || c.kind !== e.kind || c.status !== e.status) {
+      return `evidence record ${e.id} does not match cited entry ${offset + i} (${c.id})`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Validates one hunt.gateEvidencePage result against the paging state and returns its records. Throws on
+ * any mismatch (other run, gate or digest, out-of-order or altered records), so a page is never merged
+ * unless it continues the complete `cited` list exactly.
+ */
+export function projectEvidencePage(raw: unknown, paging: GateEvidencePaging): { records: EvidenceEntry[]; nextCursor: string | null } {
+  const page = GateEvidencePageSchema.parse(raw);
+  if (page.run_id !== paging.runId || page.gate !== paging.gate || page.payload_sha256.toLowerCase() !== paging.payloadSha256.toLowerCase()) {
+    throw new Error("Evidence page is for a different run, gate or gate digest; refresh the gate.");
+  }
+  if (page.evidence_total !== paging.cited.length) throw new Error("Evidence page total does not match the cited list.");
+  const err = checkEvidenceSlice(paging.cited, paging.loaded, page.evidence);
+  if (err) throw new Error(`Evidence page rejected: ${err}.`);
+  if (page.evidence.length === 0 && page.evidence_next_cursor !== null) throw new Error("Evidence page is empty but claims more pages.");
+  if (page.evidence_next_cursor === null && paging.loaded + page.evidence.length !== paging.cited.length) {
+    throw new Error("Evidence pages ended before every cited record was returned.");
+  }
+  return { records: page.evidence, nextCursor: page.evidence_next_cursor };
+}
+
+/** Projects additional records into catalog entries and Dissector events (statuses come from `cited`). */
+export function projectEvidenceRecords(handoffs: readonly Handoff[], records: readonly EvidenceEntry[]): {
+  evidenceCatalog: Record<string, EvidenceRecordDetail>;
+  events: DissectorEventRow[];
+} {
+  const refs = citedReferences(handoffs);
+  const evidenceCatalog: Record<string, EvidenceRecordDetail> = {};
+  const events: DissectorEventRow[] = [];
+  for (const ev of records) addRecord(ev, refs.get(ev.id), evidenceCatalog, events);
+  return { evidenceCatalog, events };
+}
 
 export const LiveTranscriptPageSchema = z
   .object({
@@ -175,6 +294,8 @@ export interface LiveGateProjection {
   events: DissectorEventRow[];
   /** Per-citation status, for claim rows' inline citation chips. */
   citationStatus: ReadonlyMap<string, "verified" | "unresolved" | "out_of_scope">;
+  /** Main-process-only state for loading further record pages (never sent to the renderer). */
+  pagingState?: GateEvidencePaging;
 }
 
 function fieldText(fields: Record<string, unknown>, ...keys: string[]): string {
@@ -285,6 +406,10 @@ export function projectLiveGate(
             reservedAtIso: receipt!.reserved_at,
             reasonCode: "previous_dispatch_unknown",
             ...(rest.length > 0 ? { additionalReceiptCount: rest.length } : {}),
+            ...(() => {
+              const affected = projectAffectedStep(reconcile.affected_step, receipt!.step_id);
+              return affected ? { affectedStep: affected } : {};
+            })(),
           },
         },
         citationReceipt: null,
@@ -294,51 +419,58 @@ export function projectLiveGate(
       };
     }
     // citation_source_unavailable: the reason itself is the context; show what could and could not be checked.
-    if (reconcile.evidence_truncated) return fail("Reconcile evidence is truncated; the full decision context is unavailable.");
     if (!reconcileHandoff) return fail("The unverified handoff for the affected step is unavailable.");
     if (reconcileHandoff.case_id !== ctx.case_id || reconcile.citation_receipt.case_id !== ctx.case_id) {
       return fail("Reconcile handoff or citation receipt is for a different case.");
     }
-    const projected = projectEvidence([reconcileHandoff], reconcile.evidence, reconcile.citation_receipt.verified, reconcile.unavailable_sources);
-    if (projected.uncovered) {
-      return fail(`gate context does not cover cited ids: ${projected.uncovered.slice(0, 5).join(", ")}`);
-    }
+    const projected = projectCitedEvidence([reconcileHandoff], reconcile, reconcile.citation_receipt.verified);
+    if (projected.error !== undefined) return fail(projected.error);
     return {
       activeGate: {
         ...base,
+        evidencePaging: projected.paging,
         reconcileContext: {
           reasonCode: "citation_source_unavailable",
           unavailableSources: reconcile.unavailable_sources,
           citationReceipt: projected.receipt,
+          ...(() => {
+            const affected = projectAffectedStep(reconcile.affected_step, reconcileHandoff.step_id);
+            return affected ? { affectedStep: affected } : {};
+          })(),
         },
       },
       citationReceipt: projected.receipt,
       evidenceCatalog: projected.evidenceCatalog,
       events: projected.events,
       citationStatus: projected.status,
+      pagingState: {
+        runId, gate: "reconcile", payloadSha256: ctx.payload_sha256, cited: reconcile.cited,
+        loaded: reconcile.evidence.length, nextCursor: reconcile.evidence_next_cursor,
+      },
     };
   }
 
   const incident = ctx.incident;
   if (!incidentHandoff) return fail("The incident handoff is unavailable.");
   if (!incident) return fail("incident gate context has no citation receipt or evidence");
-  if (incident.evidence_truncated) return fail("Incident evidence is truncated; the full decision context is unavailable.");
   if (incident.citation_receipt.source_status !== "ok") {
     return fail(`citation backend unavailable: ${incident.citation_receipt.diagnostic ?? "source_status=unavailable"}`);
   }
   if (incident.citation_receipt.case_id !== ctx.case_id || handoffs.some((h) => h.case_id !== ctx.case_id)) {
     return fail("Incident handoff or citation receipt is for a different case.");
   }
-  const projected = projectEvidence(handoffs, incident.evidence, incident.citation_receipt.verified);
-  if (projected.uncovered) {
-    return fail(`gate context does not cover cited ids: ${projected.uncovered.slice(0, 5).join(", ")}`);
+  if (incident.cited.some((c) => c.status === "unchecked")) {
+    return fail("Incident context reports unchecked citations; the citation source must be readable for this gate.");
   }
+  const projected = projectCitedEvidence(handoffs, incident, incident.citation_receipt.verified);
+  if (projected.error !== undefined) return fail(projected.error);
   const { receipt, evidenceCatalog, events, status } = projected;
   const claims = handoffs.flatMap((h) => h.claims);
   const reviews = handoffs.flatMap((h) => h.reviews);
   return {
     activeGate: {
       ...base,
+      evidencePaging: projected.paging,
       incidentSummary: {
         citationReceipt: receipt,
         observedCount: claims.filter((c) => c.kind === "observed").length,
@@ -357,6 +489,10 @@ export function projectLiveGate(
     evidenceCatalog,
     events,
     citationStatus: status,
+    pagingState: {
+      runId, gate: "incident", payloadSha256: ctx.payload_sha256, cited: incident.cited,
+      loaded: incident.evidence.length, nextCursor: incident.evidence_next_cursor,
+    },
   };
 }
 
@@ -418,7 +554,7 @@ function projectEvidence(
   let unresolved = 0;
   let outOfScope = 0;
   for (const ev of [...evidence].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-    const s = ev.status === "ambiguous" ? "unresolved" : ev.status;
+    const s = receiptStatus(ev.status);
     status.set(ev.id, s);
     if (s === "verified") verified++;
     else if (s === "out_of_scope") outOfScope++;
@@ -432,35 +568,7 @@ function projectEvidence(
       ...(ev.timestamp_iso ? { timestampIso: ev.timestamp_iso } : {}),
       ...(ev.title ? { summary: ev.title } : {}),
     });
-    evidenceCatalog[ev.id] = {
-      id: ev.id,
-      kind: ev.kind,
-      verified: s === "verified",
-      ...(ev.timestamp_iso ? { timestampIso: ev.timestamp_iso } : {}),
-      title: ev.title || ev.id,
-      fields: ev.fields,
-      citingClaimIds: [...(ref?.claimIds ?? [])],
-      linkedEntityIds: [],
-    };
-    if (ev.kind === "evt" && s === "verified") {
-      const ts = ev.timestamp_iso ?? fieldText(ev.fields, "@timestamp");
-      const tsMs = Date.parse(ts);
-      events.push({
-        eventId: ev.id,
-        timestampIso: ts,
-        timestampMs: Number.isNaN(tsMs) ? 0 : tsMs,
-        hostName: fieldText(ev.fields, "host.name", "host.hostname"),
-        category: fieldText(ev.fields, "event.category"),
-        action: fieldText(ev.fields, "event.action"),
-        userName: fieldText(ev.fields, "user.name"),
-        processName: fieldText(ev.fields, "process.name"),
-        commandLine: fieldText(ev.fields, "process.command_line"),
-        sourceIp: fieldText(ev.fields, "source.ip"),
-        destinationIp: fieldText(ev.fields, "destination.ip"),
-        message: fieldText(ev.fields, "message") || ev.title,
-        entityIds: [],
-      });
-    }
+    addRecord(ev, ref, evidenceCatalog, events);
   }
   // The daemon cannot read records from unavailable sources. Represent only the cited IDs
   // from those sources in the receipt; do not fabricate evidence records or event fields.
@@ -480,4 +588,126 @@ function projectEvidence(
     entries,
   };
   return { receipt, evidenceCatalog, events: events.sort((a, b) => a.timestampMs - b.timestampMs), status };
+}
+
+type CitedRef = { kind: "evt" | "frame" | "ioc"; referencedIn: CitationStatusEntry["referencedIn"][number][]; claimIds: Set<string> };
+
+/** A daemon status as the receipt reports it: `ambiguous` and `unchecked` cannot count as verified. */
+function receiptStatus(status: CitedEntry["status"]): "verified" | "unresolved" | "out_of_scope" {
+  return status === "verified" || status === "out_of_scope" ? status : "unresolved";
+}
+
+/** Adds one daemon record to the evidence catalog (and, for a verified event, the Dissector events). */
+function addRecord(
+  ev: EvidenceEntry,
+  ref: CitedRef | undefined,
+  evidenceCatalog: Record<string, EvidenceRecordDetail>,
+  events: DissectorEventRow[],
+): void {
+  const s = receiptStatus(ev.status);
+  evidenceCatalog[ev.id] = {
+    id: ev.id,
+    kind: ev.kind,
+    verified: s === "verified",
+    ...(ev.timestamp_iso ? { timestampIso: ev.timestamp_iso } : {}),
+    title: ev.title || ev.id,
+    fields: ev.fields,
+    citingClaimIds: [...(ref?.claimIds ?? [])],
+    linkedEntityIds: [],
+  };
+  if (ev.kind === "evt" && s === "verified") {
+    const ts = ev.timestamp_iso ?? fieldText(ev.fields, "@timestamp");
+    const tsMs = Date.parse(ts);
+    events.push({
+      eventId: ev.id,
+      timestampIso: ts,
+      timestampMs: Number.isNaN(tsMs) ? 0 : tsMs,
+      hostName: fieldText(ev.fields, "host.name", "host.hostname"),
+      category: fieldText(ev.fields, "event.category"),
+      action: fieldText(ev.fields, "event.action"),
+      userName: fieldText(ev.fields, "user.name"),
+      processName: fieldText(ev.fields, "process.name"),
+      commandLine: fieldText(ev.fields, "process.command_line"),
+      sourceIp: fieldText(ev.fields, "source.ip"),
+      destinationIp: fieldText(ev.fields, "destination.ip"),
+      message: fieldText(ev.fields, "message") || ev.title,
+      entityIds: [],
+    });
+  }
+}
+
+/**
+ * Gate evidence (F18): the receipt and approval coverage come from `cited`, which lists EVERY cited id with
+ * its status in one response; `evidence` is only the first page of records. Returns `error` when the
+ * handoffs cite an id `cited` does not list, `cited` repeats an id, the totals disagree, or the record page
+ * is not exactly the first slice of `cited`.
+ */
+function projectCitedEvidence(
+  handoffs: readonly Handoff[],
+  block: { cited: CitedEntry[]; evidence: EvidenceEntry[]; evidence_total: number; evidence_next_cursor: string | null },
+  receiptVerified: boolean,
+):
+  | { error: string }
+  | {
+      error?: undefined;
+      receipt: CitationVerificationReceipt;
+      evidenceCatalog: Record<string, EvidenceRecordDetail>;
+      events: DissectorEventRow[];
+      status: Map<string, "verified" | "unresolved" | "out_of_scope">;
+      paging: { loaded: number; total: number; hasMore: boolean };
+    } {
+  const { cited, evidence } = block;
+  if (block.evidence_total !== cited.length) {
+    return { error: `evidence_total ${block.evidence_total} does not match ${cited.length} cited ids` };
+  }
+  const byId = new Map(cited.map((c) => [c.id, c]));
+  if (byId.size !== cited.length) return { error: "the cited list repeats an id" };
+  const sliceErr = checkEvidenceSlice(cited, 0, evidence);
+  if (sliceErr) return { error: sliceErr };
+  if (block.evidence_next_cursor === null && evidence.length !== cited.length) {
+    return { error: "record pages end before every cited record was returned" };
+  }
+  const refs = citedReferences(handoffs);
+  const uncovered = [...refs].filter(([id, ref]) => byId.get(id)?.kind !== ref.kind).map(([id]) => id);
+  if (uncovered.length > 0) {
+    return { error: `gate context does not cover cited ids: ${uncovered.slice(0, 5).join(", ")}` };
+  }
+
+  const records = new Map(evidence.map((e) => [e.id, e]));
+  const status = new Map<string, "verified" | "unresolved" | "out_of_scope">();
+  const entries: CitationStatusEntry[] = [];
+  let verified = 0;
+  let unresolved = 0;
+  let outOfScope = 0;
+  for (const c of cited) {
+    const st = receiptStatus(c.status);
+    status.set(c.id, st);
+    if (st === "verified") verified++;
+    else if (st === "out_of_scope") outOfScope++;
+    else unresolved++;
+    const rec = records.get(c.id);
+    entries.push({
+      citationId: c.id,
+      kind: c.kind,
+      status: st,
+      referencedIn: refs.get(c.id)?.referencedIn ?? [],
+      ...(rec?.timestamp_iso ? { timestampIso: rec.timestamp_iso } : {}),
+      ...(rec?.title ? { summary: rec.title } : {}),
+    });
+  }
+  const { evidenceCatalog, events } = projectEvidenceRecords(handoffs, evidence);
+  return {
+    receipt: {
+      totalCited: cited.length,
+      verifiedCount: verified,
+      unresolvedCount: unresolved,
+      outOfScopeCount: outOfScope,
+      allVerified: receiptVerified && unresolved === 0 && outOfScope === 0,
+      entries,
+    },
+    evidenceCatalog,
+    events: events.sort((a, b) => a.timestampMs - b.timestampMs),
+    status,
+    paging: { loaded: evidence.length, total: cited.length, hasMore: block.evidence_next_cursor !== null },
+  };
 }

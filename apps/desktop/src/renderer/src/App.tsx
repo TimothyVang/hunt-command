@@ -178,6 +178,17 @@ export function App() {
     });
   };
 
+  const handleLoadMoreEvidence = async (): Promise<string | null> => {
+    const huntId = ui.workbench.huntId;
+    const requestVersion = watchVersion.current;
+    const res = await invokeDesktop<WorkbenchSnapshot>("hunt:gateEvidencePage", { huntId });
+    if (res.ok && res.data) {
+      if (selectedHunt.current === res.data.huntId) applySnapshot(res.data, requestVersion);
+      return null;
+    }
+    return res.error?.message ?? "Could not load more evidence.";
+  };
+
   const handleGlobalStop = () => {
     const requestVersion = watchVersion.current;
     const selection = selectionVersion.current;
@@ -365,6 +376,7 @@ export function App() {
               onSelectStep={(sid) => workbenchStore.selectStep(sid)}
               onUpdateGateDraft={(patch) => workbenchStore.updateActiveGateDraft(patch)}
               onSubmitGateDecision={handleSubmitGateDecision}
+              onLoadMoreEvidence={handleLoadMoreEvidence}
             />
           </div>
 

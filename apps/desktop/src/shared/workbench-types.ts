@@ -163,6 +163,11 @@ export interface ActiveGatePrompt {
   };
   reconcileContext?: ReconcileReceiptContext;
   /**
+   * Cited-record paging (F18): approval coverage comes from the complete cited-status list, while
+   * records load in pages. `loaded < total` means the record list on screen is partial.
+   */
+  evidencePaging?: { loaded: number; total: number; hasMore: boolean };
+  /**
    * Set when the gate's decision context (scope text, incident citations and evidence, or reconcile
    * receipt) could not be loaded. Approval is refused while it is set or the context is absent.
    */

@@ -19,6 +19,57 @@ export interface AuthorityGateCardProps {
   onUpdateDraft: (patch: Partial<GateDraftFields>) => void;
   onSubmitDecision: (action: "approve" | "reject", operatorToken?: string) => void;
   onSelectCitation: (citationId: string) => void;
+  /** Loads the next page of cited records; resolves to an error message, or null on success. */
+  onLoadMoreEvidence?: () => Promise<string | null>;
+}
+
+/**
+ * "N of M records loaded" for paged gate evidence (F18). Citation statuses above are complete; only the
+ * record details below are paged, and a partial list is always labelled as partial.
+ */
+export function EvidencePagingBar({
+  paging,
+  onLoadMore,
+}: {
+  paging: { loaded: number; total: number; hasMore: boolean };
+  onLoadMore?: () => Promise<string | null>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const partial = paging.loaded < paging.total;
+  return (
+    <div data-testid="evidence-paging" className="rounded border border-slate-800 bg-slate-950/70 px-2 py-1 text-[11px] font-mono space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <span className={partial ? "text-amber-200" : "text-slate-300"}>
+          {paging.loaded} of {paging.total} records loaded
+          {partial ? " (partial record list; every citation status above is complete)" : " (all records loaded)"}
+        </span>
+        {paging.hasMore && onLoadMore && (
+          <button
+            type="button"
+            data-testid="evidence-load-more"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              setError(null);
+              void onLoadMore().then((err) => {
+                setBusy(false);
+                setError(err);
+              });
+            }}
+            className="rounded border border-cyan-500/50 bg-cyan-950/70 px-2 py-0.5 text-cyan-100 disabled:opacity-40 cursor-pointer"
+          >
+            {busy ? "Loading…" : "Load more"}
+          </button>
+        )}
+      </div>
+      {error && (
+        <div role="alert" data-testid="evidence-paging-error" className="text-rose-300">
+          {error}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function AuthorityGateCard({
@@ -29,6 +80,7 @@ export function AuthorityGateCard({
   onUpdateDraft,
   onSubmitDecision,
   onSelectCitation,
+  onLoadMoreEvidence,
 }: AuthorityGateCardProps) {
   const [operatorToken, setOperatorToken] = useState("");
   const submit = (action: "approve" | "reject") => {
@@ -353,6 +405,10 @@ export function AuthorityGateCard({
             </ul>
           )}
         </div>
+      )}
+
+      {activeGate.evidencePaging && (
+        <EvidencePagingBar paging={activeGate.evidencePaging} onLoadMore={onLoadMoreEvidence} />
       )}
 
       {/* 64-Hex SHA-256 Tamper-Evident Payload Digest */}

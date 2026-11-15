@@ -19,6 +19,7 @@ export const INVOKE_CHANNEL_LIST = [
   "hunt:globalStop",
   "hunt:submitGateDecision",
   "hunt:inspectTranscriptPage",
+  "hunt:gateEvidencePage",
   "hunt:queryDissector",
   "hunt:resolveEvidence",
   "watch:getState",
