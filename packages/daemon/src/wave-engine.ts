@@ -1,3 +1,4 @@
+import { throwDataPlaneError } from "@hunt-command/data-plane";
 import crypto from "node:crypto";
 import {
   CaseMetadataSchema,
@@ -476,6 +477,32 @@ export type DataPlaneResolver = (
   caseId: string,
 ) => Promise<HuntDataPlanePort> | HuntDataPlanePort;
 
+/**
+ * Fails closed (`case_mismatch` / `case_origin_mismatch`) unless `dataPlane` serves the exact case
+ * and data origin a persisted run was started on. Every path that binds a resolved data plane to
+ * an existing run calls this before it changes any state.
+ */
+export function assertDataPlaneBindsRun(
+  run: Pick<PersistedHuntRun, "run_id" | "case_id" | "data_origin">,
+  dataPlane: HuntDataPlanePort,
+): void {
+  const meta = dataPlane.caseMetadata;
+  if (meta?.case_id !== run.case_id) {
+    throwDataPlaneError(
+      400,
+      "case_mismatch",
+      `Data plane for case '${String(meta?.case_id)}' cannot serve hunt '${run.run_id}' on case '${run.case_id}'`,
+    );
+  }
+  if (meta.data_origin !== run.data_origin) {
+    throwDataPlaneError(
+      400,
+      "case_origin_mismatch",
+      `Data plane origin '${meta.data_origin}' does not match hunt '${run.run_id}' origin '${run.data_origin}'`,
+    );
+  }
+}
+
 export class HuntWaveEngine {
   public readonly stateStore: DurableStateStore;
   public readonly gateAuthority: GateAuthority;
@@ -497,6 +524,8 @@ export class HuntWaveEngine {
   }
 
   public registerDataPlaneForRun(runId: string, dataPlane: HuntDataPlanePort): void {
+    const run = this.stateStore.getRun(runId);
+    if (run) assertDataPlaneBindsRun(run, dataPlane);
     this.dataPlanesByRun.set(runId, dataPlane);
   }
 
@@ -760,6 +789,8 @@ export class HuntWaveEngine {
           `Hunt '${snapshot.run_id}' cannot resume after gate '${activeGate.gate}': no HuntDataPlanePort is bound or resolvable (decision NOT recorded)`,
         );
       }
+      // Before any state change: the decision id is not consumed if the plane is for another case.
+      assertDataPlaneBindsRun(snapshot, dp);
     }
 
     const committed = this.stateStore.commitGateDecision({
@@ -934,11 +965,12 @@ export class HuntWaveEngine {
     runId: string,
     dataPlane: HuntDataPlanePort,
   ): Promise<PersistedHuntRun> {
-    this.dataPlanesByRun.set(runId, dataPlane);
     const run = this.stateStore.getRun(runId);
     if (!run) {
       throw new Error(`Unknown hunt run_id '${runId}'`);
     }
+    assertDataPlaneBindsRun(run, dataPlane);
+    this.dataPlanesByRun.set(runId, dataPlane);
     if (run.status !== "running") {
       return run;
     }
@@ -1782,6 +1814,8 @@ export class HuntWaveEngine {
             attempts: attempt,
             usage: turnUsage,
             diagnostic: citationCheck.errorMessage,
+            unverified_handoff: validated.handoff,
+            citation_receipt: citationCheck.receipt,
             finished_at: new Date().toISOString(),
           };
           this.stateStore.saveRun(run);

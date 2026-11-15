@@ -13,4 +13,6 @@ export * from "./drive-gates.ts";
 export * from "./rpc-server.ts";
 export * from "./runtime-lock.ts";
 export * from "./case-data-plane.ts";
+export * from "./transcript.ts";
+export * from "./gate-context.ts";
 export * from "./cli.ts";
