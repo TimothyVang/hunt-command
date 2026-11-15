@@ -619,66 +619,87 @@ describe("F4 end to end through WorkbenchService and the real daemon engine", ()
     }
   });
 
-  test("F18: 1,200 cited ids are approvable from complete statuses; records page; a stale cursor is an error", async () => {
+  /** A real-daemon incident gate whose handoff cites 1,200 ids that all exist in the case. */
+  async function bulkIncidentGate() {
     const ids = Array.from({ length: 1_200 }, (_, i) => `evt-b${String(i).padStart(4, "0")}`);
     const h = await liveHarness(() => undefined, false, false, ids);
-    try {
-      const snap = await toIncidentGate(h);
-      const run = h.store.getRun(snap.huntId)!;
-      const result = run.results["incident"]!;
-      // Cite every id from the incident handoff: 6 claims of 200 ids (each statement <= 2,048 bytes, the
-      // handoff <= 16 KiB), written to the store because a stub model turn is not needed to prove paging.
-      const base = result.handoff!.claims[0]!;
-      const claims = Array.from({ length: 6 }, (_, c) => ({
-        ...base, claim_id: `incident:bulk${c}`, statement: ids.slice(c * 200, c * 200 + 200).join(" "),
-      }));
-      run.results["incident"] = { ...result, handoff: { ...result.handoff!, claims } };
-      h.store.saveRun(run);
+    const snap = await toIncidentGate(h);
+    const run = h.store.getRun(snap.huntId)!;
+    const result = run.results["incident"]!;
+    // 6 claims of 200 ids (each statement <= 2,048 bytes, the handoff <= 16 KiB), written to the store
+    // because a stub model turn is not needed to prove paging.
+    const base = result.handoff!.claims[0]!;
+    const claims = Array.from({ length: 6 }, (_, c) => ({
+      ...base, claim_id: `incident:bulk${c}`, statement: ids.slice(c * 200, c * 200 + 200).join(" "),
+    }));
+    run.results["incident"] = { ...result, handoff: { ...result.handoff!, claims } };
+    h.store.saveRun(run);
+    return { h, ids, huntId: snap.huntId };
+  }
 
-      const atGate = await h.service.getWorkbenchState({ huntId: snap.huntId });
+  test("F18: 1,200 cited ids are approvable from complete statuses with a partial record list; a stale cursor is an error", async () => {
+    const { h, huntId } = await bulkIncidentGate();
+    try {
+      const atGate = await h.service.getWorkbenchState({ huntId });
       const gate = atGate.activeGate!;
       expect(gate.contextError).toBeUndefined();
       const receipt = gate.incidentSummary!.citationReceipt;
-      expect(receipt.totalCited).toBe(1_200);
-      expect(receipt.verifiedCount).toBe(1_200);
+      expect([receipt.totalCited, receipt.verifiedCount, receipt.allVerified]).toEqual([1_200, 1_200, true]);
       expect(gate.evidencePaging).toEqual({ loaded: 200, total: 1_200, hasMore: true });
       expect(Object.keys(atGate.evidenceCatalog)).toHaveLength(200);
       // Approval coverage comes from the complete statuses, not from how many records are loaded.
       expect(missingGateContextReason(gate)).toBeNull();
-      expect(validateGateSubmission(gate, { ...draft("approve"), payloadSha256: gate.payloadSha256 }).errors
-        .filter((e) => /approval is disabled|could not be loaded/.test(e))).toEqual([]);
+      expect(validateGateSubmission(gate, { ...draft("approve"), payloadSha256: gate.payloadSha256 }).valid).toBe(true);
 
-      let view = atGate;
+      const once = await h.service.loadMoreGateEvidence({ huntId });
+      expect(once.activeGate!.evidencePaging).toEqual({ loaded: 400, total: 1_200, hasMore: true });
+      // A refresh with the same gate keeps the pages already loaded.
+      const refreshed = await h.service.getWorkbenchState({ huntId });
+      expect(refreshed.activeGate!.evidencePaging!.loaded).toBe(400);
+      expect(Object.keys(refreshed.evidenceCatalog)).toHaveLength(400);
+
+      // Stale cursor: the gate digest changes in the daemon while the desktop holds a cursor. Loading more fails
+      // with an explanation and merges nothing.
+      const real = h.store.getRun(huntId)!.open_gate!.payload_sha256;
+      const moved = h.store.getRun(huntId)!;
+      moved.open_gate = { ...moved.open_gate!, payload_sha256: "d".repeat(64) };
+      h.store.saveRun(moved);
+      await expect(h.service.loadMoreGateEvidence({ huntId })).rejects.toThrow(/changed since its evidence was loaded/);
+      const restored = h.store.getRun(huntId)!;
+      restored.open_gate = { ...restored.open_gate!, payload_sha256: real };
+      h.store.saveRun(restored);
+      const back = await h.service.getWorkbenchState({ huntId });
+      expect(back.activeGate!.evidencePaging).toEqual({ loaded: 400, total: 1_200, hasMore: true });
+
+      // Approve through the real daemon with 400 of 1,200 records loaded and every status complete.
+      const done = await h.service.submitGateDecision({
+        huntId, gate: "incident", action: "approve", operatorName: "x", rbacRole: "incident_commander",
+        checkNote: "Checked every cited status.", payloadSha256: back.activeGate!.payloadSha256,
+        operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
+      });
+      expect(done.gateHistory.map((d) => `${d.gate}:${d.action}`)).toEqual(["scope:approve", "incident:approve"]);
+      expect(h.store.getRun(huntId)!.status).toBe("completed");
+    } finally {
+      await h.close();
+    }
+  }, 120_000);
+
+  test("F18: Load more pages every one of 1,200 records in cited order and a refresh keeps them", async () => {
+    const { h, ids, huntId } = await bulkIncidentGate();
+    try {
+      let view = await h.service.getWorkbenchState({ huntId });
+      const seen: number[] = [view.activeGate!.evidencePaging!.loaded];
       for (let page = 0; page < 10 && view.activeGate!.evidencePaging!.hasMore; page++) {
-        view = await h.service.loadMoreGateEvidence({ huntId: snap.huntId });
+        view = await h.service.loadMoreGateEvidence({ huntId });
+        seen.push(view.activeGate!.evidencePaging!.loaded);
       }
+      expect(seen).toEqual([200, 400, 600, 800, 1_000, 1_200]);
       expect(view.activeGate!.evidencePaging).toEqual({ loaded: 1_200, total: 1_200, hasMore: false });
       expect(Object.keys(view.evidenceCatalog).sort()).toEqual([...ids].sort());
       expect(view.evidenceCatalog[ids[1_199]!]?.fields["host.name"]).toBe(`bulk-host-${1_199 % 7}`);
-
-      // Stale cursor: reload the gate (paging back at 200), load one page, then the gate digest changes in the
-      // daemon without the desktop refreshing. The held cursor is now stale: loading more fails, nothing merges.
-      const fresh = await h.service.getWorkbenchState({ huntId: snap.huntId });
-      expect(fresh.activeGate!.evidencePaging!.loaded).toBe(200);
-      const once = await h.service.loadMoreGateEvidence({ huntId: snap.huntId });
-      expect(once.activeGate!.evidencePaging!.loaded).toBe(400);
-      const moved = h.store.getRun(snap.huntId)!;
-      moved.open_gate = { ...moved.open_gate!, payload_sha256: "d".repeat(64) };
-      h.store.saveRun(moved);
-      await expect(h.service.loadMoreGateEvidence({ huntId: snap.huntId })).rejects.toThrow(/changed since its evidence was loaded|stale_cursor/);
-      const after = await h.service.getWorkbenchState({ huntId: snap.huntId });
-      expect(after.activeGate!.payloadSha256).toBe("d".repeat(64));
-      expect(after.activeGate!.evidencePaging!.loaded).toBe(200);
-
-      // Approve through the service with every status complete but only 200 records loaded.
-      await h.service.submitGateDecision({
-        huntId: snap.huntId, gate: "incident", action: "approve", operatorName: "x", rbacRole: "incident_commander",
-        checkNote: "Checked every cited status.", payloadSha256: after.activeGate!.payloadSha256,
-        operatorToken: h.gates.sessionAuthority.issueToken("real-analyst", "analyst"),
-      }).catch((error: Error) => {
-        // The forged digest is not the daemon's real gate digest, so the daemon may refuse it; the desktop must not.
-        expect(error.message).not.toMatch(/approval is disabled|could not be loaded|truncated/);
-      });
+      const kept = await h.service.getWorkbenchState({ huntId });
+      expect(kept.activeGate!.evidencePaging).toEqual({ loaded: 1_200, total: 1_200, hasMore: false });
+      expect(Object.keys(kept.evidenceCatalog)).toHaveLength(1_200);
     } finally {
       await h.close();
     }

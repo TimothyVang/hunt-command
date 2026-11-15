@@ -852,10 +852,48 @@ export class WorkbenchService {
       watchState: this.#standbyWatchState(run.run_id),
     };
     this.#liveRunIds.add(run.run_id);
-    if (gate?.pagingState) this.#evidencePaging.set(run.run_id, gate.pagingState);
-    else this.#evidencePaging.delete(run.run_id);
-    this.#runs.set(run.run_id, snapshot);
-    return snapshot;
+    const merged = this.#carryLoadedEvidence(run.run_id, snapshot, gate?.pagingState);
+    this.#runs.set(run.run_id, merged);
+    return merged;
+  }
+
+  /**
+   * A refresh re-reads the gate's first record page. When the run, gate, digest and complete cited list are
+   * unchanged, records the operator already paged in are kept (and the cursor continues); any change, such
+   * as a status moving after a source came back, starts again from the daemon's first page.
+   */
+  #carryLoadedEvidence(runId: string, snapshot: WorkbenchSnapshot, fresh: GateEvidencePaging | undefined): WorkbenchSnapshot {
+    const prior = this.#evidencePaging.get(runId);
+    const previous = this.#runs.get(runId);
+    if (!fresh) {
+      this.#evidencePaging.delete(runId);
+      return snapshot;
+    }
+    const sameCited = (a: GateEvidencePaging, b: GateEvidencePaging) =>
+      a.cited.length === b.cited.length &&
+      a.cited.every((c, i) => c.id === b.cited[i]!.id && c.kind === b.cited[i]!.kind && c.status === b.cited[i]!.status);
+    if (
+      !prior || !previous || !snapshot.activeGate || prior.runId !== fresh.runId || prior.gate !== fresh.gate ||
+      prior.payloadSha256.toLowerCase() !== fresh.payloadSha256.toLowerCase() || prior.loaded <= fresh.loaded || !sameCited(prior, fresh)
+    ) {
+      this.#evidencePaging.set(runId, fresh);
+      return snapshot;
+    }
+    const keep = new Set(prior.cited.slice(0, prior.loaded).map((c) => c.id));
+    const carried = Object.fromEntries(Object.entries(previous.evidenceCatalog).filter(([id]) => keep.has(id)));
+    const eventIds = new Set(snapshot.events.map((e) => e.eventId));
+    const events = [...snapshot.events, ...previous.events.filter((e) => keep.has(e.eventId) && !eventIds.has(e.eventId))]
+      .sort((a, b) => a.timestampMs - b.timestampMs);
+    this.#evidencePaging.set(runId, prior);
+    return {
+      ...snapshot,
+      evidenceCatalog: { ...carried, ...snapshot.evidenceCatalog },
+      events,
+      activeGate: {
+        ...snapshot.activeGate,
+        evidencePaging: { loaded: prior.loaded, total: prior.cited.length, hasMore: prior.nextCursor !== null },
+      },
+    };
   }
 
   #selectHunt(huntId: string): void {
